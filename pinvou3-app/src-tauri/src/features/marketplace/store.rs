@@ -2,30 +2,47 @@
 //!
 //! 设计依据：`docs/marketplace-unification.md` §3.1（存储层 BundleRecord）、§4（存储
 //! 布局）、§9（首启一次性导入）。本模块只管 `~/.pinvou3/marketplace/bundles.json`
-//! 的读写与旧布局**登记**；物理目录搬移（`bundles/<id>/`、`assets/cli/`）与旧布局
-//! 删除在后续 PR，本刀一律不动磁盘上的包内容。
+//! 的读写与旧布局**登记**，一律不动磁盘上的包内容；物理搬移与旧布局同名残留
+//! 清理由 connectors 侧 `migrate_legacy_binary` 按 lock 校验执行。
 //!
 //! 纪律（§10）：
-//! - 原子写（tmp + rename，走底座 `write_atomic`）+ 进程内 FILE_LOCK 串行化读-改-写；
-//!   读/写入口拆「取锁包装 + 已持锁实现」两层，已持锁的 import/upsert 直接调 `_locked`
-//!   实现，避免 Mutex 重入死锁（#287 修过的竞态范式）。
+//! - 原子写（tmp + rename，走底座 `write_atomic`）+ 跨进程文件锁串行化读-改-写
+//!   （进程内 Mutex + OS 文件锁，见 `file_lock.rs`，#521）；读/写入口拆「取锁
+//!   包装 + 已持锁实现」两层，已持锁的 import/upsert 直接调 `_locked` 实现，
+//!   避免锁重入死锁（#287 修过的竞态范式）；
 //! - 不用 `#[serde(deny_unknown_fields)]`：未知字段经 `extra` flatten map 原样
 //!   roundtrip，新 schema 字段在老版本二进制上不丢数据（前向兼容）。
 //! - 损坏 JSON fail loud：bundles.json 是唯一真相源，静默重建会掩盖数据损坏，
 //!   损坏时返回 Err 且绝不回写。
+//!
+// architecture-guard: allow-target-cfg -- the unix regression tests in this file (the round-23 MAJOR 3 legacy-import gate latch and the round-21 planted-symlink load pin) need an unreadable (0o000) installed.json / symlink fixtures; test-only inline cfg(unix)+PermissionsExt (same exemption precedent as scope.rs / package_export.rs, review #455); a real read() probe guards against running as root, Windows is covered by link checks.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
 use super::MarketplaceManager;
 use super::bundle;
+use super::file_lock;
 use crate::platform::connector_lock;
+use crate::platform::filesystem::read_private_data_file;
 use crate::platform::paths;
 
 /// bundles.json 当前 schema 版本。后续 schema 演进时递增并在读路径做迁移。
 const SCHEMA_VERSION: u32 = 1;
+
+/// [`AssetRef::kind`] of a vendor CLI binary: a versioned external asset that
+/// a package references but does not own (`docs/marketplace-unification.md`
+/// §4, `assets/cli/<name>/<version>/`). Both pin writers apply the same
+/// hash-then-record gate: a pin is recorded only after the on-disk binary's
+/// SHA-256 matches the lock table (`verified_cli_asset`, wrapping the
+/// `cli_asset_state` core the legacy scan consumes directly) — the desktop
+/// connect path (connectors
+/// `bundle_store_on_connected`) and the first-start legacy scan
+/// (`legacy_cli_records`). The headless CLI mirror deliberately connects
+/// without asset pins, so consumers must still tolerate an empty `assets`
+/// list.
+pub const ASSET_KIND_CLI: &str = "cli";
 
 /// 上传包的用户自定义 UI 展示名/说明在记录 `extra` map 里的 key（只改展示，
 /// 机读 id / 目录 / frontmatter name 一律不动；见 docs/plugin-package-spec.md）。
@@ -42,16 +59,10 @@ pub(crate) const MAX_DISPLAY_NAME_CHARS: usize = 64;
 /// 展示说明校验上限（字符数；对齐 skill_marketplace 的 description 展示截断口径）。
 pub const MAX_DISPLAY_DESCRIPTION_CHARS: usize = 240;
 
-/// `bundles.json` 读-改-写的进程内串行化：统一管线登记、首启导入、后续开关命令
-/// 都可能并发触发同一份文件的读-改-写，串行化避免交错丢更新（与
-/// `disabled_connectors.json` / `disabled_skills.json` 同一范式）。
-static BUNDLES_FILE_LOCK: Mutex<()> = Mutex::new(());
-
-fn file_lock() -> MutexGuard<'static, ()> {
-    BUNDLES_FILE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+// `bundles.json` 读-改-写的串行化走 `file_lock::with_file_lock`（统一管线登记、
+// 首启导入、后续开关命令都可能并发触发同一份文件的读-改-写；GUI 与 headless
+// 宿主共享同一 `~/.pinvou3`，进程内 Mutex 之上再加 OS 文件锁，锁序与失败处置
+// 见 `file_lock.rs`，#515/#521）。
 
 // ---------------------------------------------------------------------------
 // schema
@@ -108,6 +119,36 @@ impl<'de> Deserialize<'de> for BundleSource {
     }
 }
 
+/// External asset reference (`docs/marketplace-unification.md` §3.1: name +
+/// version + sha256). `kind` is a string rather than an enum so a kind this
+/// binary does not know still parses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetRef {
+    pub kind: String,
+    pub name: String,
+    pub version: String,
+    pub sha256: String,
+    /// Keys this binary does not model round-trip unchanged.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One `BundleRecord.assets` entry. An entry that does not parse as an
+/// [`AssetRef`] (a shape written by another version, a missing field, a
+/// non-string value) is kept verbatim as `Unrecognized`: it must neither fail
+/// the whole `bundles.json` load nor be dropped by a write that edits the
+/// record in place. The exception is a writer that replaces the whole list:
+/// `upsert_preserving` swaps in a non-empty incoming `assets` verbatim (that
+/// is how a stale pin gets replaced) and drops unrecognized entries with it.
+/// The retained value is endpoint-authored data: render it as data, never as
+/// markup, wherever a future consumer surfaces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AssetEntry {
+    Ref(AssetRef),
+    Unrecognized(serde_json::Value),
+}
+
 /// 存储层包记录（§3.1：bundles.json 里唯一可写的部分）。
 /// `ready` 是派生态，永不进存储；`kind` 由查询层现算，同样不落盘。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +161,12 @@ pub struct BundleRecord {
     /// 由后续完整性校验/统一管线填写。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_fingerprint: Option<String>,
+    /// External asset references (CLI binaries and the like); the package
+    /// references them but does not own them. Tolerance is per entry only:
+    /// a missing key defaults to empty, but a `null`/non-array value fails
+    /// the whole load by the file's fail-loud rule (never silently rebuilt).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<AssetEntry>,
     /// 安装时间，RFC3339/ISO8601 UTC（对齐 SessionMetadata.updated_at 的 chrono 惯例）
     pub installed_at: String,
     /// `Degraded` 异常态（§3.2：登记在、资源缺）的原因；修复动作统一为按来源
@@ -140,6 +187,7 @@ impl BundleRecord {
             id: id.into(),
             source,
             installed: true,
+            assets: Vec::new(),
             content_fingerprint: None,
             installed_at: now_iso8601(),
             degraded: None,
@@ -225,10 +273,11 @@ impl BundleStore {
         self.file.clone()
     }
 
-    /// 读整个文件（取锁包装）。文件不存在 → 空 store；JSON 损坏 → Err（fail loud）。
+    /// 读整个文件（try 锁包装：锁被占用/不可用时退化为不落盘的解锁快照，见
+    /// `file_lock::try_file_lock_for_read`）。文件不存在 → 空 store；JSON 损坏
+    /// → Err（fail loud）。
     pub fn load(&self) -> Result<BundlesFile, String> {
-        let _guard = file_lock();
-        load_locked(&self.file)
+        file_lock::try_file_lock_for_read(&self.file, || load_locked(&self.file))
     }
 
     /// 全部记录（便捷入口）。
@@ -241,15 +290,16 @@ impl BundleStore {
         Ok(self.load()?.records.into_iter().find(|r| r.id == id))
     }
 
-    /// 插入或按 id 替换一条记录（读-改-写全程持锁，原子落盘）。
+    /// 插入或按 id 替换一条记录（读-改-写全程持跨进程文件锁，原子落盘）。
     pub fn upsert(&self, record: BundleRecord) -> Result<(), String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        match file.records.iter_mut().find(|r| r.id == record.id) {
-            Some(existing) => *existing = record,
-            None => file.records.push(record),
-        }
-        save_locked(&self.file, &file)
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            match file.records.iter_mut().find(|r| r.id == record.id) {
+                Some(existing) => *existing = record,
+                None => file.records.push(record),
+            }
+            save_locked(&self.file, &file)
+        })
     }
 
     /// upsert 变体：记录已存在时保留 `source`（包来源只在首次登记时确定 —— 重装/
@@ -258,28 +308,44 @@ impl BundleStore {
     /// `extra`（前向兼容/用户字段）与 `content_fingerprint`（完整性校验层的数据），
     /// 其余字段以新值为准。安装/连接成功的镜像写统一走这里 —— 重装、重复连接
     /// 不应冲掉首次安装时间，也不应丢老版本二进制不认识的字段。
+    /// `assets` takes the new list when it is non-empty and otherwise keeps the
+    /// existing one, so a writer that does not track assets must not wipe refs
+    /// another writer recorded while a pin writer can still replace a stale
+    /// pin. The flip side: "unpin all" is not expressible through this
+    /// variant — a writer that genuinely wants an empty list must fall to
+    /// plain `upsert`, which replaces the whole record. A non-empty incoming
+    /// list likewise replaces the whole stored list, `Unrecognized` entries
+    /// included. The pin writers are
+    /// the connectors' connect mirror and the first-start legacy import; the
+    /// rule's protection is per-process: each process merges against its own
+    /// load-time snapshot, so cross-process writers remain last-writer-wins
+    /// on the whole file.
     pub fn upsert_preserving(&self, record: BundleRecord) -> Result<(), String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let merged = match file.records.iter().find(|r| r.id == record.id) {
-            Some(existing) => BundleRecord {
-                id: record.id,
-                source: existing.source.clone(),
-                installed: record.installed,
-                content_fingerprint: record
-                    .content_fingerprint
-                    .or_else(|| existing.content_fingerprint.clone()),
-                installed_at: existing.installed_at.clone(),
-                degraded: record.degraded,
-                extra: existing.extra.clone(),
-            },
-            None => record,
-        };
-        match file.records.iter_mut().find(|r| r.id == merged.id) {
-            Some(slot) => *slot = merged,
-            None => file.records.push(merged),
-        }
-        save_locked(&self.file, &file)
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            match file.records.iter_mut().find(|r| r.id == record.id) {
+                Some(existing) => {
+                    *existing = BundleRecord {
+                        id: record.id,
+                        source: existing.source.clone(),
+                        installed: record.installed,
+                        assets: if record.assets.is_empty() {
+                            existing.assets.clone()
+                        } else {
+                            record.assets
+                        },
+                        content_fingerprint: record
+                            .content_fingerprint
+                            .or_else(|| existing.content_fingerprint.clone()),
+                        installed_at: existing.installed_at.clone(),
+                        degraded: record.degraded,
+                        extra: existing.extra.clone(),
+                    };
+                }
+                None => file.records.push(record),
+            }
+            save_locked(&self.file, &file)
+        })
     }
 
     /// 仅当记录仍存在时更新内容指纹（单锁 RMW，原子落盘）。id 不存在 →
@@ -291,47 +357,47 @@ impl BundleStore {
         id: &str,
         fingerprint: &str,
     ) -> Result<bool, String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
-            return Ok(false);
-        };
-        record.content_fingerprint = Some(fingerprint.to_string());
-        save_locked(&self.file, &file)?;
-        Ok(true)
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
+                return Ok(false);
+            };
+            record.content_fingerprint = Some(fingerprint.to_string());
+            save_locked(&self.file, &file)?;
+            Ok(true)
+        })
     }
 
-    /// 按 id 删除记录（读-改-写全程持锁，原子落盘）。id 不存在 → Ok(false)，不写盘。
+    /// 按 id 删除记录（读-改-写全程持跨进程文件锁，原子落盘）。id 不存在 →
+    /// Ok(false)，不写盘。
     pub fn remove(&self, id: &str) -> Result<bool, String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let before = file.records.len();
-        file.records.retain(|r| r.id != id);
-        if file.records.len() == before {
-            return Ok(false);
-        }
-        save_locked(&self.file, &file)?;
-        Ok(true)
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            let before = file.records.len();
+            file.records.retain(|r| r.id != id);
+            if file.records.len() == before {
+                return Ok(false);
+            }
+            save_locked(&self.file, &file)?;
+            Ok(true)
+        })
     }
 
     /// 局部更新：置 `Degraded` 原因（§3.2：登记在、资源缺），供 CLI 修复/断开
     /// 路径用。id 不存在 → Ok(false)；原因未变 → Ok(true) 但不写盘。
     pub fn mark_degraded(&self, id: &str, reason: &str) -> Result<bool, String> {
-        self.set_degraded(id, Some(reason.to_string()))
-    }
-
-    fn set_degraded(&self, id: &str, reason: Option<String>) -> Result<bool, String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
-            return Ok(false);
-        };
-        if record.degraded == reason {
-            return Ok(true);
-        }
-        record.degraded = reason;
-        save_locked(&self.file, &file)?;
-        Ok(true)
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
+                return Ok(false);
+            };
+            if record.degraded.as_deref() == Some(reason) {
+                return Ok(true);
+            }
+            record.degraded = Some(reason.to_string());
+            save_locked(&self.file, &file)?;
+            Ok(true)
+        })
     }
 
     /// 设置上传包的用户自定义 UI 展示名/说明（写在记录 `extra` map 的
@@ -347,74 +413,77 @@ impl BundleStore {
         display_name: Option<&str>,
         display_description: Option<&str>,
     ) -> Result<(), String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
-            return Err(format!("包 '{id}' 未登记，无法设置展示名/说明"));
-        };
-        if !matches!(record.source, BundleSource::Upload(_)) {
-            return Err(format!(
-                "包 '{id}' 非用户上传来源，预置/内置包不允许覆盖展示名/说明"
-            ));
-        }
-        if display_name.is_none() && display_description.is_none() {
-            return Ok(());
-        }
-        apply_display_meta(
-            &mut record.extra,
-            EXTRA_DISPLAY_NAME,
-            "展示名",
-            display_name,
-            MAX_DISPLAY_NAME_CHARS,
-        )?;
-        apply_display_meta(
-            &mut record.extra,
-            EXTRA_DISPLAY_DESCRIPTION,
-            "展示说明",
-            display_description,
-            MAX_DISPLAY_DESCRIPTION_CHARS,
-        )?;
-        save_locked(&self.file, &file)
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
+                return Err(format!("包 '{id}' 未登记，无法设置展示名/说明"));
+            };
+            if !matches!(record.source, BundleSource::Upload(_)) {
+                return Err(format!(
+                    "包 '{id}' 非用户上传来源，预置/内置包不允许覆盖展示名/说明"
+                ));
+            }
+            if display_name.is_none() && display_description.is_none() {
+                return Ok(());
+            }
+            apply_display_meta(
+                &mut record.extra,
+                EXTRA_DISPLAY_NAME,
+                "展示名",
+                display_name,
+                MAX_DISPLAY_NAME_CHARS,
+            )?;
+            apply_display_meta(
+                &mut record.extra,
+                EXTRA_DISPLAY_DESCRIPTION,
+                "展示说明",
+                display_description,
+                MAX_DISPLAY_DESCRIPTION_CHARS,
+            )?;
+            save_locked(&self.file, &file)
+        })
     }
 
     /// 读取记录的 SKILL.md 原说明备份（`EXTRA_SKILL_DESC_BACKUP`；缺 key /
     /// 非字符串 → None；`Some("")` = 原缺失哨兵）。清空展示说明的恢复路径用。
     pub fn skill_desc_backup(&self, id: &str) -> Result<Option<String>, String> {
-        let _guard = file_lock();
-        let file = load_locked(&self.file)?;
-        Ok(file
-            .records
-            .iter()
-            .find(|r| r.id == id)
-            .and_then(|r| r.extra.get(EXTRA_SKILL_DESC_BACKUP))
-            .and_then(|v| v.as_str())
-            .map(str::to_string))
+        file_lock::try_file_lock_for_read(&self.file, || {
+            let file = load_locked(&self.file)?;
+            Ok(file
+                .records
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.extra.get(EXTRA_SKILL_DESC_BACKUP))
+                .and_then(|v| v.as_str())
+                .map(str::to_string))
+        })
     }
 
     /// 设置/删除 `EXTRA_SKILL_DESC_BACKUP`（与 `set_display_meta` 同锁同门禁：
     /// 仅 Upload 记录可写）。值由内部读取/校验管线产生（引擎口径原值或空串哨兵），
     /// 不做展示字段校验；`None` = 删除 key。
     pub fn set_skill_desc_backup(&self, id: &str, backup: Option<&str>) -> Result<(), String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
-            return Err(format!("包 '{id}' 未登记，无法备份技能说明原值"));
-        };
-        if !matches!(record.source, BundleSource::Upload(_)) {
-            return Err(format!("包 '{id}' 非用户上传来源，不允许写说明备份"));
-        }
-        match backup {
-            Some(v) => {
-                record.extra.insert(
-                    EXTRA_SKILL_DESC_BACKUP.to_string(),
-                    serde_json::Value::String(v.to_string()),
-                );
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            let Some(record) = file.records.iter_mut().find(|r| r.id == id) else {
+                return Err(format!("包 '{id}' 未登记，无法备份技能说明原值"));
+            };
+            if !matches!(record.source, BundleSource::Upload(_)) {
+                return Err(format!("包 '{id}' 非用户上传来源，不允许写说明备份"));
             }
-            None => {
-                record.extra.remove(EXTRA_SKILL_DESC_BACKUP);
+            match backup {
+                Some(v) => {
+                    record.extra.insert(
+                        EXTRA_SKILL_DESC_BACKUP.to_string(),
+                        serde_json::Value::String(v.to_string()),
+                    );
+                }
+                None => {
+                    record.extra.remove(EXTRA_SKILL_DESC_BACKUP);
+                }
             }
-        }
-        save_locked(&self.file, &file)
+            save_locked(&self.file, &file)
+        })
     }
 
     /// 首启一次性导入（§9）：从旧布局（installed.json + bundle/skills/* 的
@@ -423,35 +492,42 @@ impl BundleStore {
     ///
     /// - **幂等**：`legacy_imported` 闸置位后直接跳过；闸未置位时也只补缺失 id，
     ///   已存在的记录永远保留（用户/新管线写入的赢）。
-    /// - **非破坏性**：只读旧布局、只写 bundles.json；目录搬移与旧布局删除在后续 PR。
-    /// - 全程持 FILE_LOCK（"读到即迁移"必须持锁，§9.4 / #287 竞态教训前置）。
+    /// - **非破坏性**：只读旧布局、只写 bundles.json；目录搬移与同名残留清理由
+    ///   connectors 侧 `migrate_legacy_binary` 按 lock 校验执行（boot 序列在
+    ///   本 import 之后；#608）。
+    /// - **注册表不可读 = 不导入、不落闸**（review #455 round-23 MAJOR 3）：
+    ///   installed.json 存在但不可读时整体报错返回，`legacy_imported` 不置位——
+    ///   宁可下次启动重试，也不把一次吞错读取得来的不完整镜像永久烘焙进
+    ///   bundles.json（与 round-20 MAJOR A 的 reconcile 转换同类）。
+    /// - 全程持跨进程文件锁（"读到即迁移"必须持锁，§9.4 / #287 竞态教训前置）。
     pub fn import_legacy(&self) -> Result<LegacyImportReport, String> {
-        let _guard = file_lock();
-        let mut file = load_locked(&self.file)?;
-        let mut report = LegacyImportReport::default();
-        if file.legacy_imported {
-            report.already_imported = true;
-            return Ok(report);
-        }
-        for candidate in collect_legacy_records() {
-            if file.records.iter().any(|r| r.id == candidate.id) {
-                report.kept_existing.push(candidate.id);
-                continue;
+        file_lock::with_file_lock(&self.file, || {
+            let mut file = load_locked(&self.file)?;
+            let mut report = LegacyImportReport::default();
+            if file.legacy_imported {
+                report.already_imported = true;
+                return Ok(report);
             }
-            if candidate.degraded.is_some() {
-                report.degraded.push(candidate.id.clone());
+            for candidate in collect_legacy_records()? {
+                if file.records.iter().any(|r| r.id == candidate.id) {
+                    report.kept_existing.push(candidate.id);
+                    continue;
+                }
+                if candidate.degraded.is_some() {
+                    report.degraded.push(candidate.id.clone());
+                }
+                report.imported.push(candidate.id.clone());
+                file.records.push(candidate);
             }
-            report.imported.push(candidate.id.clone());
-            file.records.push(candidate);
-        }
-        file.legacy_imported = true;
-        save_locked(&self.file, &file)?;
-        Ok(report)
+            file.legacy_imported = true;
+            save_locked(&self.file, &file)?;
+            Ok(report)
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
-// 已持锁实现（取锁包装之上的内层；调用前必须已持有 BUNDLES_FILE_LOCK）
+// 已持锁实现（取锁包装之上的内层；调用前必须已持有 bundles.json 的跨进程文件锁）
 // ---------------------------------------------------------------------------
 
 /// 单个展示字段的写入语义（`set_display_meta` 用）：None 不动；trim 后空 = 删 key
@@ -489,6 +565,11 @@ fn apply_display_meta(
 /// 反斜杠/首尾单引号，见 `rewrite_frontmatter_description`）——同一值在非
 /// 单技能包可存、在单技能包会被整体拒绝，这是同步能力差异使然，不是本函数的
 /// 口径不一致。
+/// 上传来源展示名的长度上限（字符数）：GUI 的 `sanitize_display_name`
+/// 与 headless CLI 的导入净化共用同一截断口径（与上面 64 字符的展示元数据
+/// 校验上限是两个不同的口径，勿混用）。
+pub const MAX_IMPORT_DISPLAY_NAME_CHARS: usize = 128;
+
 /// 展示字段值的不可见字符拒绝集：`Cc`（控制字符/换行）之外，补充对卡片标题/
 /// composer 菜单/SKILL.md 回写都有实际危害或显示异常的不可见字符——
 /// - 双向控制（U+202A–202E、U+2066–2069）：可视觉重排/隐藏文本（bidi 欺骗）；
@@ -498,7 +579,9 @@ fn apply_display_meta(
 ///   无法表达，效果等同换行。
 /// std 无通用 Unicode 类别 API，此处按具名范围精确拒绝；未列出的 Cf 变体
 /// （如变体选择符）不拦——宁可少拦可见字符，不误伤正常文案。
-fn is_display_unsafe_char(c: char) -> bool {
+/// `pub`：headless CLI 的 plugins 家族为共享 `bundles.json` 的导入显示名
+/// 直接复用本判定（曾因 crate-private 而逐字手抄镜像）。
+pub fn is_display_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00AD}' // SOFT HYPHEN
@@ -608,18 +691,57 @@ pub(crate) fn upload_display_name(record: &BundleRecord, fallback: &str) -> Stri
     }
 }
 
-/// 内层读：与取锁包装分离，已持锁的 import/upsert 直接调用，避免 Mutex 重入。
+/// Inner read: separated from the lock-taking wrapper so already-locked
+/// import/upsert callers invoke it directly, avoiding mutex re-entry. The
+/// read goes through the hardened primitive: this function
+/// runs inside the bundles.json file lock and — via the scope's DenyAll
+/// expansion — inside the disabled_bundles.lock critical section, so a FIFO
+/// or symlink planted at the path must be refused rather than left hanging
+/// the lock holder — the same hardening discipline as disabled_bundles.json's
+/// identical reads. NotFound semantics unchanged (the kind passes through).
 fn load_locked(path: &Path) -> Result<BundlesFile, String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).map_err(|e| {
-            format!(
-                "解析 {} 失败: {e}（bundles.json 是唯一真相源，损坏时 fail loud，不静默重建）",
-                path.display()
-            )
-        }),
+    match read_private_data_file(path) {
+        Ok(content) => {
+            let file: BundlesFile = serde_json::from_str(&content).map_err(|e| {
+                format!(
+                    "解析 {} 失败: {e}（bundles.json 是唯一真相源，损坏时 fail loud，不静默重建）",
+                    path.display()
+                )
+            })?;
+            let flagged = unrecognized_asset_record_ids(&file);
+            if !flagged.is_empty() {
+                log::warn!(
+                    "[marketplace] {}: unreadable assets entries kept verbatim in {}",
+                    path.display(),
+                    flagged.join(", ")
+                );
+            }
+            Ok(file)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BundlesFile::default()),
         Err(e) => Err(format!("读取 {} 失败: {e}", path.display())),
     }
+}
+
+/// Record ids carrying at least one entry this binary cannot read; the
+/// flag-and-log lives at the load site so the targeting rule is testable
+/// without capturing log output.
+///
+/// Unparsable `assets` entries are kept verbatim per the `AssetEntry`
+/// contract, but a silent degrade hides data-quality problems (a `sha_256`
+/// misspelling from a future pin writer, for example). Report them once per
+/// load so the anomaly is diagnosable instead of just invisible.
+fn unrecognized_asset_record_ids(file: &BundlesFile) -> Vec<String> {
+    file.records
+        .iter()
+        .filter(|record| {
+            record
+                .assets
+                .iter()
+                .any(|entry| !matches!(entry, AssetEntry::Ref(_)))
+        })
+        .map(|record| record.id.clone())
+        .collect()
 }
 
 /// 内层写：tmp + rename 原子替换（底座 `write_atomic`，含 Windows 替换重试），
@@ -631,7 +753,7 @@ fn save_locked(path: &Path, file: &BundlesFile) -> Result<(), String> {
     }
     let json =
         serde_json::to_string_pretty(file).map_err(|e| format!("序列化 bundles.json 失败: {e}"))?;
-    deepseek_tui::utils::write_atomic(path, json.as_bytes())
+    crate::platform::filesystem::atomic_write_private(path, json.as_bytes())
         .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
 }
 
@@ -639,63 +761,91 @@ fn save_locked(path: &Path, file: &BundlesFile) -> Result<(), String> {
 // 旧布局反推（只读旧文件，不动包内容）
 // ---------------------------------------------------------------------------
 
-/// 安装时间戳：RFC3339/ISO8601 UTC，对齐 SessionMetadata.updated_at 的 chrono 惯例。
-fn now_iso8601() -> String {
+/// Install/recycle timestamps: RFC3339/ISO8601 UTC, following the same chrono convention
+/// as SessionMetadata.updated_at. recycle_bin.rs reuses this implementation so the two
+/// timestamp formats cannot drift apart.
+pub(super) fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn collect_legacy_records() -> Vec<BundleRecord> {
-    let mut out = legacy_mcp_records();
-    out.extend(legacy_skill_records());
+/// 旧布局扫描 → 预置包记录。MCP 安装态读走 `try_installed_ids`（review #455
+/// round-23 MAJOR 3）：installed.json 存在但不可读时整体报错，调用方据此跳过
+/// 本次导入且不落 `legacy_imported` 闸，避免把不完整镜像永久烘焙进 bundles.json。
+fn collect_legacy_records() -> Result<Vec<BundleRecord>, String> {
+    let mut out = legacy_mcp_records()?;
+    // Round-24 minor 2: the skill/CLI scan legs propagate a scan-root read
+    // error the same way the registry leg does — a degraded scan latching the
+    // one-shot gate would bake an incomplete mirror in permanently (the same
+    // class the registry conversion closed). A missing legacy dir stays the
+    // common Ok(empty) case; only an existing-but-unreadable root errors.
+    out.extend(legacy_skill_records()?);
     out.extend(legacy_cli_records());
     // id 去重（保序留先）：MCP 包与其同名 companion 技能（pptx↔pptx）会各扫到一次，
     // 终态模型里它们是同一个包（§5.2「一个包 = 一张卡」），MCP 侧记录含凭据声明，
     // 信息更全，故排在前面的 MCP 记录优先。
     let mut seen = std::collections::HashSet::new();
     out.retain(|r| seen.insert(r.id.clone()));
-    out
+    Ok(out)
 }
 
-/// installed.json（MCP 安装态）→ 预置包记录。
-fn legacy_mcp_records() -> Vec<BundleRecord> {
+/// installed.json（MCP 安装态）→ 预置包记录。读失败报 Err（不塌缩为空集）。
+fn legacy_mcp_records() -> Result<Vec<BundleRecord>, String> {
     let manager = MarketplaceManager::new();
-    let installed = manager.installed_ids();
+    let installed = manager.try_installed_ids()?;
     if installed.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let now = now_iso8601();
-    installed
+    Ok(installed
         .into_iter()
         .map(|id| BundleRecord {
-            id,
-            source: BundleSource::Preset,
-            installed: true,
-            content_fingerprint: None,
             installed_at: now.clone(),
-            degraded: None,
-            extra: serde_json::Map::new(),
+            ..BundleRecord::installed_now(id, BundleSource::Preset)
         })
-        .collect()
+        .collect())
 }
 
 /// `bundle/skills/*/.installed-from` 标记 → 技能包记录：
 /// `pinvou3-marketplace:<id>` → 预置技能包；`upload:<zip名>` → 上传技能包。
 /// 无标记目录（内置 visual-design、CLI companion 技能）不在此登记 —— CLI
 /// companion 由 [`legacy_cli_records`] 归并到所属 CLI 包。
-fn legacy_skill_records() -> Vec<BundleRecord> {
+fn legacy_skill_records() -> Result<Vec<BundleRecord>, String> {
     let skills_dir = paths::bundle_skills_dir();
-    let Ok(rd) = std::fs::read_dir(&skills_dir) else {
-        return Vec::new();
+    // Round-24 minor 2: a missing legacy dir is the common fresh case; an
+    // existing-but-unreadable root propagates so the import aborts before the
+    // gate latches (same fail-closed as the registry leg).
+    let rd = match std::fs::read_dir(&skills_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("读取旧布局技能目录失败: {e}")),
     };
     let now = now_iso8601();
     let mut out = Vec::new();
-    for entry in rd.flatten() {
+    // Round-30 m6 (review #455): `flatten()` silently drops mid-scan
+    // iteration errors — the one-shot `legacy_imported` gate could latch
+    // over an incomplete mirror (records permanently skipped). Propagate
+    // like the root read above and the per-entry markers below: the last
+    // leg of the round-23 MAJOR-3 class in this function.
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("遍历旧布局技能目录失败: {e}"))?;
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
         }
-        let Ok(marker) = std::fs::read_to_string(dir.join(".installed-from")) else {
-            continue;
+        // Round-29 m4 (review #455): NotFound is the common no-marker skip,
+        // but an EXISTS-but-unreadable marker must abort the import exactly
+        // like the unreadable root above — the one-shot `legacy_imported`
+        // gate must not latch over an incomplete mirror (round-23 MAJOR-3 /
+        // round-24 m2 class, per-entry form).
+        // Hardened read: read_private_data_file refuses
+        // directories and non-regular entries, so a planted FIFO now
+        // ABORTS the one-shot import fail-closed instead of silently
+        // skipping (and latching the gate over a skipped mirror).
+        let marker_path = dir.join(".installed-from");
+        let marker = match read_private_data_file(&marker_path) {
+            Ok(marker) => marker,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("读取 {} 失败: {e}", marker_path.display())),
         };
         let marker = marker.trim();
         let dir_name = entry.file_name().to_string_lossy().into_owned();
@@ -711,22 +861,23 @@ fn legacy_skill_records() -> Vec<BundleRecord> {
             continue;
         }
         out.push(BundleRecord {
-            id,
-            source,
-            installed: true,
-            content_fingerprint: None,
             installed_at: now.clone(),
-            degraded: None,
-            extra: serde_json::Map::new(),
+            ..BundleRecord::installed_now(id, source)
         });
     }
-    out
+    Ok(out)
 }
 
 /// 内置 CLI 连接器 → Builtin 包记录。安装态判定：companion 技能目录在盘
 /// （连接时才解包）或 CLI 二进制在盘。存量二进制对照 lock 表验 SHA-256：
 /// 匹配 → 正常登记；不匹配/无法校验 → 记 `degraded`（§9.3，
-/// 修复动作 = 重新下载，物理搬移 `assets/cli/` 在后续 PR）。
+/// 修复动作 = 重新下载；旧布局搬移与同名残留清理由 connectors 侧
+/// `migrate_legacy_binary` 按 lock 校验执行（#608））。
+/// CLI 腿只做 `is_file` 存在性探测（无 read_dir 根可失败）——#608 移除了
+/// 仅为与另两腿签名对称而保留的空壳 `Result`（round-24 minor 2 的对称性
+/// 理由随空壳一并失效）；另两腿（registry / skill 扫描）保留 `Result`，
+/// 其 fail-closed 传播是 review #455 round-23 MAJOR 3 / round-29 m4 /
+/// round-30 m6 的契约。
 fn legacy_cli_records() -> Vec<BundleRecord> {
     let skills_dir = paths::bundle_skills_dir();
     let now = now_iso8601();
@@ -735,34 +886,31 @@ fn legacy_cli_records() -> Vec<BundleRecord> {
         let skills_present = bundle::cli_bundle_skill_dirs(id)
             .iter()
             .any(|d| skills_dir.join(d).join("SKILL.md").is_file());
-        let mut binary_verified = false;
+        let mut assets = Vec::new();
         let mut degraded = None;
         if let Some(bin) = bundle::cli_bundle_bin(id) {
             match cli_asset_state(bin) {
-                CliAssetState::Verified => binary_verified = true,
+                CliAssetState::Verified(asset) => assets.push(AssetEntry::Ref(asset)),
                 CliAssetState::Mismatch(reason) => degraded = Some(reason),
                 CliAssetState::Absent => {}
             }
         }
         // 技能目录与二进制都不在盘 = 未连接过，不登记
-        if !skills_present && !binary_verified && degraded.is_none() {
+        if !skills_present && assets.is_empty() && degraded.is_none() {
             continue;
         }
         out.push(BundleRecord {
-            id: id.to_string(),
-            source: BundleSource::Builtin,
-            installed: true,
-            content_fingerprint: None,
+            assets,
             installed_at: now.clone(),
             degraded,
-            extra: serde_json::Map::new(),
+            ..BundleRecord::installed_now(id, BundleSource::Builtin)
         });
     }
     out
 }
 
 enum CliAssetState {
-    Verified,
+    Verified(AssetRef),
     Mismatch(String),
     Absent,
 }
@@ -785,8 +933,14 @@ fn cli_asset_state(bin: &str) -> CliAssetState {
             "lock 表无 {bin} 条目，存量二进制无法校验，待重新下载"
         ));
     };
-    match connector_lock::file_sha256_hex(&path) {
-        Ok(actual) if actual == pin.binary_sha256 => CliAssetState::Verified,
+    match crate::platform::hashing::sha256_file(&path) {
+        Ok(actual) if actual == pin.binary_sha256 => CliAssetState::Verified(AssetRef {
+            kind: ASSET_KIND_CLI.to_string(),
+            name: bin.to_string(),
+            version: pin.version,
+            sha256: pin.binary_sha256,
+            ..AssetRef::default()
+        }),
         Ok(actual) => CliAssetState::Mismatch(format!(
             "CLI 二进制 SHA-256 与 lock 表不符（expected {}, got {actual}），待重新下载",
             pin.binary_sha256
@@ -795,16 +949,42 @@ fn cli_asset_state(bin: &str) -> CliAssetState {
     }
 }
 
+/// 连接镜像与旧布局导入共用的登记口径：盘上二进制 SHA-256 与 lock 表匹配才返回
+/// 其资产引用；二进制缺失/不匹配/无 lock 条目 → `None`（调用方降级为无 pin 记录，
+/// 不据此置 `degraded` —— 存证缺失不能推翻连接本身的成功）。
+pub(crate) fn verified_cli_asset(bin: &str) -> Option<AssetRef> {
+    match cli_asset_state(bin) {
+        CliAssetState::Verified(asset) => Some(asset),
+        CliAssetState::Mismatch(_) | CliAssetState::Absent => None,
+    }
+}
+
+/// Test-only fixture: register `id` as an installed record of `source` in the
+/// default bundle store (`BundleRecord::installed_now`) — the shape the
+/// scope/command gate tests plant before exercising a gate. New gate tests
+/// copy this helper instead of re-stating the fully-qualified
+/// `BundleStore::new().upsert(...)` ceremony.
+#[cfg(test)]
+pub(crate) fn plant_installed_record(id: &str, source: BundleSource) {
+    BundleStore::new()
+        .upsert(BundleRecord::installed_now(id, source))
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::test_support::with_temp_home;
+    // The helper is `#[cfg(all(test, unix))]`; its callers are `#[cfg(unix)]` tests.
+    #[cfg(unix)]
+    use crate::platform::test_support::file_unreadable_or_skip;
 
     fn record(id: &str, source: BundleSource) -> BundleRecord {
         BundleRecord {
             id: id.to_string(),
             source,
             installed: true,
+            assets: Vec::new(),
             content_fingerprint: None,
             installed_at: "2026-08-14T00:00:00+00:00".to_string(),
             degraded: None,
@@ -829,6 +1009,13 @@ mod tests {
             let store = BundleStore::new();
             let mut full = record("feishu", BundleSource::Builtin);
             full.content_fingerprint = Some("abc123".to_string());
+            full.assets = vec![AssetEntry::Ref(AssetRef {
+                kind: ASSET_KIND_CLI.to_string(),
+                name: "lark-cli".to_string(),
+                version: "1.2.3".to_string(),
+                sha256: "deadbeef".to_string(),
+                ..AssetRef::default()
+            })];
             full.degraded = Some("reason".to_string());
             store.upsert(full.clone()).unwrap();
             store
@@ -866,7 +1053,10 @@ mod tests {
             entries.sort();
             assert_eq!(
                 entries,
-                vec!["bundles.json".to_string()],
+                // bundles.lock is the cross-process file lock (#521), not a
+                // leftover tmp: the assertion's job is that no tmp residue
+                // survives an atomic write.
+                vec!["bundles.json".to_string(), "bundles.lock".to_string()],
                 "原子写不得残留 tmp 文件"
             );
         });
@@ -940,6 +1130,57 @@ mod tests {
         });
     }
 
+    /// Round-23 MAJOR 3: an unreadable installed.json must fail the legacy
+    /// import WITHOUT latching the one-shot `legacy_imported` gate and without
+    /// writing bundles.json — a swallowed read here would bake an incomplete
+    /// mirror into the store permanently (no later boot can repair it). After
+    /// the permissions are restored, the same call imports and latches.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_import_unreadable_registry_fails_without_latching_gate() {
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_home("pinvou3-store-test", || {
+            let store = BundleStore::new();
+            let home = paths::pinvou3_home();
+            let installed_path = home.join("marketplace/installed.json");
+            std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+            std::fs::write(&installed_path, r#"["gongwen"]"#).unwrap();
+            // Root probe (mode bits are no-ops for root): if the file is still
+            // readable, the unreadable-read branch never runs — skip loudly.
+            if !file_unreadable_or_skip(
+                &installed_path,
+                "legacy_import_unreadable_registry_fails_without_latching_gate",
+            ) {
+                return;
+            }
+
+            assert!(
+                store.import_legacy().is_err(),
+                "an unreadable registry must fail the import (fail loud, not swallow)"
+            );
+            let file = store.load().unwrap();
+            assert!(
+                !file.legacy_imported,
+                "the one-shot gate must stay unset so a later boot retries the import"
+            );
+            assert!(
+                file.records.is_empty(),
+                "no incomplete mirror may be persisted off a failed read"
+            );
+
+            // Permissions restored: the same call now imports and latches.
+            std::fs::set_permissions(&installed_path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            let report = store.import_legacy().unwrap();
+            assert_eq!(report.imported, vec!["gongwen".to_string()]);
+            let file = store.load().unwrap();
+            assert!(
+                file.legacy_imported,
+                "the successful import latches the gate"
+            );
+        });
+    }
+
     /// 首启导入：MCP（installed.json + manifest 凭据）、预置/上传技能标记、
     /// CLI 连接器（companion 技能在盘 + 存量二进制对照 lock 表）全部归位。
     #[test]
@@ -952,8 +1193,9 @@ mod tests {
                 std::fs::write(p, content).unwrap();
             };
             write("marketplace/installed.json", r#"["gongwen"]"#);
-            // MCP manifest 已迁按包聚合新布局：`legacy_mcp_records` 经 installed_ids()
-            // 读登记 id（manifest 本体现在只影响 kind/凭据查询，不进记录）。
+            // MCP manifest 已迁按包聚合新布局：`legacy_mcp_records` 经
+            // try_installed_ids() 读登记 id（manifest 本体现在只影响 kind/凭据查询，
+            // 不进记录）。
             write(
                 "bundles/gongwen/mcp/manifest.json",
                 r#"{"id":"gongwen","name":"公文写作","description":"d","version":"1.0.0","icon":"","category":"office","mcp_tools":[],"command":"","args":[],"config_fields":[{"key":"GONGWEN_KEY","label":"k","required":true}]}"#,
@@ -1041,9 +1283,11 @@ mod tests {
         });
     }
 
-    /// 首启登记：企微按 1.1.0 的 14 新名识别「连接过」（五轮评审必修 3：旧 7 名
-    /// 表会让升级自 wecom-cli 1.1.0 的用户漏登 wecom 安装记录——`legacy_imported`
-    /// 闸一次性置位，错过即永久错过）。
+    /// 首启登记：企微识别表现已为 15 名表（1.1.0 重排的 14 新名 + 1.3.4 新增
+    /// wecomcli-pptx），重点是 1.2.1 及更早时代装机的 14 目录在 15 名表下仍被
+    /// 识别为「连接过」（五轮评审必修 3：旧 7 名表会让升级自 wecom-cli 1.1.0
+    /// 的用户漏登 wecom 安装记录——`legacy_imported` 闸一次性置位，错过即永久
+    /// 错过）。
     #[test]
     fn import_legacy_registers_wecom_by_new_skill_dirs() {
         with_temp_home("pinvou3-store-test", || {
@@ -1108,6 +1352,81 @@ mod tests {
         });
     }
 
+    /// Round-29 m4 (review #455): an EXISTS-but-unreadable `.installed-from`
+    /// marker must abort the legacy import (Err) instead of being silently
+    /// skipped — the one-shot `legacy_imported` gate must not latch over an
+    /// incomplete mirror (round-23 MAJOR-3 / round-24 m2 class, per-entry
+    /// form). A no-marker dir stays a plain skip.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_import_unreadable_marker_aborts_before_gate_latches() {
+        with_temp_home("pinvou3-store-test", || {
+            let skills = paths::bundle_skills_dir();
+            let good = skills.join("good");
+            std::fs::create_dir_all(&good).unwrap();
+            std::fs::write(good.join(".installed-from"), "pinvou3-marketplace:legacy-a").unwrap();
+            let sealed = skills.join("sealed");
+            std::fs::create_dir_all(&sealed).unwrap();
+            std::fs::write(
+                sealed.join(".installed-from"),
+                "pinvou3-marketplace:legacy-b",
+            )
+            .unwrap();
+            let sealed_marker = sealed.join(".installed-from");
+            // Root probe (mode bits are no-ops for root): if the marker is
+            // still readable, the unreadable-read branch never runs — skip
+            // loudly.
+            if !file_unreadable_or_skip(
+                &sealed_marker,
+                "legacy_import_unreadable_marker_aborts_before_gate_latches",
+            ) {
+                return;
+            }
+            // 无标记目录仍是普通跳过，不得触发任何错误路径。
+            std::fs::create_dir_all(skills.join("bare")).unwrap();
+
+            let store = BundleStore::new();
+            let err = store.import_legacy().unwrap_err();
+            assert!(
+                err.contains(".installed-from") || err.contains("读取"),
+                "the unreadable marker must abort the import: {err}"
+            );
+            assert!(
+                !store.load().unwrap().legacy_imported,
+                "the one-shot gate must not latch over an aborted import"
+            );
+        });
+    }
+
+    /// A planted DIRECTORY at `.installed-from` must
+    /// abort the legacy import exactly like the unreadable regular file —
+    /// the is_file gate reads it as "no marker", which would silently latch
+    /// the one-shot `legacy_imported` gate over a skipped mirror.
+    #[test]
+    fn legacy_import_marker_directory_aborts_before_gate_latches() {
+        with_temp_home("pinvou3-store-test", || {
+            let skills = paths::bundle_skills_dir();
+            let planted = skills.join("planted");
+            std::fs::create_dir_all(planted.join(".installed-from")).unwrap();
+            std::fs::write(
+                planted.join(".installed-from").join("keep"),
+                b"pinvou3-marketplace:legacy-a",
+            )
+            .unwrap();
+
+            let store = BundleStore::new();
+            let err = store.import_legacy().unwrap_err();
+            assert!(
+                err.contains(".installed-from"),
+                "the directory marker must abort the import: {err}"
+            );
+            assert!(
+                !store.load().unwrap().legacy_imported,
+                "the one-shot gate must not latch over an aborted import"
+            );
+        });
+    }
+
     #[test]
     fn remove_deletes_record_and_missing_id_is_false() {
         with_temp_home("pinvou3-store-test", || {
@@ -1129,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_and_clear_degraded_roundtrip() {
+    fn mark_degraded_roundtrip() {
         with_temp_home("pinvou3-store-test", || {
             let store = BundleStore::new();
             store
@@ -1141,12 +1460,8 @@ mod tests {
                 store.get("feishu").unwrap().unwrap().degraded,
                 Some("二进制缺失".to_string())
             );
-            // 清除路径走私有 set_degraded(id, None)（公开包装已随死代码清理删除）
-            assert!(store.set_degraded("feishu", None).unwrap());
-            assert_eq!(store.get("feishu").unwrap().unwrap().degraded, None);
             // 不存在的 id：Ok(false)，不误建记录
             assert!(!store.mark_degraded("ghost", "x").unwrap());
-            assert!(!store.set_degraded("ghost", None).unwrap());
             assert!(store.get("ghost").unwrap().is_none());
         });
     }
@@ -1174,6 +1489,164 @@ mod tests {
             assert_eq!(merged.content_fingerprint, Some("fp-v1".to_string()));
             assert_eq!(store.records().unwrap().len(), 1, "不得产生重复记录");
         });
+    }
+
+    fn cli_asset(version: &str) -> AssetEntry {
+        AssetEntry::Ref(AssetRef {
+            kind: ASSET_KIND_CLI.to_string(),
+            name: "lark-cli".to_string(),
+            version: version.to_string(),
+            sha256: "ab".repeat(32),
+            ..AssetRef::default()
+        })
+    }
+
+    #[test]
+    fn upsert_preserving_keeps_assets_unless_the_new_record_carries_some() {
+        with_temp_home("pinvou3-store-test", || {
+            let store = BundleStore::new();
+            let mut first = record("feishu", BundleSource::Builtin);
+            first.assets = vec![cli_asset("1.0.0")];
+            store.upsert(first).unwrap();
+
+            // A writer that does not track assets (the GUI connector mirror)
+            // must not wipe them.
+            store
+                .upsert_preserving(BundleRecord::installed_now("feishu", BundleSource::Builtin))
+                .unwrap();
+            assert_eq!(
+                store.get("feishu").unwrap().unwrap().assets,
+                vec![cli_asset("1.0.0")]
+            );
+
+            // A writer that does track them can replace a stale pin.
+            let mut repinned = BundleRecord::installed_now("feishu", BundleSource::Builtin);
+            repinned.assets = vec![cli_asset("1.1.0")];
+            store.upsert_preserving(repinned).unwrap();
+            assert_eq!(
+                store.get("feishu").unwrap().unwrap().assets,
+                vec![cli_asset("1.1.0")]
+            );
+        });
+    }
+
+    /// 登记口径的不匹配腿：旧布局位上有二进制但内容与 lock 表不符（无 lock
+    /// 条目的平台是同一 Mismatch 臂的「lock 表无条目」）→ 拒绝给 pin。Verified
+    /// 腿需要对 lock 内嵌哈希求 preimage，单测不可构造，由 ensure/installer 的
+    /// 同一 SHA-256 校验链覆盖。
+    #[test]
+    fn verified_cli_asset_needs_the_hash_to_match_the_lock_table() {
+        with_temp_home("pinvou3-cli-asset-mismatch", || {
+            let Some(bin) = bundle::cli_bundle_bin("feishu") else {
+                panic!("feishu 是内置 CLI 包，必有二进制名");
+            };
+            let dir = paths::managed_connector_bin_dir()
+                .expect("受支持平台必有 connectors/<platform>/bin 布局");
+            std::fs::create_dir_all(&dir).unwrap();
+            let planted = dir.join(connector_lock::executable_name(bin));
+            std::fs::write(&planted, b"not the pinned bytes").unwrap();
+            assert!(
+                matches!(cli_asset_state(bin), CliAssetState::Mismatch(_)),
+                "哈希不符（或无 lock 条目）必须落在 Mismatch 臂"
+            );
+            assert!(verified_cli_asset(bin).is_none(), "Mismatch 不得给 pin");
+        });
+    }
+
+    #[test]
+    fn unreadable_asset_entries_neither_fail_the_load_nor_get_dropped() {
+        with_temp_home("pinvou3-store-test", || {
+            let store = BundleStore::new();
+            let path = store.file_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let assets = serde_json::json!([
+                {"kind": "cli", "name": "lark-cli", "version": "1.0.0",
+                 "sha256": "abc", "platforms": ["darwin"]},
+                {"kind": "cli", "name": "wecom-cli", "version": 2},
+                {"kind": "pip", "name": "requests"},
+                "not-an-object",
+            ]);
+            let file = serde_json::json!({
+                "schema_version": 1,
+                "legacy_imported": true,
+                "records": [{"id": "feishu", "source": "builtin", "installed": true,
+                             "installed_at": "2026-08-14T00:00:00Z", "assets": assets}],
+            });
+            std::fs::write(&path, file.to_string()).unwrap();
+
+            let loaded = store.get("feishu").unwrap().unwrap();
+            let AssetEntry::Ref(first) = &loaded.assets[0] else {
+                panic!("a well-formed entry must parse as a typed ref");
+            };
+            assert_eq!(first.name, "lark-cli");
+            assert_eq!(
+                first.extra.get("platforms"),
+                Some(&serde_json::json!(["darwin"]))
+            );
+            assert!(
+                loaded.assets[1..]
+                    .iter()
+                    .all(|entry| matches!(entry, AssetEntry::Unrecognized(_))),
+                "entries this binary cannot read must stay unrecognized, not fail the load"
+            );
+
+            // A read-modify-write preserves every entry as an equal JSON
+            // value: unrecognized entries round-trip verbatim, recognized
+            // ones re-serialize canonically with their unknown fields kept.
+            // Not byte-exact — object key order is normalized on save, and
+            // the whole file is re-pretty-printed, before and after this PR.
+            store.mark_degraded("feishu", "probe").unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(value["records"][0]["assets"], assets);
+        });
+    }
+
+    /// The `assets` container itself stays fail-loud (see the field doc):
+    /// a record whose `assets` is not an array fails the whole load like
+    /// corrupt JSON rather than reading as "no assets" — only the
+    /// per-entry degrade is tolerant.
+    #[test]
+    fn unreadable_assets_container_fails_the_load_loud() {
+        with_temp_home("pinvou3-store-test", || {
+            let store = BundleStore::new();
+            let path = store.file_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for bad in ["null", "\"pins\"", "{\"kind\": \"cli\"}"] {
+                // `installed_at` is present so the assets container is the
+                // ONLY thing that can fail this load — otherwise a missing
+                // required field fails it first and the assertion passes
+                // while blind to the rule it guards.
+                let file = format!(
+                    r#"{{"schema_version": 1, "records": [{{"id": "feishu", "source": "builtin", "installed": true, "installed_at": "2026-09-30T00:00:00Z", "assets": {bad}}}]}}"#
+                );
+                std::fs::write(&path, file).unwrap();
+                assert!(
+                    store.load().is_err(),
+                    "`assets: {bad}` must fail the whole load, not read as empty"
+                );
+            }
+        });
+    }
+
+    /// The load's unreadable-entry announcement targets exactly the records
+    /// that carry an unrecognized entry — not clean records, and not
+    /// records that merely have no assets at all.
+    #[test]
+    fn unrecognized_asset_announce_targets_the_right_records() {
+        let mut flagged = record("feishu", BundleSource::Builtin);
+        flagged.assets = vec![AssetEntry::Unrecognized(serde_json::json!("not-an-object"))];
+        let mut clean = record("gongwen", BundleSource::Builtin);
+        clean.assets = vec![cli_asset("1.0.0")];
+        let pinless = record("dingtalk", BundleSource::Builtin);
+        let file = BundlesFile {
+            records: vec![flagged, clean, pinless],
+            ..BundlesFile::default()
+        };
+        assert_eq!(
+            unrecognized_asset_record_ids(&file),
+            vec!["feishu".to_string()]
+        );
     }
 
     /// 回归（四轮评审 BLOCKER 1）：既有记录的来源必须保留 —— 上传包重装时
@@ -1470,5 +1943,107 @@ mod tests {
                 "upsert_preserving 不得丢备份 key"
             );
         });
+    }
+
+    /// #515/#521 cross-process contention on the WRITE path: while a foreign
+    /// fd holds the bundles OS lock, the save must not land first; after the
+    /// release the write lands with its full content.
+    #[test]
+    fn cross_process_lock_blocks_save_write_until_release() {
+        with_temp_home("pinvou3-store-cross-process-save", || {
+            let store = BundleStore::new();
+            let data_path = store.file_path();
+            let lock_path = file_lock::lock_path_for(&data_path);
+            let worker = file_lock::with_foreign_write_lock(&lock_path, || {
+                let worker = std::thread::spawn(move || {
+                    store
+                        .upsert(record("weather", BundleSource::Preset))
+                        .expect("write should succeed once the foreign lock is released");
+                });
+                file_lock::wait_until_process_mutex_parked(&lock_path, "bundles");
+                // The write must not land while the peer holds the lock.
+                let window = std::time::Duration::from_secs(2);
+                let deadline = std::time::Instant::now() + window;
+                while std::time::Instant::now() < deadline {
+                    assert!(
+                        !data_path.exists(),
+                        "data file written while the lock was still held — serialization is broken"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                worker
+            });
+            worker
+                .join()
+                .expect("worker should finish once the foreign lock is released");
+            let content = std::fs::read_to_string(&data_path).unwrap();
+            assert!(
+                content.contains("\"weather\""),
+                "write should land after the lock is released: {content}"
+            );
+        });
+    }
+
+    /// #515/#521 cross-process contention on the READ path: while a peer holds
+    /// the OS lock, a load must degrade promptly to the unlocked, never-
+    /// persisting view (bounded — readers never couple to a peer's critical
+    /// section) instead of blocking or writing. A missing file stays missing
+    /// (a pure read must not create the store), contended or not.
+    #[test]
+    fn cross_process_lock_contention_degrades_read_without_persist() {
+        with_temp_home("pinvou3-store-cross-process-read", || {
+            let store = BundleStore::new();
+            let lock_path = file_lock::lock_path_for(&store.file_path());
+            file_lock::with_foreign_write_lock(&lock_path, || {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    let got = BundleStore::new().load();
+                    done_tx.send(got).expect("reader should send its result");
+                });
+                // A contended read must return promptly. recv_timeout doubles as
+                // the regression assertion: a blocking read hangs here and fails
+                // the test with a bounded, diagnosable timeout.
+                let got = done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("contended read must degrade instead of blocking on the peer's lock");
+                assert!(
+                    got.unwrap().records.is_empty(),
+                    "a missing store reads as empty under contention"
+                );
+                assert!(
+                    !store.file_path().exists(),
+                    "a contended read must not persist (create) the store file"
+                );
+                reader.join().expect("reader thread should finish");
+            });
+        });
+    }
+
+    /// `load_locked` runs inside the bundles.json file lock
+    /// and — via the scope DenyAll expansion — inside the scope lock's
+    /// critical section, so it must route through the hardened read. Symlink
+    /// pin (unix-only API, same convention as recycle_bin.rs): a planted
+    /// symlink at the path must be refused by the hardened open (O_NOFOLLOW)
+    /// — a plain `read_to_string` would silently follow it — and the refusal
+    /// must not block the lock holder. Behavioral pin that the routing
+    /// survived refactors (the platform primitive's own tests cover the
+    /// mechanism, FIFO shape included).
+    #[cfg(unix)]
+    #[test]
+    fn load_locked_refuses_a_planted_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("bundles.json");
+        let target = temp.path().join("outside.json");
+        std::fs::write(
+            &target,
+            r#"{"schema_version": 1, "legacy_imported": false, "records": []}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+
+        assert!(
+            load_locked(&file).is_err(),
+            "a planted symlink must be refused by the hardened open, not followed"
+        );
     }
 }

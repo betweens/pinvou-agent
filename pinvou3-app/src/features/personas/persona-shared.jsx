@@ -1,25 +1,29 @@
-// 人格卡共享件:ChatView / tool-renderers / SubagentTranscriptPanel 等主 chunk
-// 消费的小件(头像块、部门配色、多语言取名)从 Personas.jsx 抽出,使卡池视图
-// (CardPoolView/PersonaEditorModal)可独立成懒加载 chunk,不再把
-// 主 chunk 的常驻引用一并拖进卡池。内容与 Personas.jsx 原实现的唯一差异:
-// AppIcon 的头像 img 补了 loading="lazy" decoding="async"(本 PR 主题内优化)。
+// Persona-card shared pieces: the small widgets (avatar block, department
+// colors, multilingual naming) consumed by the main chunk (ChatView /
+// tool-renderers / SubagentTranscriptPanel) were extracted from
+// Personas.jsx so the card-pool views (CardPoolView/PersonaEditorModal) can
+// be a standalone lazy chunk instead of pinning them into the main entry.
 import { useState } from 'react';
 import { AppWindow, Award, Briefcase, Cpu, Feather, Globe, Lock, Navigation, Palette, Radio, Terminal, TrendingUp, User } from '../../components/icons.jsx';
-import { dict } from '../../shared/i18n.js';
-    // 部门标签按当前 UI 语言取词(t.depts),中文词典(dict.zh.depts)兜底
-export function deptLabelFor(t, k) { return (t && t.depts && t.depts[k]) || (dict.zh.depts && dict.zh.depts[k]) || k; }
-    // 内置卡名称/简介按 UI 语言显示(personas-i18n.js overlay,按 id 查),中文兜底;自制卡不翻
+import { zhDict } from '../../shared/i18n.js';
+import { personaOverlayFor } from '../../shared/persona-overlay.js';
+    // iOS-style font stack shared by the Persona surfaces (5 call sites in
+    // Personas/persona-shared/SavedPersonaConfirmDialog); the promo banner in
+    // Personas.jsx deliberately keeps its shorter 4-font stack from main.
+export const IOS_FONT_STACK = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif';
+    // Department labels follow the UI language (t.depts) with the zh dictionary
+    // (zhDict().depts) as the fallback.
+export function deptLabelFor(t, k) { return (t && t.depts && t.depts[k]) || (zhDict().depts && zhDict().depts[k]) || k; }
+    // Built-in card name/bio render per UI language (personas-i18n.js overlay,
+    // keyed by id) with zh fallback; user-made cards are never translated.
 export function personaText(c, t) {
-      const L = t && t.langTag;
-      if (!c || !L || L === 'zh' || c.source === 'user') return c || {};
-      const overlays = window.PERSONA_I18N;
-      const tr = (overlays && overlays[c.id] && overlays[c.id][L]) || null;
-      if (!tr) return c;
+      const tr = personaOverlayFor(c, t && t.langTag);
+      if (!tr) return c || {};
       return { ...c, name: tr.name || c.name, description: tr.description || c.description };
     }
 export const DEPT_ORDER = ['engineering','marketing','specialized','design','product','finance','sales','testing','project-management','paid-media','support','academic','game-development','spatial-computing','gis','security','supply-chain','hr','legal','tool'];
 export const ALL_DEPT = '__all__'; // 分类「全部」哨兵(语言中立,显示走 t.cpAll)
-const DEPT_COLOR = { academic:'#8B5CF6', design:'#EC4899', engineering:'#06B6D4', finance:'#10B981', 'game-development':'#F59E0B', gis:'#0EA5E9', hr:'#F472B6', legal:'#6B7280', marketing:'#F97316', 'paid-media':'#EF4444', product:'#7C3AED', 'project-management':'#3B82F6', sales:'#14B8A6', security:'#F43F5E', 'spatial-computing':'#6366F1', specialized:'#64748B', 'supply-chain':'#84CC16', support:'#22D3EE', testing:'#A855F7', tool:'#7C3AED' };
+const DEPT_COLOR = { academic:'#8B5CF6', design:'#EC4899', engineering:'#06B6D4', finance:'#10B981', 'game-development':'#F59E0B', gis:'#0EA5E9', hr:'#F472B6', legal:'#6B7280', marketing:'#F97316', 'paid-media':'#EF4444', product:'#7C3AED', 'project-management':'#3B82F6', sales:'#14B8A6', security:'#F43F5E', 'spatial-computing':'#6366F1', specialized:'#64748B', 'supply-chain':'#84CC16', support:'#22D3EE', testing:'#A855F7' };
     // 可在编辑器下拉选的部门(排除 tool —— 那是内置工具卡专用)
 export const DEPT_OPTIONS = DEPT_ORDER.filter(function(d){ return d !== 'tool'; });
 export const deptColor = (d) => DEPT_COLOR[d] || '#9aa0a6';
@@ -54,15 +58,15 @@ export const AppIcon = ({ card, cls = 'w-14 h-14 rounded-[14px]', fb = 26 }) => 
       if (!persona) return null;
       const cd = personaText(persona, t);
       return (
-        <div className="absolute top-0 left-6 z-[15]" style={{ width:150, fontFamily:'-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif' }}>
+        <div className="absolute top-0 left-6 z-[15]" style={{ width:150, fontFamily: IOS_FONT_STACK }}>
           <div className="flex flex-col items-center">
             {/* 挂绳 + 扣环 */}
             {/* isDark dynamic-value: 保留 (linear-gradient 无法纯 className 化) */}
             <div style={{ width:2, height:52, background: isDark?'linear-gradient(#3a3a3c,#5a5a5e)':'linear-gradient(#d1d1d6,#aeaeb2)' }}></div>
             <div className="w-2.5 h-2.5 rounded-full -mt-1 mb-2 bg-[#e8e8ed] dark:bg-[#1c1c1e] border-2 border-[#c7c7cc] dark:border-[#48484a]"></div>
             {/* 卡片 */}
-            {/* biome-ignore lint/a11y/useKeyWithClickEvents: lanyard-card click is a mouse shortcut; the keyboard path is served by controls inside the card-pool popover */}
-            {/* biome-ignore lint/a11y/noStaticElementInteractions: lanyard-card click hot zone; not a standalone interactive control */}
+            {/* biome-ignore lint/a11y/useKeyWithClickEvents: swap hot-zone click is a mouse shortcut; the keyboard path is served by controls inside the card-pool popover */}
+            {/* biome-ignore lint/a11y/noStaticElementInteractions: swap hot zone; not a standalone interactive control */}
             <div onClick={onOpenPicker} title={t.cpLanyardSwap}
               className="relative rounded-[14px] p-3 w-[150px] cursor-pointer transition-transform hover:-translate-y-0.5 bg-[#fff] dark:bg-[#1C1C1E] border border-[rgba(0,0,0,.06)] dark:border-[#2c2c2e]"
               style={{ boxShadow:'0 8px 24px -8px rgba(0,0,0,.3)' }}>

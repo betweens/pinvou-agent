@@ -14,9 +14,10 @@ use crate::platform::prefs::ModelPreset;
 
 use super::io::{
     commit_topic_migration_unlocked_with, compact_timed_memory_store_unlocked, current_focus_path,
-    enqueue_memory_candidate, is_delivery_tool, load_preferences, load_profile,
-    pending_item_from_suggestion, reconcile_topic_migration_journals_unlocked,
-    summarize_tool_start, topic_migration_journal_path, upsert_timed_memory_unlocked, write_lock,
+    enqueue_memory_candidate, is_delivery_tool, list_preferences, load_profile,
+    pending_item_from_suggestion, recent_activity_path,
+    reconcile_topic_migration_journals_unlocked, summarize_tool_start,
+    topic_migration_journal_path, upsert_timed_memory_unlocked, write_lock,
     write_never_memory_unlocked, write_pending_memory_unlocked, write_recent_work_unlocked,
     write_timed_memory_file,
 };
@@ -24,7 +25,7 @@ use super::llm_review::{
     LLM_REVIEW_PROMPT_TEMPLATE, append_memory_review_diagnostic_to, apply_llm_memory_review,
     apply_memory_review_reasoning_controls, assistant_suggests_delivery_complete,
     has_explicit_remember_signal, has_memory_review_signal, memory_review_error_stage,
-    parse_llm_memory_review, sanitize_llm_memory_item,
+    memory_review_request_body, parse_llm_memory_review, sanitize_llm_memory_item,
 };
 use super::render::{render_from_parts, render_memory_block};
 // 引入全部常量（MAX_STORED / PENDING_STATUS_* / PROFILE_VERSION / Llm* 实体）。
@@ -278,6 +279,31 @@ fn corrupted_authoritative_file_self_heals_from_backup() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn repeated_unparsable_journals_each_keep_their_quarantined_bytes() {
+    let root = recovery_test_root("journal-quarantine-repeat");
+    let journal = topic_migration_journal_path(&root.join("topic.json")).unwrap();
+    for garbage in ["first corruption", "second corruption"] {
+        fs::write(&journal, garbage).unwrap();
+        reconcile_topic_migration_journals_unlocked::<PreferenceFile>(&root).unwrap();
+        assert!(
+            !journal.exists(),
+            "an unparsable journal must be moved aside"
+        );
+    }
+    let mut quarantined: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    quarantined.sort();
+    assert_eq!(
+        quarantined,
+        ["first corruption", "second corruption"],
+        "the second quarantine in one process must not replace the first"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 fn preference_fixture(id: &str, topic: &str, text: &str) -> PreferenceFile {
     PreferenceFile {
         id: id.to_string(),
@@ -417,7 +443,7 @@ fn preference_and_work_context_topic_updates_commit_before_old_cleanup() {
     assert_eq!(context.value.topic, "project_context");
     assert!(!old_preference_path.exists());
     assert!(!old_context_path.exists());
-    assert_eq!(load_preferences().unwrap().len(), 1);
+    assert_eq!(list_preferences().unwrap().len(), 1);
     assert_eq!(load_work_context().unwrap().len(), 1);
     drop(home);
 }
@@ -457,7 +483,7 @@ fn topic_migration_lifecycle_hides_intermediate_duplicate_from_overview() {
     });
     ready.wait();
     let (sent, received) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || sent.send(load_preferences()).unwrap());
+    let reader = std::thread::spawn(move || sent.send(list_preferences()).unwrap());
     assert!(
         received
             .recv_timeout(std::time::Duration::from_millis(30))
@@ -801,6 +827,13 @@ fn memory_review_diagnostic_classifies_request_parse_and_apply_failures() {
         memory_review_error_stage(&anyhow::anyhow!("parse memory review json")),
         "parse_failed"
     );
+    // The empty-response marker files as parse-stage, not apply_failed —
+    // same response-content-anomaly class as bad JSON (see
+    // memory_review_error_stage and the parser's empty-response rejection).
+    assert_eq!(
+        memory_review_error_stage(&anyhow::anyhow!("memory review returned an empty response")),
+        "parse_failed"
+    );
     assert_eq!(
         memory_review_error_stage(&anyhow::anyhow!("auto write work context")),
         "apply_failed"
@@ -861,7 +894,7 @@ fn authoritative_writes_commit_when_derived_runtime_source_is_unavailable() {
     })
     .unwrap();
     confirm_pending_memory(&preference.id).unwrap().unwrap();
-    let preference_id = load_preferences().unwrap()[0].id.clone();
+    let preference_id = list_preferences().unwrap()[0].id.clone();
 
     fs::create_dir_all(recent_work_path().parent().unwrap()).unwrap();
     fs::write(recent_work_path(), "not-json\n").unwrap();
@@ -877,11 +910,11 @@ fn authoritative_writes_commit_when_derived_runtime_source_is_unavailable() {
     .unwrap();
     assert_eq!(updated.value.text, "Use detailed answers");
     assert!(updated.cleanup_warning.is_none());
-    assert_eq!(load_preferences().unwrap()[0].text, "Use detailed answers");
+    assert_eq!(list_preferences().unwrap()[0].text, "Use detailed answers");
     assert!(render_memory_block().is_err());
 
     assert!(delete_preference(&preference_id).unwrap());
-    assert!(load_preferences().unwrap().is_empty());
+    assert!(list_preferences().unwrap().is_empty());
     assert!(render_memory_block().is_err());
 
     let profile_candidate = enqueue_memory_candidate(MemorySuggestion {
@@ -1042,6 +1075,16 @@ fn llm_review_parser_accepts_json_object() {
     assert_eq!(suggestion.content, "回答默认先给结论");
 }
 
+// 空响应(拒绝/内容过滤/缺 choices)是模型或传输侧异常:review 侧与 organize
+// 侧同口径必须报错,而不是产出假的 no_change 成功。
+#[test]
+fn llm_review_parser_rejects_empty_response() {
+    let error = parse_llm_memory_review("").unwrap_err();
+    assert!(error.to_string().contains("empty response"));
+    let error = parse_llm_memory_review("   \n  ").unwrap_err();
+    assert!(error.to_string().contains("empty response"));
+}
+
 #[test]
 fn llm_review_sanitizer_does_not_override_recent_kind_by_status_words() {
     let item = LlmMemoryItem {
@@ -1096,6 +1139,21 @@ fn llm_review_sanitizer_applies_per_store_text_caps() {
 }
 
 #[test]
+fn work_context_normalizes_to_the_exported_cap() {
+    // The final storage gate must truncate to WORK_CONTEXT_TEXT_MAX_CHARS —
+    // the exported constant the CLI validates against. A regression back to
+    // a local literal is behavior-identical while the values match, so pin
+    // the constant itself here.
+    let mut item: WorkContextFile = serde_json::from_value(serde_json::json!({})).unwrap();
+    item.text = "记".repeat(super::io::WORK_CONTEXT_TEXT_MAX_CHARS + 5);
+    super::io::normalize_work_context(&mut item);
+    assert_eq!(
+        item.text.chars().count(),
+        super::io::WORK_CONTEXT_TEXT_MAX_CHARS
+    );
+}
+
+#[test]
 fn llm_review_prompt_matches_supported_actions() {
     assert!(
         LLM_REVIEW_PROMPT_TEMPLATE
@@ -1103,6 +1161,53 @@ fn llm_review_prompt_matches_supported_actions() {
     );
     assert!(!LLM_REVIEW_PROMPT_TEMPLATE.contains("archive"));
     assert!(!LLM_REVIEW_PROMPT_TEMPLATE.contains("must_create_recent_activity"));
+}
+
+/// The memory one-shot body must mirror the engine wire (no temperature): a
+/// hard-coded 0 400s on sampling-pinned gateways (Kimi Coding Plan, live
+/// 2026-09-30: only 1 is allowed for this model).
+#[test]
+fn memory_review_request_body_mirrors_engine_wire_no_temperature() {
+    let body = memory_review_request_body("k3", "sys prompt", "user content", 900);
+    assert!(
+        body.get("temperature").is_none(),
+        "aux memory body must mirror the engine wire (no temperature)"
+    );
+    assert_eq!(body["model"], "k3");
+    assert_eq!(body["max_tokens"], 900);
+    assert_eq!(body["stream"], false);
+    assert_eq!(body["response_format"]["type"], "json_object");
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][0]["content"], "sys prompt");
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert_eq!(body["messages"][1]["content"], "user content");
+}
+
+/// Pin the call site, not just the builder: the pin above goes red when
+/// `memory_review_request_body` itself changes, but a re-inlined body inside
+/// `send_memory_llm_request` would bypass it silently. The request region
+/// must build through the shared builder and must not carry a sampling
+/// parameter (the Kimi Coding Plan gateway rejects client temperature).
+#[test]
+fn send_memory_llm_request_call_site_builds_body_through_builder() {
+    let source = include_str!("llm_review.rs");
+    let start = source
+        .find("async fn send_memory_llm_request")
+        .expect("send_memory_llm_request definition present");
+    let region = &source[start
+        ..source[start..]
+            .find("pub(super) fn memory_review_request_body")
+            .expect("memory_review_request_body definition present")
+            + start];
+    assert!(
+        region.contains("memory_review_request_body("),
+        "send_memory_llm_request must build its body via \
+         memory_review_request_body"
+    );
+    assert!(
+        !region.contains("\"temperature\""),
+        "the memory request region must not re-inline a temperature field"
+    );
 }
 
 /// The memory review prompt body carries no language constraint of its own; the
@@ -1222,7 +1327,7 @@ fn scenario_review_writes_long_and_recent_memories() {
 
     let profile = load_profile().unwrap();
     assert_eq!(profile.identity.call_name, "欣哥");
-    assert!(load_preferences().unwrap().is_empty());
+    assert!(list_preferences().unwrap().is_empty());
     let pending = load_pending_memory().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].kind, "preference");
@@ -1254,7 +1359,7 @@ fn scenario_review_writes_long_and_recent_memories() {
     assert!(!block_before_confirm.contains("回答默认先给结论"));
 
     confirm_pending_memory(&pending[0].id).unwrap().unwrap();
-    let preferences = load_preferences().unwrap();
+    let preferences = list_preferences().unwrap();
     assert_eq!(preferences.len(), 1);
     assert_eq!(preferences[0].topic, "answer_style");
     assert!(preferences[0].text.contains("先给结论"));
@@ -1300,7 +1405,7 @@ fn scenario_review_filters_low_quality_memory() {
     assert!(outcome.events.is_empty());
     assert!(outcome.pending.is_empty());
     assert!(load_profile().unwrap().identity.call_name.is_empty());
-    assert!(load_preferences().unwrap().is_empty());
+    assert!(list_preferences().unwrap().is_empty());
     assert!(load_work_context().unwrap().is_empty());
     assert!(load_current_focus().unwrap().is_empty());
     assert!(load_recent_activity().unwrap().is_empty());
@@ -2253,7 +2358,7 @@ async fn organize_memory_merges_duplicates_and_deletes_stale_focus() {
 
     // After the merge only one preference remains, holding the merged content;
     // the stale focus entry is deleted.
-    let preferences = load_preferences().unwrap();
+    let preferences = list_preferences().unwrap();
     assert_eq!(preferences.len(), 1);
     assert!(preferences[0].text.contains("再给步骤"));
     assert!(load_current_focus().unwrap().is_empty());
@@ -2389,7 +2494,7 @@ async fn organize_update_ignores_model_topic_and_never_migrates_buckets() {
     let report = organize_memory_with_llm(&bridge, None).await.unwrap();
 
     assert_eq!(report.updated["preference"], 1);
-    let preferences = load_preferences().unwrap();
+    let preferences = list_preferences().unwrap();
     assert_eq!(
         preferences.len(),
         2,
@@ -2456,7 +2561,7 @@ async fn organize_merge_skips_source_deletion_when_keep_update_fails() {
     // The source entry survives, nothing is counted, but a "merge skipped"
     // warning is left behind.
     assert!(
-        load_preferences()
+        list_preferences()
             .unwrap()
             .iter()
             .any(|item| item.id == id_b),
@@ -2471,6 +2576,96 @@ async fn organize_merge_skips_source_deletion_when_keep_update_fails() {
         "unexpected warnings: {:?}",
         report.warnings
     );
+}
+
+/// Cross-process half of the single-flight guard: the ORGANIZE_IN_FLIGHT
+/// mutex above only covers this process, so a second organize from another
+/// process (the CLI while the GUI's scheduled task is organizing) is fenced
+/// out by the advisory file lock in the memory data directory. Holding the
+/// lock the way the other process would must make the call fail fast with
+/// the actionable busy error — no model contact, no history entry.
+#[tokio::test]
+async fn organize_memory_rejects_second_pass_while_pass_lock_is_held() {
+    let _home = IsolatedPinvouHome::new("organize-cross-process-lock");
+    enable_memory_for_tests();
+    let holder = super::io::try_lock_organize_pass().expect("lock must be free at test start");
+    // Port 9 (discard) almost certainly refuses connections: if a locked-out
+    // pass (wrongly) proceeded to the LLM call, the error below would carry a
+    // request failure instead of the busy message.
+    let bridge = FakeOrganizeModel {
+        base_url: "http://127.0.0.1:9".to_string(),
+    };
+
+    let started = std::time::Instant::now();
+    let error = organize_memory_with_llm(&bridge, None).await.unwrap_err();
+
+    // Fail fast: the try-lock must reject immediately, not queue behind the
+    // holder (and not spend the ~75s LLM timeout first).
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a locked-out pass must fail immediately (took {:?})",
+        started.elapsed()
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("another organize pass is already running"),
+        "unexpected error: {error:#}"
+    );
+    assert!(load_organize_history().is_empty());
+
+    // Releasing the holder (the other process finishing) frees the pass
+    // again; the lock file itself stays behind and must not block it.
+    drop(holder);
+    assert!(super::io::organize_lock_path().is_file());
+    let relock = super::io::try_lock_organize_pass();
+    assert!(
+        relock.is_ok(),
+        "a leftover lock file must not block the next pass"
+    );
+}
+
+/// The pass lock is a scoped RAII guard: a pass that errors mid-way (here:
+/// the model response is unparseable, after the LLM call already spent) must
+/// release it, so the next pass can acquire it and complete.
+#[tokio::test]
+async fn organize_memory_releases_pass_lock_after_mid_pass_failure() {
+    let _home = IsolatedPinvouHome::new("organize-lock-error-release");
+    enable_memory_for_tests();
+    // Seed one preference so the pass has content to scan.
+    let preference_dir = paths::user_memory_preferences_dir();
+    std::fs::create_dir_all(&preference_dir).unwrap();
+    write_json_atomic(
+        &preference_dir.join("pref_lock_release.json"),
+        &preference_fixture("pref_lock_release", "answer_style", "回答默认先给结论"),
+    )
+    .unwrap();
+    // Unbalanced braces: direct parse fails and no JSON object can be
+    // extracted, so the pass errors out mid-way (lock acquired, no actions
+    // applied, no report persisted).
+    let failing_bridge = FakeOrganizeModel {
+        base_url: spawn_chat_completions_stub("not json {".to_string()),
+    };
+    let error = organize_memory_with_llm(&failing_bridge, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("parse"),
+        "unexpected error: {error:#}"
+    );
+    assert!(load_organize_history().is_empty());
+
+    // The very next pass acquires the lock — a plain relock now proves the
+    // release; the full retry below also proves it end to end against the
+    // same lock file that was never removed.
+    let retry_bridge = FakeOrganizeModel {
+        base_url: spawn_chat_completions_stub(serde_json::json!({ "actions": [] }).to_string()),
+    };
+    let report = organize_memory_with_llm(&retry_bridge, None).await.unwrap();
+    assert!(report.no_change);
+    assert_eq!(report.scanned.get("preference"), Some(&1));
+    assert_eq!(load_organize_history().len(), 1);
+    assert!(super::io::organize_lock_path().is_file());
 }
 
 #[tokio::test]
@@ -2587,7 +2782,7 @@ async fn organize_memory_canceled_before_apply_applies_nothing() {
 
     assert!(error.to_string().contains("canceled"), "{error:#}");
     assert!(
-        load_preferences()
+        list_preferences()
             .unwrap()
             .iter()
             .any(|item| item.id == id_a),
@@ -3099,7 +3294,7 @@ async fn organize_skips_targets_edited_during_the_llm_call() {
     let report = organize_memory_with_llm(&bridge, None).await.unwrap();
 
     // Every edited value survives the stale action aimed at its id.
-    let preferences = load_preferences().unwrap();
+    let preferences = list_preferences().unwrap();
     let find_preference = |id: &str| {
         preferences
             .iter()
@@ -3187,6 +3382,36 @@ fn ignore_pending_memory_never_clobbers_a_confirmed_item() {
         status(&load_pending_memory().unwrap()),
         PENDING_STATUS_CONFIRMED,
         "confirm must survive a late ignore"
+    );
+}
+
+/// The deliberate asymmetry to the test above: `never` has no automated caller,
+/// so a confirmed candidate must still be blacklisted when the user explicitly
+/// asks for it. An `ignore`-style decided guard here would turn the click into a
+/// silent no-op that the command still reports to the user as success.
+#[test]
+fn never_pending_memory_blacklists_even_a_confirmed_item() {
+    let _home = IsolatedPinvouHome::new("pending-never-vs-confirm");
+    enable_memory_for_tests();
+    let candidate = enqueue_memory_candidate(MemorySuggestion {
+        kind: "preference".to_string(),
+        topic: "answer_style".to_string(),
+        content: "回答保持简洁分点".to_string(),
+        source: "test".to_string(),
+    })
+    .unwrap();
+    confirm_pending_memory(&candidate.id).unwrap();
+
+    let event = never_pending_memory(&candidate.id, Some("user_selected".to_string()))
+        .unwrap()
+        .expect("an explicit never click must report the write it performed");
+    assert_eq!(event.action, "never");
+    assert!(
+        load_never_memory()
+            .unwrap()
+            .iter()
+            .any(|item| item.pattern == "回答保持简洁分点"),
+        "the content the user asked never to see again must reach the never list"
     );
 }
 
@@ -3472,4 +3697,118 @@ fn organize_report_serializes_snake_case_for_frontend() {
     let serialized = serde_json::to_string(&report).unwrap();
     assert!(serialized.contains("\"started_at\""));
     assert!(!serialized.contains("startedAt"));
+}
+
+/// `archive_recent_work` flips the status in place (the item survives), is
+/// idempotent, and reports `false` for an id it cannot find.
+#[test]
+fn archive_recent_work_archives_in_place_and_is_idempotent() {
+    let _home = IsolatedPinvouHome::new("recent-work-archive");
+    let now = Utc::now();
+    let item = RecentWorkItem {
+        id: "rw_fixture".to_string(),
+        title: "Refactor session store".to_string(),
+        summary: "split sidecars from the boot map".to_string(),
+        status: "active".to_string(),
+        source: "test".to_string(),
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_hit: now.to_rfc3339(),
+        expires_at: (now + Duration::days(7)).to_rfc3339(),
+    };
+    {
+        let _guard = write_lock().lock();
+        write_recent_work_unlocked(std::slice::from_ref(&item)).unwrap();
+    }
+
+    assert!(archive_recent_work(&item.id).unwrap());
+    let items = load_recent_work().unwrap();
+    assert_eq!(items.len(), 1, "archiving keeps the item");
+    assert_eq!(items[0].status, "archived");
+    assert!(
+        !archive_recent_work(&item.id).unwrap(),
+        "re-archiving an already-archived item reports no change"
+    );
+    assert!(
+        !archive_recent_work("no-such-id").unwrap(),
+        "archiving an absent id reports no change"
+    );
+}
+
+/// `archive_recent_work` archives an id in every store it appears in: the
+/// legacy recent-work store and both timed stores. A match in one store must
+/// not short-circuit the others.
+#[test]
+fn archive_recent_work_archives_the_id_in_every_store() {
+    let _home = IsolatedPinvouHome::new("archive-every-store");
+    let now = Utc::now();
+    let timed = |kind: &str| super::types::TimedMemoryItem {
+        id: "shared-id".to_string(),
+        kind: kind.to_string(),
+        topic: "topic".to_string(),
+        text: "text".to_string(),
+        source: String::new(),
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_hit: now.to_rfc3339(),
+        ttl_days: 21,
+        status: "active".to_string(),
+    };
+    let work = RecentWorkItem {
+        id: "shared-id".to_string(),
+        title: "title".to_string(),
+        summary: String::new(),
+        status: "active".to_string(),
+        source: "test".to_string(),
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_hit: now.to_rfc3339(),
+        expires_at: (now + Duration::days(7)).to_rfc3339(),
+    };
+    {
+        let _guard = write_lock().lock();
+        write_recent_work_unlocked(std::slice::from_ref(&work)).unwrap();
+        write_timed_memory_file(
+            &current_focus_path(),
+            &[timed("current_focus")],
+            "current_focus",
+        )
+        .unwrap();
+        write_timed_memory_file(
+            &recent_activity_path(),
+            &[timed("recent_activity")],
+            "recent_activity",
+        )
+        .unwrap();
+    }
+
+    assert!(archive_recent_work("shared-id").unwrap());
+    assert_eq!(load_recent_work().unwrap()[0].status, "archived");
+    assert_eq!(
+        load_current_focus().unwrap()[0].status,
+        "archived",
+        "the current_focus copy must be archived even though recent work matched"
+    );
+    assert_eq!(
+        load_recent_activity().unwrap()[0].status,
+        "archived",
+        "the recent_activity copy must be archived too"
+    );
+}
+
+#[test]
+fn memory_block_marker_gate_is_case_insensitive() {
+    // Round-46 review: models treat the render block's tag boundary
+    // case-insensitively, so an uppercase variant passes an exact-lowercase
+    // check yet still closes the block on render. The gate must be at least
+    // as wide as the boundary it guards.
+    assert!(contains_memory_block_marker(
+        "note </PINVOU_USER_MEMORY> injection"
+    ));
+    assert!(contains_memory_block_marker(
+        "note <PINVOU_USER_MEMORY> injection"
+    ));
+    assert!(contains_memory_block_marker("PinVou_User_Memory"));
+    assert!(contains_memory_block_marker("<pinvou_user_memory>"));
+    assert!(!contains_memory_block_marker("ordinary preference text"));
 }

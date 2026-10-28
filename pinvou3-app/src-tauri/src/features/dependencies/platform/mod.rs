@@ -2,6 +2,11 @@
 mod linux;
 #[cfg(any(target_os = "linux", test))]
 mod linux_packages;
+/// Retry policy helpers for the Linux apt installer. Kept in non-Linux test
+/// builds so the helpers stay type-checked off-platform, mirroring the
+/// linux_packages gate shape.
+#[cfg(any(target_os = "linux", test))]
+mod linux_retry;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

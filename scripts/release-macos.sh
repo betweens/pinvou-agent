@@ -12,15 +12,8 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$REPO_ROOT/pinvou3-app"
 
-V_TAURI="$(jq -r .version "$APP_DIR/src-tauri/tauri.conf.json")"
-V_CARGO="$(sed -n 's/^version = "\(.*\)"/\1/p' "$APP_DIR/src-tauri/Cargo.toml" | head -1)"
-V_NPM="$(jq -r .version "$APP_DIR/package.json")"
-if [ "$V_TAURI" != "$V_CARGO" ] || [ "$V_TAURI" != "$V_NPM" ]; then
-  echo "Version mismatch: tauri=$V_TAURI cargo=$V_CARGO npm=$V_NPM" >&2
-  exit 1
-fi
-
-VERSION="$V_TAURI"
+node "$REPO_ROOT/scripts/sync-version.mjs" --check
+VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 TAG="${1:-v$VERSION}"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 
@@ -45,6 +38,12 @@ if [ ! -f "$SOURCE" ]; then
   echo "Community dmg not found: $SOURCE" >&2
   exit 1
 fi
+
+# Same compression upgrade as release-packages.yml via the shared helper
+# (tauri dmg is UDZO at hdiutil's default zlib level 1; ULMO=LZMA usually
+# saves another 20-40%; a failed conversion degrades to keeping the original
+# dmg) — see scripts/convert-dmg-ulmo.sh.
+"$REPO_ROOT/scripts/convert-dmg-ulmo.sh" "$SOURCE"
 
 cp "$SOURCE" "$ASSET"
 shasum -a 256 "$ASSET" > "$ASSET.sha256"

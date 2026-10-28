@@ -59,7 +59,13 @@ pub async fn get_code_permission_prefs(
 pub async fn confirm_code_yolo(
     store: State<'_, SessionStore>,
 ) -> Result<crate::platform::prefs::CodePermissionPrefs, String> {
-    store.confirm_code_yolo()
+    // Round-54 audit A5: the settings transaction holds the cross-process
+    // settings.json.lock across keychain I/O (a CLI `models` command parked
+    // at a keychain prompt can hold it for minutes) — join it on a blocking
+    // worker instead of parking this runtime worker, like the settings
+    // family.
+    let store = store.inner().clone();
+    super::settings::join_blocking("confirm_code_yolo", move || store.confirm_code_yolo()).await
 }
 
 /// The per-lane (work/code) global default modes. Fetched at startup / on
@@ -85,8 +91,14 @@ pub async fn set_mode_default(
     store: State<'_, SessionStore>,
 ) -> Result<crate::core::mode_state::ModeDefaultsView, String> {
     let lane = crate::core::mode_state::ModeLane::parse(&lane)?;
-    store.set_mode_default(lane, mode);
-    Ok(store.mode_defaults())
+    // Round-54 audit A5: same blocking-worker join as confirm_code_yolo —
+    // the draft-state switch persists through the settings transaction.
+    let store = store.inner().clone();
+    super::settings::join_blocking("set_mode_default", move || {
+        store.set_mode_default(lane, mode);
+        Ok(store.mode_defaults())
+    })
+    .await
 }
 
 // ===================== 卡片池: 专家面具 =====================
@@ -122,7 +134,7 @@ pub async fn exit_plan_to_yolo(
 /// 模型列表下方的会话级开关。开启：装配专家名册，并让下一次发送按多智能体
 /// 资源边界重建引擎；关闭：让下一次发送恢复普通对话的底座资源配置。切换时
 /// 回收空闲旧引擎，避免旧 hook / 深度 / 并发配置泄漏到新模式；正在生成时拒绝
-/// 切换。工具面不随开关变化——与主线完全一致：`workflow` 保持可用（委派提醒
+/// 切换。工具面不随开关变化——与主线完全一致：`workflow` 保持可用（蜂群契约
 /// 不教学不推荐），裸 `agent` 本就对所有会话可用。
 #[tauri::command]
 pub async fn set_multi_agent_mode(
@@ -135,6 +147,14 @@ pub async fn set_multi_agent_mode(
     // 逃逸会话边界）+ 会话确实存在（防 IPC 直调给不存在的 id 造孤儿状态）。
     crate::features::sessions::validate_session_id(&session_id)
         .map_err(|error| format!("set_multi_agent_mode: {error:#}"))?;
+    // Aux = scoped Q&A engine (ADR-0006 round-32 minor 20, upgraded by
+    // ADR-0024 to at-most-one-scoped-read-tool): explicit rejection, same
+    // stance as the sibling metadata commands.
+    if crate::features::sessions::is_aux_session_id(&session_id) {
+        return Err(
+            "set_multi_agent_mode: auxiliary conversations do not take multi-agent mode".into(),
+        );
+    }
     store
         .load(&session_id)
         .map_err(|error| format!("set_multi_agent_mode({session_id}): 会话不存在: {error:#}"))?;
@@ -175,6 +195,16 @@ pub async fn accept_plan(
     // is_user_turn_prompt 计数口径一致），切 YOLO 执行恰是最高风险的一轮——
     // 缺快照会让其编辑只能连同前一轮一起回退（评审 M6）。失败/超预算如实记
     // 日志不阻断 turn（设计 §5 降级语义）；发送失败按 id 作废「未成活」快照。
+    // Computed BEFORE the snapshot so the checkpoint label quotes this turn's
+    // actual display content; the literal below is only the no-display-message
+    // fallback. That fallback is fixed zh persisted as ledger fidelity data
+    // (historical fidelity with the pre-cleanup surface) and printed verbatim
+    // by the CLI — localizing it is a consumer-side decision, not a label-side
+    // one (PR #602).
+    let display_content = display_message
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| "✅ 就这么干".to_string());
     let mut created_snapshot_id: Option<String> = None;
     let mut checkpoint_ledger_root = None;
     if store.is_code_session(&session_id) {
@@ -187,6 +217,7 @@ pub async fn accept_plan(
             &session_id,
             roots.ledger,
             roots.execution,
+            display_content.clone(),
             "accept_plan",
         )
         .await;
@@ -218,17 +249,17 @@ pub async fn accept_plan(
         .await;
         return Err(format!("prepare accept_plan admission: {error:#}"));
     }
+    // 候选专家只从计划正文（plan_markdown）匹配，不加 accept 前缀——与快照同源；
+    // 实际发送内容仍是包装后的 accept 指令。蜂群契约在 spawn 级 instructions，
+    // 这里不再改写消息内容。
     let prepared_delegation = super::multiagent::prepare_delegation_turn(
         pool.inner(),
         &session_id,
         accepted_mode_state.multi_agent,
-        &plan_markdown,
         accept_plan_instruction(&plan_markdown),
+        super::multiagent::MatchSource(&plan_markdown),
     );
-    let display_content = display_message
-        .map(|message| message.trim().to_string())
-        .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| "✅ 就这么干".to_string());
+    crate::features::assistant::timing::start_turn(&session_id);
     if let Err(error) = pool
         .send_reserved_user_message(
             &session_id,
@@ -237,10 +268,16 @@ pub async fn accept_plan(
             SerializableMode::Yolo.to_app_mode(),
             false,
             prepared_delegation.expert_snapshot,
+            prepared_delegation.expert_candidates,
             reservation,
         )
         .await
     {
+        crate::features::assistant::timing::finish_turn(
+            &session_id,
+            "send_error",
+            Some(&format!("{error:#}")),
+        );
         // 发送失败：作废「未成活」快照（与 chat.rs 同款，按 id 精确删除）。
         super::checkpoints::drop_unsent_turn_checkpoint(
             checkpoint_ledger_root,
@@ -257,7 +294,20 @@ pub async fn accept_plan(
             ),
         });
     }
-    plan_claim.commit();
+    // Round-54 audit A5, round-1 correction: commit runs
+    // finish_pending_plan_claim plus the accepted-mode persist — a
+    // `_session_mode_states.json` sidecar RMW under a std Mutex, NOT the
+    // settings transaction (the audit's "plan accept" label pointed here,
+    // but this file's settings-transaction callers are confirm_code_yolo
+    // and set_mode_default above). Still joined on a blocking worker: the
+    // sidecar RMW is file I/O and need not park this runtime worker.
+    // Log-only on a failed join: the turn is already submitted, and
+    // persist_accepted_yolo_mode's own write-failure arm has the same
+    // tolerance.
+    let joined = tauri::async_runtime::spawn_blocking(move || plan_claim.commit()).await;
+    if let Err(error) = joined {
+        eprintln!("[sessions] accept_plan commit join failed: {error}");
+    }
     Ok(accepted_mode_state)
 }
 

@@ -157,23 +157,6 @@ fn is_authoritative_turn_complete(event: &Event) -> bool {
     matches!(event, Event::TurnComplete { .. })
 }
 
-fn event_kind(e: &Event) -> &'static str {
-    match e {
-        Event::MessageDelta { .. } => "MessageDelta",
-        Event::ThinkingDelta { .. } => "ThinkingDelta",
-        Event::ToolCallStarted { .. } => "ToolCallStarted",
-        Event::ToolCallComplete { .. } => "ToolCallComplete",
-        Event::TurnComplete { .. } => "TurnComplete",
-        Event::Error { .. } => "Error",
-        Event::ApprovalRequired { .. } => "ApprovalRequired",
-        Event::UserInputRequired { .. } => "UserInputRequired",
-        Event::CompactionStarted { .. } => "CompactionStarted",
-        Event::CompactionCompleted { .. } => "CompactionCompleted",
-        Event::CompactionFailed { .. } => "CompactionFailed",
-        _ => "OtherEvent",
-    }
-}
-
 /// 单 scenario 期望项 —— **只保留 judge 看不见的硬指标**。
 ///
 /// 砍掉的 (judge 更准): tool_use_counts / tools_never / output_contains_any /
@@ -313,9 +296,9 @@ async fn run_turn(
     turn_timeout: Duration,
 ) {
     engine
-        .send_user_message(user.to_string(), mode, None, false)
+        .send_headless_user_message(user.to_string(), mode, None, false)
         .await
-        .expect("send_user_message");
+        .expect("send_headless_user_message");
     let (timeline, elapsed, timed_out) = collect_turn_events(engine, turn_timeout).await;
     let summary = summarize(&timeline, elapsed, timed_out);
     eprintln!(
@@ -832,7 +815,7 @@ async fn yolo_large_html() {
 /// 问题3 实测:sudo reminder **精简版**关闭态,模型还遵守吗?
 /// 关闭态(默认,/etc/sudoers.d/pinvou3 不存在)+ 需要 root 的任务,看模型:
 ///   - 是否避免试 sudo(理想:压根不调,省一轮;退一步=试了被 deny hook 拦)
-///   - 是否引导用户去【设置→系统权限】开开关 / 给免 root 替代
+///   - 是否引导用户去【设置→权限与环境→高级执行权限】开开关 / 给免 root 替代
 /// judge 读 transcript 评遵守度(砍命令例子后有没有退化)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "L1 真 vLLM 端到端,默认不跑"]
@@ -904,8 +887,16 @@ async fn save_to_tmp_no_validate_fail() {
 }
 
 /// MVP 5: 简单单 turn 必须 < 15s (LLM 没工具调用,不应该 thinking)。
-/// 防 reasoning_effort=off 失效或 prefill 变长拖慢响应回归。
-/// thinking 没关时 Qwen3.6 单 turn 可达 30s+,差 2 倍以上易判别。
+/// Note: the local default tier is now the lowest thinking tier (low) instead
+/// of off — real-machine testing shows models like the Qwen3.8 family cannot
+/// reliably turn thinking off (see bridge::request_reasoning_effort). This
+/// scenario starts with default prefs and injects no explicit tier, so it now
+/// exercises the low path: thinking is expected to be on and the 15s budget
+/// times out deterministically (a single Qwen3.6 turn can reach 30s+ with
+/// thinking on), so do not mistake the timeout for a regression. To verify the
+/// off path is not slowed by longer prefill, first save reasoning_effort=off
+/// for this model in Settings and rerun (the harness cannot inject it; off
+/// remains an explicit option and a stored value is sent verbatim).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "L1 真 vLLM 端到端,默认不跑"]
 async fn reasoning_off_speed() {
@@ -1434,9 +1425,9 @@ async fn image_vision_analyze() {
     expect.max_duration_s = 120.0; // image_analyze 含 thinking 单次 ~17s,主 loop 多轮留足
 
     engine
-        .send_user_message(user.to_string(), AppMode::Agent, None, false)
+        .send_headless_user_message(user.to_string(), AppMode::Agent, None, false)
         .await
-        .expect("send_user_message");
+        .expect("send_headless_user_message");
     let (timeline, elapsed, timed_out) =
         collect_turn_events(&engine, Duration::from_secs(140)).await;
     let summary = summarize(&timeline, elapsed, timed_out);

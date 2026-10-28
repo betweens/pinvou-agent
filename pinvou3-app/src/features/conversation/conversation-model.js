@@ -1,3 +1,5 @@
+import { pathBasename } from '../../shared/path-utils.js';
+
 const ESC = String.fromCodePoint(0x1b);
 const BEL = String.fromCodePoint(0x07);
 const C1_CSI = String.fromCodePoint(0x9b);
@@ -58,6 +60,13 @@ export function expertDelegationText(args) {
 }
 
 const OPERATION_ITEM_TYPES = new Set(['command_execution', 'file_change', 'tool']);
+
+/// Single source for the operation-item membership so every lane filters with
+/// the same list (exported for the codex/ACP lane and the shared timeline).
+export function isOperationItemType(type) {
+  return OPERATION_ITEM_TYPES.has(type);
+}
+
 const SEARCH_TOOL_NAMES = new Set([
   'web_search',
   'mcp_iwencai_news_search',
@@ -87,7 +96,7 @@ export function toolWorkspaceResources(tool) {
     const path = String(value || '').trim();
     if (!path || seen.has(path)) return;
     seen.add(path);
-    const basename = path.split(/[\\/]/).pop() || path;
+    const basename = pathBasename(path, { fallback: path });
     const label = String(name || '').trim();
     resources.push({ path, name: !label || label === path ? basename : label });
   };
@@ -240,8 +249,9 @@ function collectSearchResults(rawOutput) {
   return results;
 }
 
-export function searchToolDetails(tool) {
-  if (!isSearchTool(tool)) return null;
+// search/fetch 工具卡片共用的原始输入/输出规整:rawInput 仅接受对象;
+// rawOutput 优先取 rawOutput 字段,缺省回退 content,非字符串一律 JSON 化。
+function toolRawIO(tool) {
   const rawInput = tool && tool.rawInput && typeof tool.rawInput === 'object'
     ? tool.rawInput
     : {};
@@ -251,6 +261,12 @@ export function searchToolDetails(tool) {
     : rawOutputValue == null
       ? ''
       : JSON.stringify(rawOutputValue, null, 2);
+  return { rawInput, rawOutput };
+}
+
+export function searchToolDetails(tool) {
+  if (!isSearchTool(tool)) return null;
+  const { rawInput, rawOutput } = toolRawIO(tool);
   const name = searchToolName(tool);
   const countMatch = rawOutput.match(/"count"\s*:\s*(\d+)/i);
   const query = String(rawInput.query || rawInput.q || rawInput.keyword || '').trim();
@@ -276,17 +292,11 @@ function fetchContentTypeLabel(contentType) {
 
 export function fetchToolDetails(tool) {
   if (!isFetchTool(tool)) return null;
-  const rawInput = tool && tool.rawInput && typeof tool.rawInput === 'object'
-    ? tool.rawInput
-    : {};
-  const rawOutputValue = tool && (tool.rawOutput == null ? tool.content : tool.rawOutput);
-  const rawOutput = typeof rawOutputValue === 'string'
-    ? rawOutputValue
-    : rawOutputValue == null
-      ? ''
-      : JSON.stringify(rawOutputValue, null, 2);
-  let payload = rawOutputValue && typeof rawOutputValue === 'object' ? rawOutputValue : null;
-  if (!payload && rawOutput) {
+  const { rawInput, rawOutput } = toolRawIO(tool);
+  // rawOutputValue 为对象时 rawOutput 即其 JSON 文本,这里统一走解析取回;
+  // 非字符串对象的字段读取与直取原对象等价(payload 只读)。
+  let payload = null;
+  if (rawOutput) {
     try { payload = JSON.parse(rawOutput); } catch { /* non-JSON output is treated as text */ }
   }
   payload = payload && typeof payload === 'object' ? payload : {};
@@ -308,7 +318,6 @@ export function fetchToolDetails(tool) {
     || '');
   return {
     url,
-    hostname,
     target: target || hostname || '网页',
     status: Number.isFinite(status) ? status : null,
     contentType,
@@ -357,6 +366,14 @@ export function presentConversationItems(items) {
 }
 
 export function commandExecutionDetails(tool) {
+  return readCommandExecution(tool, true);
+}
+
+export function commandExecutionExitCode(tool) {
+  return readCommandExecution(tool, false);
+}
+
+function readCommandExecution(tool, forDisplay) {
   const rawInput = tool && tool.rawInput;
   const rawOutput = tool && tool.rawOutput;
   const command = rawInput && typeof rawInput === 'object' && rawInput.command != null
@@ -377,17 +394,23 @@ export function commandExecutionDetails(tool) {
         ?? '',
     );
     const code = rawOutput.exit_code ?? rawOutput.exitCode;
+    // eslint-disable-next-line unicorn/prefer-includes-over-repeated-comparisons -- strict null/''-guard chain, not a membership test (see the contract comment below); an array literal would allocate per mapped message
     if (code !== undefined && code !== null && code !== '') exitCode = Number(code);
   }
   if (!output && tool && typeof tool.content === 'string') output = tool.content;
-  output = stripTerminalControlSequences(output);
+  // Statistics need no display output. Keep the original property reads and
+  // coercions so malformed inputs still throw in the same order as display.
+  output = forDisplay ? stripTerminalControlSequences(output) : String(output ?? '');
   const commandLines = command.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const normalizedExitCode = Number.isNaN(exitCode) ? null : exitCode;
+  const summary = commandLines[0] || String(tool && tool.title || '执行 Shell 命令');
+  if (!forDisplay) return normalizedExitCode;
   return {
     command,
     cwd,
     output,
-    exitCode: Number.isNaN(exitCode) ? null : exitCode,
-    summary: commandLines[0] || String(tool && tool.title || '执行 Shell 命令'),
+    exitCode: normalizedExitCode,
+    summary,
     commandCount: commandLines.length,
   };
 }
@@ -422,7 +445,7 @@ export function countsAsFailedOperation(item) {
   const input = tool.rawInput ?? (item && item.legacyItem && item.legacyItem.args);
   if (isAgentWaitCall(tool.name, input)) return false;
   const exitCode = item && item.type === 'command_execution'
-    ? commandExecutionDetails(tool).exitCode
+    ? commandExecutionExitCode(tool)
     : null;
   return terminalStatus(item && item.status, exitCode) === 'failed';
 }

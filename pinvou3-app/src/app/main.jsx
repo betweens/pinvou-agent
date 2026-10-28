@@ -2,8 +2,9 @@ import { lazy, startTransition as scheduleViewTransition, Suspense, useCallback,
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import '../styles/base.css';
-import { Edit2, BarChart2, Settings, Smartphone, Clock, Package, Search, ChevronDown, Menu, MoreHorizontal, Check, Filter, Layers, MessageSquare, X, XIcon, Globe, BookOpen, Puzzle, PetPawIcon } from '../components/icons.jsx';
-import { ArchiveConfirmDialog, ArchiveToast, NavItem, RecentItem } from '../components/layout/NavigationComponents.jsx';
+import '../styles/tailwind.css';
+import { Edit2, BarChart2, Settings, Smartphone, Clock, Package, Search, ChevronDown, Menu, MoreHorizontal, Check, Filter, Layers, MessageSquare, XIcon, Globe, BookOpen, Puzzle, PetPawIcon } from '../components/icons.jsx';
+import { NavItem, RecentItem } from '../components/layout/NavigationComponents.jsx';
 import { SidePanelLayoutProvider } from '../components/layout/ResizableSidePanel.jsx';
 import {
   RightDockHost,
@@ -13,27 +14,42 @@ import {
 import { AcpAgentLogo } from '../features/codex/AcpAgentLogo.jsx';
 import { CodexAcpView } from '../features/codex/LazyCodexAcpView.jsx';
 import { PinvouLogo } from '../components/PinvouLogo.jsx';
-import { MobileMoreSheet, MobileTabBar, MobileTopBar } from '../components/layout/MobileShell.jsx';
-import { VllmSetupProgress } from '../components/VllmSetupProgress.jsx';
+const MobileMoreSheet = lazy(() =>
+  import('../components/layout/MobileShell.jsx').then((m) => ({ default: m.MobileMoreSheet })));
+const MobileTabBar = lazy(() =>
+  import('../components/layout/MobileShell.jsx').then((m) => ({ default: m.MobileTabBar })));
+const MobileTopBar = lazy(() =>
+  import('../components/layout/MobileShell.jsx').then((m) => ({ default: m.MobileTopBar })));
 import { bridge, useBridgeState, usePlatformCapability, activeModelIsLocal, shouldShowApiKeyGate } from '../hooks/useBridge.js';
 import { useCompactViewport, useVisualViewportHeight } from '../hooks/useViewport.js';
 import { useSystemDarkMode } from '../hooks/useSystemDarkMode.js';
-import { COLOR_SCHEME_STORAGE_KEY, normalizeColorScheme, resolveTheme } from '../shared/color-scheme.js';
-import { DEFAULT_CHAT_TITLES, dict, createLatestLanguageGate, ensureLanguage, LANG_TO_TAG, initialSystemLanguage, SEARCH_KEY_PROVIDERS, TAG_TO_LANG } from '../shared/i18n.js';
+import { COLOR_SCHEME_STORAGE_KEY, normalizeColorScheme, readStoredColorScheme, resolveTheme } from '../shared/color-scheme.js';
+import { DEFAULT_CHAT_TITLES, dict, createLatestLanguageGate, ensureLanguage, ensureLanguageWithZhFallback, LANG_TO_TAG, initialSystemLanguage, SEARCH_KEY_PROVIDERS, TAG_TO_LANG, zhDict } from '../shared/i18n.js';
+import { mountWhenLanguageReady } from '../shared/entry-boot.js';
 import { formatSessionDate, localDateKey, formatDateGroupLabel } from '../shared/date-utils.js';
 import { groupSessionsWithProjects, resolveSessionProjectId, needsAddFolderConfirm, WORKSPACE_KIND_BOUND } from '../features/projects/projectGrouping.js';
-import { ProjectGroupHeader } from '../features/projects/ProjectGroupHeader.jsx';
-import { MoveToProjectDialog } from '../features/projects/MoveToProjectDialog.jsx';
-import { RebindFolderDialog } from '../features/projects/RebindFolderDialog.jsx';
-import { classifyRebindError } from '../features/projects/rebindErrors.js';
+import { interpretFolderEnsureOutcomes } from '../features/projects/folderEnsure.js';
+// Startup-budget (round-41 merge with #586): project group header + the
+// mobile chrome split behind lazy — they render per project row / only on
+// compact viewports, well off the critical first paint (#586's mention
+// feature plus this PR pushed the main entry past the 500 kB budget).
+const ProjectGroupHeader = lazy(() =>
+  import('../features/projects/ProjectGroupHeader.jsx').then((m) => ({ default: m.ProjectGroupHeader })));
+const WorkspacePickerDialog = lazy(() =>
+  import('../features/projects/WorkspacePickerDialog.jsx').then(m => ({ default: m.WorkspacePickerDialog })));
+import { computePickerRows, pickerPrimaryRoot, pickerProjectRoots, workspaceNoticeTone } from '../features/projects/workspacePickerState.js';
+import { boundDraftNoticeMode as boundDraftNoticeModeOf } from '../features/chat/bound-draft-mode.js';
+import { removeRootPlan, rootAlreadyPresent, rootConflictsWithExisting, rootPathOf } from '../features/projects/manageFoldersState.js';
+const ManageProjectFoldersDialog = lazy(() =>
+  import('../features/projects/ManageProjectFoldersDialog.jsx').then(m => ({ default: m.ManageProjectFoldersDialog })));
+const SessionWorkspaceDialog = lazy(() =>
+  import('../features/projects/SessionWorkspaceDialog.jsx').then(m => ({ default: m.SessionWorkspaceDialog })));
+import { classifyRebindError, mergeRebindCarryoverIds } from '../features/projects/rebindErrors.js';
 import { runSessionBatch } from '../shared/session-management.js';
 import { filterSessionsByTab, groupSessionsByLocalDate, sessionListComparator } from '../shared/session-list-pipeline.js';
 import { can, isWeb } from '../shared/platform.js';
 import { installGlobalMarkdownRenderer } from '../shared/markdown-renderer.js';
-import {
-  acquireNativeSurfaceTransitionHide,
-  BrowserView,
-} from '../features/browser/BrowserView.jsx';
+import { acquireNativeSurfaceTransitionHide } from '../features/browser/native-surface-coordinator.js';
 import {
   createNativeSurfaceTransitionGate,
   settleBrowserUiPublicationAfterCommit,
@@ -57,6 +73,7 @@ import {
 import { ViewErrorBoundary } from '../shared/ViewErrorBoundary.jsx';
 import { ChatView } from '../features/chat/ChatView.jsx';
 import { createPinvouModeScopeKey, savePinvouModeState } from '../features/chat/pinvou-mode-state.js';
+import { setStreamFadePreference } from '../features/conversation/stream-fade.js';
 import { WebConnectionStatus } from '../features/web/WebConnectionStatus.jsx';
 import { VoiceShortcutRouter } from '../features/voice-composer/VoiceShortcutRouter.jsx';
 import { createPetActivationGuard } from '../features/pet/activation-guard.js';
@@ -74,10 +91,14 @@ import {
 import { listAcpSessions } from '../features/codex/acpClient.js';
 import { revealStartupWindow } from '../platform/tauri/startup-window.js';
 
-// 后端默认会话标题哨兵集合(bridge 按当前语言生成三语兜底标题,并据此判断是否自动改名)——
-// 显示层把任意一种哨兵标题映射成当前语言的「新对话」文案。哨兵是跨语言的后端
-// 契约而非当前 UI 文案,直接使用 shared/i18n.js 的静态集合,与词典装载进度无关
-// (zh 主用户不会装载 en/ja chunk,不能从 dict 派生)。
+// Backend default-chat-title sentinel set. The backend always persists the
+// fixed zh sentinel (store.rs's NEW_CHAT_TITLE) and auto-rename targets only
+// that exact zh match; the trilingual set is a display-layer superset — at
+// render time any sentinel title maps to the current language's "new chat"
+// copy. The sentinels are a cross-language backend contract, not current UI
+// copy: use the static set from shared/i18n.js directly, independent of
+// dictionary load progress (zh-primary users never load the en/ja chunks, so
+// the set cannot be derived from the dict).
 function isDefaultChatTitle(title) {
   return DEFAULT_CHAT_TITLES.has(title);
 }
@@ -94,9 +115,6 @@ function scheduledRunIcon(run, activeTheme) {
     </span>
   );
 }
-import { PinvouSummonCard } from '../features/tools/tool-renderers.jsx';
-import { SearchOverlay } from '../features/search/SearchOverlay.jsx';
-import { UpdateNoticeButton } from '../features/updater/UpdateNoticeButton.jsx';
 import { Lanyard } from '../features/personas/persona-shared.jsx';
 import { VIEW_LOADERS, prefetchView } from './view-loaders.js';
 // Low-traffic views are lazy-loaded: VIEW_LOADERS (see view-loaders.js) is the
@@ -110,9 +128,20 @@ const LazySettingsView = lazy(() => VIEW_LOADERS.settings().then(m => ({ default
 const LazyToolStoreView = lazy(() => VIEW_LOADERS.toolStore().then(m => ({ default: m.ToolStoreView })));
 const LazyCardPoolView = lazy(() => VIEW_LOADERS.cardpool().then(m => ({ default: m.CardPoolView })));
 const LazyScheduledTasksView = lazy(() => VIEW_LOADERS.scheduled().then(m => ({ default: m.ScheduledTasksView })));
+// The browser pane graph is dead weight at startup until a browser session opens.
+const LazyBrowserView = lazy(() => VIEW_LOADERS.browser().then(m => ({ default: m.BrowserView })));
 const LazyKnowledgeView = lazy(() => VIEW_LOADERS.knowledge().then(m => ({ default: m.KnowledgeView })));
 const LazyMonitorView = lazy(() => VIEW_LOADERS.monitor().then(m => ({ default: m.MonitorView })));
 const LazySearchView = lazy(() => VIEW_LOADERS.search().then(m => ({ default: m.SearchView })));
+const LazySearchOverlay = lazy(() => VIEW_LOADERS.searchOverlay().then(m => ({ default: m.SearchOverlay })));
+const LazyMoveToProjectDialog = lazy(() => VIEW_LOADERS.moveToProjectDialog().then(m => ({ default: m.MoveToProjectDialog })));
+const LazyRebindFolderDialog = lazy(() => VIEW_LOADERS.rebindFolderDialog().then(m => ({ default: m.RebindFolderDialog })));
+const LazyPinvouSummonModal = lazy(() => VIEW_LOADERS.pinvouSummon().then(m => ({ default: m.PinvouSummonModal })));
+const LazyUpdateNoticeButton = lazy(() => VIEW_LOADERS.updateNotice().then(m => ({ default: m.UpdateNoticeButton })));
+const LazySavedPersonaConfirmDialog = lazy(() => VIEW_LOADERS.savedPersonaConfirmDialog().then(m => ({ default: m.SavedPersonaConfirmDialog })));
+const LazyApiKeyGateDialog = lazy(() => VIEW_LOADERS.apiKeyGateDialog().then(m => ({ default: m.ApiKeyGateDialog })));
+const LazyArchiveConfirmDialog = lazy(() => VIEW_LOADERS.archiveConfirmDialog().then(m => ({ default: m.ArchiveConfirmDialog })));
+const LazyArchiveToast = lazy(() => VIEW_LOADERS.archiveConfirmDialog().then(m => ({ default: m.ArchiveToast })));
 const LazyPersonaEditorModal = lazy(() => VIEW_LOADERS.cardpool().then(m => ({ default: m.PersonaEditorModal })));
 const LazyWebAccessModal = lazy(() => VIEW_LOADERS.settings().then(m => ({ default: m.WebAccessModal })));
 const LazyDetachedShell = lazy(() => import('./DetachedShell.jsx').then(m => ({ default: m.DetachedShell })));
@@ -196,16 +225,20 @@ const NAV_ICON_CURRENT_CHAT = <MessageSquare size={18} />;
 const NAV_PREFETCH = {
   scheduled: () => prefetchView('scheduled'),
   knowledge: () => prefetchView('knowledge'),
+  outputs: () => prefetchView('knowledge'),
   monitor: () => prefetchView('monitor'),
   toolStore: () => prefetchView('toolStore'),
   cardpool: () => prefetchView('cardpool'),
+  browser: () => prefetchView('browser'),
 };
+
+const EMPTY_PICKER_ROWS = [];
 
     // App root component: aggregates bridge state, routing, and all sidebar/overlay UI. Size and complexity are historical
     // evolution; splitting requires a dedicated refactor task (involving a hundred-plus closure handlers and test contracts);
     // only lint fixes here, no behavior change.
     // eslint-disable-next-line sonarjs/cognitive-complexity -- due to the App root component's size; behavior preservation takes priority, split needs a dedicated refactor
-    const App = () => {
+const App = () => {
       if (!appFirstRenderMarked) {
         // One-shot startup marker: module-level boolean set on first render, unrelated to component state (no rerender needed).
         appFirstRenderMarked = true;
@@ -283,7 +316,15 @@ const NAV_PREFETCH = {
       // theme to render; light when the system preference is undeterminable
       // (see shared/color-scheme.js).
       const systemDark = useSystemDarkMode();
-      const [colorScheme, setColorScheme] = useState('system');
+      // Seed from the persisted scheme (readStoredColorScheme mirrors the
+      // pre-paint rule: stored light/dark wins, anything else follows the OS)
+      // so the class the index.html pre-paint script applied survives until
+      // real settings arrive: reconciling from plain 'system' first would
+      // strip a correct pre-paint class whenever the stored pick differs from
+      // the OS at boot. Web stores the raw choice in localStorage ('system'
+      // falls through to the default); desktop stores the resolved scheme as
+      // a boot cache.
+      const [colorScheme, setColorScheme] = useState(readStoredColorScheme);
       const activeTheme = resolveTheme(colorScheme, systemDark);
       // Browser state is scoped to workspace sessions: switching chats only shows
       // that chat's WebView2. The login profile remains globally shared by the
@@ -426,7 +467,7 @@ const NAV_PREFETCH = {
         const sessionCommandToken = tracksCommandEcho
           ? browserSessionCommandEchoGuard.begin(
             options.sessionTarget,
-            bridge.activeSessionId || null,
+            bsRef.current?.activeSessionId || null,
           )
           : null;
         if (tracksSession) browserSessionTransitionPendingRef.current += 1;
@@ -579,6 +620,10 @@ const NAV_PREFETCH = {
         if (!browserNativeDisplayAvailable || !requestedSessionId || !browserPaneAllowed) return;
         setBrowserPaneStates((current) => activateBrowserPane(current, requestedSessionId));
         if (browserActive) return;
+        // Hide the lazy chunk fetch inside the Rust workspace preparation. A
+        // failed prefetch remains non-blocking; React.lazy owns the visible
+        // retry/error boundary when the view actually mounts.
+        prefetchView('browser');
         const attempt = browserOpenAttemptSequenceRef.current + 1;
         browserOpenAttemptSequenceRef.current = attempt;
         browserOpenAttemptsRef.current[requestedSessionId] = attempt;
@@ -951,23 +996,17 @@ const NAV_PREFETCH = {
           window.removeEventListener('click', guard.handleClick, true);
         };
       }, []);
-      useEffect(() => {
-        const liveBridge = window.TauriBridge || bridge;
-        if (!liveBridge?.monitor || typeof liveBridge.monitor.startMonitorPolling !== 'function') return;
-        if (currentView === 'monitor') {
-          liveBridge.monitor.startMonitorPolling();
-          return () => { if (typeof liveBridge.monitor.stopMonitorPolling === 'function') liveBridge.monitor.stopMonitorPolling(); };
-        }
-      }, [currentView]);
       // 工具商店/卡片用 Tailwind dark: 变体(darkMode:'class'),全局挂 <html>.dark 让其随 app 主题切换
-      useEffect(() => { document.documentElement.classList.toggle('dark', activeTheme === 'dark'); }, [activeTheme]);
-      // 厂商预装本地大模型首屏检测:仅启动一次,检测「预装但未启用」本地大模型环境(后端短路保证普通机零开销)。
       useEffect(() => {
-        if (bridge.available && platformCapabilities.localVllmSupported) {
-          bridge.vllm.detectLocalVllmSetup();
+        document.documentElement.classList.toggle('dark', activeTheme === 'dark');
+        // 桌面端把解析后的配色写回 localStorage,作为 index.html 首帧前置
+        // class 脚本的启动缓存(authoritative color_scheme 在 settings.json,
+        // 异步到达;无缓存时深色冷启会闪白)。web 端 handleSetTheme 自己持久化
+        // 用户选择(system/light/dark),这里若覆盖会毁掉「跟随系统」。
+        if (!isWeb) {
+          try { window.localStorage.setItem(COLOR_SCHEME_STORAGE_KEY, activeTheme); } catch { /* storage may be unavailable */ }
         }
-      }, [platformCapabilities.localVllmSupported]);
-      const [vllmDeclineConfirm, setVllmDeclineConfirm] = useState(false); // 引导框「不再提醒」二次确认子态
+      }, [activeTheme]);
       const [language, setLanguage] = useState(() => {
         const systemLanguage = initialSystemLanguage();
         if (!isWeb) return systemLanguage;
@@ -1145,8 +1184,9 @@ const NAV_PREFETCH = {
         return () => { disposed = true; if (un) un(); };
       }, []);
 
-      // 兜底 zh:词典 chunk 装载失败时按 zh 渲染而非白屏(与 PetWindow/ReaderApp 同口径)。
-      const t = dict[language] || dict.zh;
+      // 兜底 zh 是活腿:入口 ensureLanguageWithZhFallback 在首选语言 chunk 装载
+      // 失败时已装载 zh,此处 zhDict() 因此非空(两者都失败才落空表,见该函数注释)。
+      const t = dict[language] || zhDict();
       // The desk-pet reply consumption loop (mounted once) reads a latest-ref mirror of current-language error copy.
       const petI18nTextRef = useRef(null);
       petI18nTextRef.current = t.uiMainApp;
@@ -1164,6 +1204,8 @@ const NAV_PREFETCH = {
       }, [t]);
       // 有可用新版 → 侧边栏设置图标亮红点（不弹窗不打断）
       const hasUpdate = !!(bs && bs.updateInfo && bs.updateInfo.available);
+      const updateNoticePreviewEnabled = !bridge.available
+        && !!window.UpdateNoticeLogic?.previewEnabled?.(window.location);
       const isWebAccessConnected = !!(bs && bs.webAccess && bs.webAccess.web_client_connected);
       function handleOpenWebAccess() {
         if (!can('webAccessAdmin')) return;
@@ -1394,6 +1436,9 @@ const NAV_PREFETCH = {
             // posture). Unbound sessions leave both values empty and stay in
             // the date view.
             workspacePath: s.workspace_binding || '',
+            // §6 keychain snapshot (cwd first): powers the "view workspace"
+            // menu entry's access-scope list. Absent on older hosts → [].
+            workspaceRoots: Array.isArray(s.workspace_roots) ? s.workspace_roots : [],
             // A standalone 'bound' kind: shares the three-tier grouping with
             // the code/ACP 'project' kind, but is not a disguised
             // project-kind (review #452 finding 5).
@@ -1416,6 +1461,9 @@ const NAV_PREFETCH = {
         updatedAt: session.updated_at || session.created_at || '',
         workspacePath: session.workspace_path || '',
         workspaceKind: session.workspace_kind || '',
+        // §6 keychain snapshot for the "view workspace" menu entry (same
+        // cwd-first shape as the chat lane's workspaceRoots).
+        workspaceRoots: Array.isArray(session.workspace_roots) ? session.workspace_roots : [],
         pinned: !!session.pinned,
         pinnedAt: session.pinned_at || '',
         working: !!codexBusyBySession[session.id],
@@ -1489,7 +1537,7 @@ const NAV_PREFETCH = {
       // 日期组展开状态:未点过的组按默认值走(今天展开、以往折叠),点过后记住用户选择
       const [dateGroupOpen, setDateGroupOpen] = useState({});
       // Code-style sidebar: enabled by default in code mode (folder grouping +
-      // collapsed primary nav); the 全部/代码 pill switches style explicitly.
+      // collapsed primary nav); the 全部/项目 pill switches style explicitly.
       // null means the user never picked: standard list outside code mode, code
       // style inside code mode (the long-standing default). Once picked, the
       // choice is persisted and applies in every mode.
@@ -1501,7 +1549,7 @@ const NAV_PREFETCH = {
           return null;
         }
       });
-      // The 全部/代码 pill drives both state and the persisted choice in one place.
+      // The 全部/项目 pill drives both state and the persisted choice in one place.
       const setSidebarCodeStylePersisted = useCallback((next) => {
         setSidebarCodeStyle(next);
         try {
@@ -1514,7 +1562,7 @@ const NAV_PREFETCH = {
       const [folderGroupOpen, setFolderGroupOpen] = useState({});
       // Primary-nav collapse is a global manual toggle, shared by every mode: nothing
       // auto-collapses it and no mode switch resets it; the choice persists per window
-      // like the 全部/代码 style pill above.
+      // like the 全部/项目 style pill above.
       const [sidebarNavCollapsed, setSidebarNavCollapsed] = useState(() => {
         try {
           return localStorage.getItem('pinvou_sidebar_nav_collapsed') === '1';
@@ -1535,7 +1583,7 @@ const NAV_PREFETCH = {
       // code sessions; only explicitly switching back to work, or opening a normal
       // chat session, exits it.
       const [codeModeOn, setCodeModeOn] = useState(false);
-      // 任务列表的展示形态由 全部/代码 胶囊决定;未显式选择(null)时普通模式
+      // 任务列表的展示形态由 全部/项目 胶囊决定;未显式选择(null)时普通模式
       // 默认「全部」标准列表、code 模式默认 code 样式(沿用既有默认)。
       const sidebarCodeListActive = sidebarCodeStyle === null ? codeModeOn : sidebarCodeStyle === 'code';
       // code 形态下「代码会话」筛选等同「全部」、「定时任务」恒为空(菜单已隐藏这两项);
@@ -1566,6 +1614,7 @@ const NAV_PREFETCH = {
       // (finding 7;setState 引用稳定,不影响本回调的 identity)。
       const movePickerRestoreRef = useRef(null);
       const openMovePicker = useCallback((target) => {
+        prefetchView('moveToProjectDialog');
         movePickerRestoreRef.current = null;
         setMoveToPresetProject(null);
         setMoveToProjectSession(target);
@@ -1575,12 +1624,30 @@ const NAV_PREFETCH = {
       // 引用,击穿 RecentItem 的 memo,重渲染全部侧栏行。
       const clearDropTarget = useCallback(() => setDropTargetGroupKey(null), []);
       const [rebindDraft, setRebindDraft] = useState(null);
+      // Close-time focus resolver for the rebind dialog (review #463 round-10
+      // T7): filled with a `() => Element | null` targeting the project header
+      // row that opened it, which survives the refresh that removes the badge.
+      const rebindRestoreRef = useRef(null);
+      // Re-entry guard for the folder-picker window (review #463 round-10
+      // minor 7): `rebindDraft` stays null until the picker resolves, so the
+      // existing guard cannot see a second badge click in that window — two
+      // pickers would race, and a successful A-rebind could open B's draft.
+      // Held from pick start to settle (pick, empty pick, failure).
+      const rebindPickingRef = useRef(false);
       // 桥完成首次状态同步(bs 就绪)后拉一次项目快照;后续变更由
       // projects:list_changed 事件驱动桥内刷新(bridge/projects.js)。
       const projectsBootstrapReady = !!bs;
       useEffect(() => {
         if (projectsBootstrapReady && bridge.projects) bridge.projects.loadProjects();
       }, [projectsBootstrapReady]);
+      // Round-36 P2b: surface the never-retried tier-1 assignment failure
+      // (tier-2 adoption applies) — the bridge bumps a timestamp on the
+      // degraded create-channel action; one toast per bump, no copy in the
+      // bridge itself.
+      const assignmentDegradedAt = bs.projectsAssignmentDegradedAt || 0;
+      useEffect(() => {
+        if (assignmentDegradedAt) setSettingsToast(t.uiWorkspacePicker.assignmentDegradedNotice);
+      }, [assignmentDegradedAt]); // eslint-disable-line react-hooks/exhaustive-deps
       // Set of session ids whose archive export is in flight: the handler
       // exits early to prevent concurrent duplicate exports, and the sidebar
       // hides the matching menu item as in-progress feedback.
@@ -1613,6 +1680,15 @@ const NAV_PREFETCH = {
         setSidebarWidth(w);
       };
       const beginSidebarResize = useCallback((event) => {
+        // Primary button only, mirroring ResizableSidePanel's splitter: a middle
+        // press falls through to the browser's middle-click autoscroll instead
+        // of starting a resize session.
+        if (event.button != null && event.button !== 0) return;
+        // Cancel the compatibility mousedown: left uncanceled it moves focus to
+        // the strip, blurring the composer mid-IME and letting later arrow keys
+        // run keyboardSidebarResize instead of moving the caret — as
+        // ResizableSidePanel does. Canceling pointerdown does not affect
+        // click/dblclick synthesis, so double-click reset is unaffected.
         event.preventDefault();
         const handle = event.currentTarget;
         const startX = event.clientX;
@@ -1764,6 +1840,461 @@ const NAV_PREFETCH = {
         : []), [taskListSort, sidebarCodeTasks]);
       const sidebarUnpinnedCodeTasks = useMemo(() => sidebarCodeTasks.filter(chat => !(sidebarFolderPinned.length && chat.pinned)), [sidebarCodeTasks, sidebarFolderPinned]);
       const sidebarProjectsData = bs && bs.projectsList;
+      // Sidebar group-header props per group kind (extracted so the render map
+      // stays readable): the project channel (§9.9) and manage-panel (§4)
+      // entries are desktop-only, gated by the projects bridge domain.
+      // Single source for the ProjectGroupHeader domain props (review #484
+      // MINOR: the mount site used to repeat onRename/onDelete/onRebind
+      // before this spread, and the spread silently shadowed the gated
+      // spellings with un-gated ones). Every bridge-backed entry
+      // is gated here: the projects domain is desktop-only (§9.8), and a
+      // web group must render no dead entries.
+      const unavailableRootsOf = (group) => (group.roots || [])
+        // Only a root explicitly marked available=false is unavailable;
+        // missing availability data (older host, stub) counts as available —
+        // same default as manageFolderRows (review #484 round-6). The keep
+        // predicate must select strictly-false roots: `available !== false`
+        // here would invert the list and pin the unavailable badge on every
+        // healthy folder.
+        .filter(root => !!(root && typeof root === 'object' && root.available === false))
+        .map(root => String(root.path));
+      const projectGroupHeaderProps = (group) => ({
+        // Tag-only projects (no roots left) have no directory to bind: the
+        // "new session" entry must not render for them — the handler would
+        // silently no-op on a missing primary root (review #484 M3).
+        onNewSession: bridge.projects && pickerProjectRoots(group).length > 0 ? () => handleProjectNewSession(group.projectId) : undefined,
+        onManage: bridge.projects ? () => setManageFoldersId(group.projectId) : undefined,
+        onRename: bridge.projects ? (name) => handleRenameProject(group.projectId, name) : undefined,
+        onDelete: bridge.projects ? () => handleDeleteProject(group.projectId) : undefined,
+        unavailableRoots: unavailableRootsOf(group),
+        // Forwards the header element too (review #463 round-10 T7 focus
+        // restore): the rebase merged this helper over main's mount-site
+        // props, and a rootPath-only spelling would silently drop the
+        // focus-restore target.
+        onRebind: bridge.projects ? (rootPath, headerEl) => startRebindWorkspace(rootPath, headerEl) : undefined,
+        onDropSession: bridge.projects ? (sessionId) => handleDropSessionOnProject(sessionId, group.projectId) : undefined,
+      });
+      const folderGroupHeaderProps = (group) => ({
+        title: group.path,
+        // bridge.projects exists on desktop only: no dead entries on web.
+        onConvert: bridge.projects ? (name) => handleConvertFolderToProject(group.path, name) : undefined,
+      });
+      const sidebarGroupHeaderProps = (group) => {
+        if (group.kind === 'project') return projectGroupHeaderProps(group);
+        if (group.kind === 'folder') return folderGroupHeaderProps(group);
+        return {};
+      };
+      // Picker inputs: the projects snapshot plus every directory-bound item
+      // (code/ACP project sessions and #445 bound work sessions).
+      const projectsListEntries = sidebarProjectsData && sidebarProjectsData.projects;
+      const projectsListAssignments = sidebarProjectsData && sidebarProjectsData.assignments;
+      // Hot-view inputs come from the UNFILTERED task pool: deriving from
+      // sidebarCodeTasks (the sidebar-filtered slice) made a warm folder go
+      // cold — or vanish from the picker — whenever the sidebar sat in
+      // another filter/style, which has nothing to do with recency
+      // (review #484 round-3 minor).
+      const boundWorkspaceItems = useMemo(() => [
+        ...allSidebarTasks
+          .filter(s => s.taskKind === 'codex'
+            || (can('desktopChrome') && s.taskKind === 'regular' && s.workspacePath))
+          .map(s => ({ id: s.id, workspaceKind: s.workspaceKind, workspacePath: s.workspacePath, updatedAt: s.updatedAt || '' })),
+        ...codexSessions
+          .filter(s => s && s.workspace_kind === 'project' && s.workspace_path)
+          .map(s => ({ id: s.id, workspaceKind: 'project', workspacePath: String(s.workspace_path), updatedAt: s.updated_at || '' })),
+      ], [allSidebarTasks, codexSessions]);
+      // Dedicated channel for the project row's "new session" (§9.9 project
+      // channel): no picker detour — cwd = the project's remembered primary
+      // root (written by the picker / manage panel), keychain = all of the
+      // project's roots at that moment. The lane follows the current page
+      // (code page → codex draft, anything else → chat draft).
+      const handleProjectNewSession = async (projectId) => {
+        const project = ((sidebarProjectsData && sidebarProjectsData.projects) || [])
+          .find(entry => entry.id === projectId);
+        if (!project) return;
+        const primary = pickerPrimaryRoot(project);
+        if (!primary) return; // tag-only project: no root to bind; the render side already keeps the button away
+        const roots = pickerProjectRoots(project);
+        // Grant-notice parity: this channel grants the project's whole root set
+        // without a picker detour, so the mode-aware notice must still surface
+        // at grant time (§9.4) — but only when the draft actually staged.
+        if (await applyWorkspaceTarget({
+          lane: currentView === 'codex' ? 'codex' : 'chat',
+          path: primary,
+          projectId: project.id,
+          roots,
+        }).catch((error) => { reportPickerApplyFailure(error); return false; })) {
+          setSettingsToast(workspaceGrantNotice(
+            currentView === 'codex' ? activeLaneMode() : chatLaneGrantMode(),
+            roots.length,
+            currentView === 'codex' && (codexLaneDeliveryReported ? codexLaneDeliveryLimited : true),
+          ));
+        }
+      };
+
+      // ── Session workspace viewer (sidebar "more" menu) ──────────────────
+      // Read-only access-scope view: the session's §6 keychain snapshot with
+      // the primary folder marked. Desktop-only: the web lane's session list
+      // redacts host absolute paths, so a scope viewer there would display
+      // misleading redacted data.
+      const [viewWorkspaceChat, setViewWorkspaceChat] = useState(null);
+      const openSessionWorkspaceViewer = useCallback((chat) => setViewWorkspaceChat(chat), []);
+
+      // ── Manage-folders panel (§4) ───────────────────────────────────────
+      // View/add/remove project roots, primary-root memory, rename, and the
+      // exclusion list view/revoke. Removing a root writes explicit move-outs
+      // for its auto members inside the backend's update_project; after
+      // add/remove the bridge reloads projects on its own (event + active
+      // refetch, belt and braces).
+      const [manageFoldersId, setManageFoldersId] = useState(null);
+      const manageFoldersProject = manageFoldersId
+        ? (((sidebarProjectsData && sidebarProjectsData.projects) || [])
+            .find(entry => entry.id === manageFoldersId) || null)
+        : null;
+      const closeManageFolders = () => setManageFoldersId(null);
+      // Add folder: system folder picker → whole-set roots replacement (the
+      // grant notice sits on the panel's "add" entry, the same weight as the
+      // picker, §2). Paths already in the project are skipped with a notice.
+      const handleManageAddFolder = async () => {
+        // Round-35 M4: dedicated single-select picker (title matches the
+        // channel; pickFolders was the KB multi-select that silently kept
+        // picked[0] only).
+        if (!bridge.files || !bridge.files.pickManageFolder || !manageFoldersProject || projectOpsBusy) return;
+        const folder = await bridge.files.pickManageFolder()
+          .catch((error) => { console.warn('pick project folder failed', error); return null; });
+        if (!folder) return;
+        if (rootAlreadyPresent(manageFoldersProject, folder)) {
+          setSettingsToast(t.uiManageFolders.addDuplicate);
+          return;
+        }
+        if (rootConflictsWithExisting(manageFoldersProject, folder)) {
+          setSettingsToast(t.uiManageFolders.addNested);
+          return;
+        }
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.updateProjectRoots(
+            manageFoldersProject.id,
+            [...manageFoldersProject.roots.map(root => rootPathOf(root)), folder],
+          );
+        } catch (error) {
+          console.warn('add project folder failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+      const handleManageRemoveRoot = async (root) => {
+        if (!manageFoldersProject || projectOpsBusy) return;
+        const plan = removeRootPlan(manageFoldersProject, root);
+        if (!plan.removed || plan.needsNewPrimary) return; // primary-root removal is blocked inside the panel
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.updateProjectRoots(manageFoldersProject.id, plan.roots);
+        } catch (error) {
+          console.warn('remove project folder failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+      const handleManageSetPrimary = async (root) => {
+        if (!manageFoldersProject || projectOpsBusy) return;
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.setPrimaryRoot(manageFoldersProject.id, root);
+        } catch (error) {
+          console.warn('set primary root failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+      // Exclusion list (§3): listed = no more auto-materialization
+      // (reversible; projects/sessions untouched); unlisted = revoked.
+      const handleSetNeverMaterialize = async (root, never) => {
+        if (projectOpsBusy) return;
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.setNeverMaterialize(root, never);
+          setSettingsToast(t.uiManageFolders.exclusionDone);
+        } catch (error) {
+          console.warn('set never-materialize failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+
+      // ── Unified "choose workspace" picker (single entry, §2/§3/§9.3/§9.4) ──
+      // The picker is mounted by the host below and is pure display: every
+      // consequential action (draft staging, ensure/materialization, codex
+      // workspacePickerRequest) is handled here. The dialog only ever reads
+      // hot-view rows + callbacks and never touches the backend.
+      const [workspacePicker, setWorkspacePicker] = useState(null); // { lane, mode }
+      const [pickerBusy, setPickerBusy] = useState(false);
+      const [pickerExcluded, setPickerExcluded] = useState(null);
+      const [pickerCodexRequest, setPickerCodexRequest] = useState(null);
+      // Round-32 MAJOR 1: the request's only clears used to be dismissal, a
+      // chat-lane stage, and the codex view's consumed-ack — if the lazy
+      // codex view never mounts (navigate away mid-chunk-load), no ack ever
+      // fires and the NEXT codex entry replays the stale pick into a fresh
+      // draft (epoch ref resets to 0 on the unmounted view). Leaving the
+      // codex view clears it: an unconsumed request is only meaningful
+      // inside the view it was staged for.
+      useEffect(() => {
+        if (currentView !== 'codex') setPickerCodexRequest(null);
+      }, [currentView]);
+      // The codex lane's effective mode is reported up by CodexAcpView so
+      // sidebar surfaces opened while the code page is active show the codex
+      // lane's mode-aware copy rather than the chat lane's. The delivery
+      // flag mirrors the §6 stage-gate the same way: a third-party ACP agent
+      // only receives the primary root, so codex-lane grant notices use the
+      // recorded-only copy.
+      const [codexLaneMode, setCodexLaneMode] = useState(null);
+      const [codexLaneDeliveryLimited, setCodexLaneDeliveryLimited] = useState(false);
+      // Round-34 minor 17: the mirror stays false until the lazy CodexAcpView
+      // first mounts and reports, so during the chunk-load window a
+      // third-party agent would get full-access wording. `reported` gates the
+      // wording: un-reported = conservative recorded copy (over-warning, never
+      // over-claiming); the first report flips to the lane's true posture.
+      const [codexLaneDeliveryReported, setCodexLaneDeliveryReported] = useState(false);
+      // Lazy hot view (review #484 round-11 M5): `boundWorkspaceItems`
+      // includes `codexSessions`, identity-replaced at every turn boundary,
+      // so an unconditional memo recomputed the rows twice per turn on the
+      // UI thread with the picker closed. Compute only while the picker is
+      // open; closed re-runs short-circuit to the shared empty array before
+      // any grouping work.
+      const workspacePickerRows = useMemo(() => (
+        workspacePicker
+          ? computePickerRows({
+            projects: projectsListEntries || [],
+            items: boundWorkspaceItems,
+            assignments: projectsListAssignments || {},
+          })
+          : EMPTY_PICKER_ROWS
+      ), [workspacePicker, projectsListEntries, projectsListAssignments, boundWorkspaceItems]);
+      const closeWorkspacePicker = () => { setWorkspacePicker(null); setPickerExcluded(null); };
+      // Dismissal without a staged target (Escape / backdrop / close button):
+      // an unconsumed codex picker request from an earlier interaction must
+      // not survive it — the consuming view's epoch ref resets to 0 on
+      // remount, so any stored request would replay onto the next
+      // CodexAcpView mount (review #484 round-11 m8). Chat-lane stages clear
+      // it too (a chat pick invalidates a lingering codex request); the codex
+      // branch of applyWorkspaceTarget intentionally closes WITHOUT clearing
+      // — the request it just set is the payload the view will consume.
+      const dismissWorkspacePicker = () => { closeWorkspacePicker(); setPickerCodexRequest(null); };
+      // Returns whether the draft actually staged (the codex lane's request
+      // object always lands); callers surface grant notices only on a real
+      // staging. Async: the chat lane may need to enter a fresh draft first.
+      const applyWorkspaceTarget = async ({ lane, path, projectId, roots }) => {
+        // Round-37 M8: the re-entry guard lives HERE, not at the five call
+        // sites — the round-34 gates covered the two picker heads while the
+        // browse tail (apply runs after the finally that clears busy),
+        // onBrowseExcluded, and the sidebar new-session path re-entered with
+        // a stale closure (the exact double-session class). The ref (not the
+        // state) is load-bearing: a state check would still see false in the
+        // same render cycle as the first click.
+        if (applyInFlightRef.current) return false;
+        applyInFlightRef.current = true;
+        try {
+          return await applyWorkspaceTargetInner({ lane, path, projectId, roots });
+        } finally {
+          applyInFlightRef.current = false;
+        }
+      };
+      const applyInFlightRef = useRef(false);
+      const applyWorkspaceTargetInner = async ({ lane, path, projectId, roots }) => {
+        // Default false: a missing bridge surface means nothing was staged, so
+        // callers must not claim the grant happened (review #484 n5).
+        let applied = false;
+        if (lane === 'codex') {
+          // Round-21 M7 (mirror of the chat lane's round-11 M7): a pick made
+          // while a codex SESSION is displayed would land as a dormant
+          // beginDraft staging — the grant notice describes a conversation
+          // that is not on screen, and the binding surfaces only on the next
+          // draft. Clear the active codex session (the same transition the
+          // view itself performs on draft entry) and navigate to the codex
+          // view so the staged draft is what the user sees.
+          updateActiveCodexSession(null);
+          setCodeModeOn(true);
+          setCurrentView('codex');
+          setPickerCodexRequest({ epoch: Date.now(), path: path || null, projectId: projectId || null, roots: roots || [] });
+          applied = true;
+        } else if (bridge.sessions && bridge.sessions.setDraftWorkspace) {
+          // A chat-lane stage invalidates a lingering unconsumed codex
+          // request (review #484 round-11 m8).
+          setPickerCodexRequest(null);
+          // The bridge stages a draft workspace only in draft state — with an
+          // active session the call is a documented silent no-op, so the
+          // project row "+" used to dead-end without any feedback on the most
+          // common path (review #484 round-5 M2). Enter a fresh chat draft
+          // first (the same path as handleNewChat), then stage; the
+          // navigation makes the new draft visible instead of silently
+          // discarding the click. The active-session read must go through the
+          // subscribed snapshot: the public bridge object exposes no
+          // activeSessionId getter, so bridge.activeSessionId is always
+          // undefined and the guard below never fired (review #484 round-8 B1).
+          // Round-11 M7: the navigation is NOT gated on an active session —
+          // with no session active while the user is on monitor/outputs/
+          // settings, staging alone left the binding invisible in bridge
+          // state, silently binding a much later fresh draft to a workspace
+          // picked minutes earlier on another page. The chat page's own
+          // handleNewChat always navigates; this entry now does too.
+          if (bs && bs.activeSessionId && bridge.sessions.createNewSession) {
+            setCodeModeOn(false);
+            await bridge.sessions.createNewSession();
+          }
+          setActiveChat(null);
+          setCurrentView('chat');
+          applied = bridge.sessions.setDraftWorkspace(path || null, { projectId: projectId || null, workspaceRoots: roots || [] }) !== false;
+          // Record the pick in the recents list: the legacy system-dialog
+          // path (pickDraftWorkspace) is unreachable on desktop, so the
+          // single-entry picker is now the only recorder — without this the
+          // chat lane's recents never grow while the codex lane's does
+          // (review #484 round-18 M3). Only a concrete path is recorded; the
+          // temporary no-path pick must not create an entry. Existence-guarded
+          // like every optional bridge surface above (web side has no draft
+          // workspace channel).
+          if (applied && path && bridge.sessions.rememberDraftWorkspaceRecent) {
+            bridge.sessions.rememberDraftWorkspaceRecent(path);
+          }
+        }
+        closeWorkspacePicker();
+        return applied;
+      };
+      const activeLaneMode = () => (currentView === 'codex'
+        ? codexLaneMode
+        : ((bs && bs.modeState && bs.modeState.mode) || null));
+      // Chat-lane grant-notice mode (review #484 round-11 M6): the notice
+      // must describe the posture the draft takes ONCE the pick binds it —
+      // the bridge resolves a bound draft to the code lane's default
+      // (fallback plan), and the composer chip flips to exactly that mode
+      // when the pick lands. The render-scope snapshot still shows the
+      // unbound draft's mode at notice time, so reading it here showed YOLO
+      // "visibility" wording for a conversation that then ran plan (and the
+      // inverse overclaim under work-default=plan/code-default=yolo). The
+      // codex lane keeps the draft agent's own mode (correct since round-9).
+      // round-47 M5: resolver body shared with ChatView (features/chat/
+      // bound-draft-mode.js) — one body, no drift twin.
+      const chatLaneGrantMode = () => boundDraftNoticeModeOf(bridge, bs);
+      // Same-weight grant notice for every entry that grants folder access
+      // without the picker's expansion panel (§9.4). Codex-lane channels for
+      // a third-party ACP agent say "recorded" instead: the §6 stage-gate
+      // delivers only the primary root until the session/new follow-up lands.
+      // Recorded wording is gated on count > 1: a single root is the
+      // cwd/primary and is delivered on the wire, so the recorded copy would
+      // be false at n=1 (review #484 round-9 N3).
+      const workspaceGrantNotice = (mode, count, deliveryLimited = false) => (
+        workspaceNoticeTone(mode) === 'restricted'
+          ? (deliveryLimited && count > 1
+            ? t.uiWorkspacePicker.noticeRestrictedRecorded(count)
+            : t.uiWorkspacePicker.noticeRestricted(count))
+          : (deliveryLimited && count > 1
+            ? t.uiWorkspacePicker.noticeVisibilityRecorded(count)
+            : t.uiWorkspacePicker.noticeVisibility(count)));
+      const pickerLane = () => (workspacePicker ? workspacePicker.lane : 'chat');
+      // Project channel (§9.3): cwd = the picked root, keychain = the project's
+      // full root set at that moment; the backend writes last_primary_root
+      // inside create_session.
+      // The picker closes inside applyWorkspaceTarget, so a rejected create
+      // would otherwise be console-only: closed picker, nothing staged, no
+      // toast — on the most common entry path (row click). Surfaced with the
+      // shared project-operations failure copy (review #484 round-10 m5).
+      const reportPickerApplyFailure = (error) => {
+        console.warn('workspace target failed', error);
+        setSettingsToast(t.uiProjects.opFailed);
+      };
+      // Round-34 minor 15: re-entry guard — during the chat lane's
+      // createNewSession await a second click re-entered applyWorkspaceTarget
+      // with the stale closure (double session). Since round-37 M8 the
+      // authoritative guard is the in-flight ref INSIDE applyWorkspaceTarget
+      // (all five apply sites); these pickerBusy checks now only disable the
+      // dialog's click surface for the two picker heads.
+      const handlePickerSelectProject = (project, root) => {
+        if (pickerBusy) return;
+        setPickerBusy(true);
+        applyWorkspaceTarget({ lane: pickerLane(), path: root, projectId: project.id, roots: pickerProjectRoots(project) })
+          .catch(reportPickerApplyFailure)
+          .finally(() => setPickerBusy(false));
+      };
+      const handlePickerTemporary = () => {
+        if (pickerBusy) return;
+        setPickerBusy(true);
+        applyWorkspaceTarget({ lane: pickerLane(), path: null, projectId: null, roots: [] })
+          .catch(reportPickerApplyFailure)
+          .finally(() => setPickerBusy(false));
+      };
+      // Browse channel (§9.9 folder channel): system folder picker → ensure
+      // (anchor reuse / materialize; the exclusion list skips) → start at the
+      // picked folder with cwd = F, roots = [F], projectId = the anchored
+      // project's id. The assignment is required: without it, tier-2 nested
+      // grouping adopts the session into a broader project whose root covers
+      // F (e.g. a Desktop-rooted project), but the user picked F itself —
+      // the decision is "group only on an exact primary-root match, else
+      // materialize a new project and belong to it".
+      const handlePickerBrowse = async () => {
+        if (!bridge.files || !bridge.files.pickWorkspaceFolder || pickerBusy) return;
+        // Capture the lane synchronously: the system folder dialog can outlive
+        // the picker (closed meanwhile), and reading pickerLane() after the
+        // await would mistarget the chat lane (review #484 m1).
+        const lane = pickerLane();
+        // Round-35 M4: dedicated single-select picker (same rationale as the
+        // manage channel above).
+        const folder = await bridge.files.pickWorkspaceFolder()
+          .catch((error) => { console.warn('pick workspace folder failed', error); return null; });
+        if (!folder) return;
+        let materialized = false;
+        // Only an ensure that actually ran may interpret "no outcome" as the
+        // exclusion list; a missing bridge entry proves nothing about the
+        // folder (review #484 round-6: the panel's copy asserts the list, so
+        // it must not render on an unverified claim). An IPC-level rejection
+        // is neither an outcome nor an exclusion either — the folder's
+        // exclusion status stays unverified.
+        let ensured = false;
+        let errored = false;
+        let ensuredProjectId = null;
+        if (bridge.projects && bridge.projects.ensureFolderProjects) {
+          ensured = true;
+          setPickerBusy(true);
+          try {
+            const outcomes = await bridge.projects.ensureFolderProjects([folder]);
+            const interpreted = interpretFolderEnsureOutcomes(outcomes);
+            materialized = interpreted.materialized;
+            // The picked folder now owns an anchored project (created or
+            // reused): the conversation must be assigned to THAT project, or
+            // tier-2 nested grouping adopts it into a broader project whose
+            // root covers the folder (e.g. a Desktop-rooted project) — the
+            // user picked the subfolder, not its ancestor (review decision:
+            // group only on an exact primary-root match, else materialize).
+            ensuredProjectId = interpreted.projectId;
+            // A failed root is NOT the exclusion list: it gets the failure
+            // toast and stops here — the excluded-folder panel is only for
+            // the "skipped without an outcome" case (review #484 MINOR).
+            if (!materialized && interpreted.failed) {
+              setSettingsToast(t.uiProjects.opFailed);
+              return;
+            }
+          } catch (error) {
+            // Log and start the plain folder conversation — browse promises a
+            // conversation at the picked folder, and the failed-outcome branch
+            // above is the stop surface for a real backend refusal.
+            console.warn('ensure folder project failed', error);
+            errored = true;
+          } finally {
+            setPickerBusy(false);
+          }
+        }
+        if (!materialized && ensured && !errored) {
+          // Exclusion list (§3): the backend skipped it → no outcome; the
+          // picker says so honestly and still allows starting as a plain
+          // folder (no projectId).
+          setPickerExcluded(folder);
+          return;
+        }
+        applyWorkspaceTarget({ lane, path: folder, projectId: ensuredProjectId, roots: [folder] })
+          .catch(reportPickerApplyFailure);
+      };
+
       const sidebarFolderGroups = useMemo(() => (sidebarCodeListActive
         ? groupSessionsWithProjects(
             sidebarUnpinnedCodeTasks,
@@ -1840,6 +2371,7 @@ const NAV_PREFETCH = {
       // identity. bs is read through a latest-ref — a click sees the most
       // recently rendered snapshot, matching closure-capture semantics.
       const navigateFromScheduledRun = useCallback(async (nextView, beforeNavigate) => {
+        NAV_PREFETCH[nextView]?.();
         const bs = bsRef.current;
         const context = browserSurfaceTransitionContextRef.current;
         const keepsDesktopBrowserVisible = !context.compact && (
@@ -1854,7 +2386,11 @@ const NAV_PREFETCH = {
           if (beforeNavigate) beforeNavigate();
           if (nextView === 'chat') setCodeModeOn(false);
           setCurrentView(nextView);
-          if (bs && bs.scheduledRunContext) setActiveChat(bridge.activeSessionId || null);
+          // exitScheduledRunChat may have moved activeSessionId (return
+          // session or draft); read the latest ref after the await rather
+          // than the pre-await snapshot.
+          const bsAfterExit = bsRef.current;
+          if (bsAfterExit && bsAfterExit.scheduledRunContext) setActiveChat(bsAfterExit.activeSessionId || null);
           closeMobileSidebar();
           return true;
         }, {
@@ -1974,16 +2510,16 @@ const NAV_PREFETCH = {
           // user's chosen Plan — surfacing as "switch back from code to work
           // and the approval mode reverts to Yolo". Keep the original
           // session; ChatView shows its measured mode after mounting.
-          const scopeKey = bridge.activeSessionId
-            ? createPinvouModeScopeKey(bridge.activeSessionId)
+          const scopeKey = bs?.activeSessionId
+            ? createPinvouModeScopeKey(bs.activeSessionId)
             : undefined;
           savePinvouModeState({ mode: 'work' }, undefined, scopeKey);
-          if (bridge.available && !bridge.activeSessionId) bridge.sessions.createNewSession();
+          if (bridge.available && !bs?.activeSessionId) bridge.sessions.createNewSession();
           // While on the code page the original work session's mode may have
           // changed (the code page has its own chain), so pull a fresh value
           // before switching back — ChatView must not mount with a stale
           // modeState.
-          if (bridge.available && bridge.activeSessionId) {
+          if (bridge.available && bs?.activeSessionId) {
             bridge.interaction.syncModeState().catch(() => {});
           }
           setCurrentView('chat');
@@ -2453,6 +2989,7 @@ const NAV_PREFETCH = {
         // 拖回当前所属项目 = 选择器里禁用当前项的同一语义,直接忽略。
         if (resolveSessionProjectId(chat, projects, sidebarProjectsData ? sidebarProjectsData.assignments : {}) === projectId) return;
         if (needsAddFolderConfirm(chat, target)) {
+          prefetchView('moveToProjectDialog');
           setMoveToPresetProject(projectId);
           setMoveToProjectSession(chat);
           return;
@@ -2464,11 +3001,24 @@ const NAV_PREFETCH = {
       // dialog. Two-phase confirmation: the first call omits confirmExisting,
       // the backend rejects when the old folder still exists, and the dialog
       // escalates to the strong warning for the user to confirm again.
-      const startRebindWorkspace = async (fromPath) => {
+      const startRebindWorkspace = async (fromPath, headerEl) => {
         // Do not reopen while rebindDraft is already open: with focus left on
         // the badge, pressing Enter re-triggers onRebind (review #463 minor),
-        // and the projectOpsBusy guard does not cover that window.
-        if (!bridge.files || !bridge.files.pickRebindFolder || projectOpsBusy || rebindDraft) return;
+        // and the projectOpsBusy guard does not cover that window. The
+        // pickingRef arm covers the picker window itself, which rebindDraft
+        // cannot see (round-10 minor 7).
+        if (!bridge.files || !bridge.files.pickRebindFolder || projectOpsBusy || rebindDraft || rebindPickingRef.current) return;
+        rebindPickingRef.current = true;
+        // Focus destination for the dialog's close (review #463 round-10 T7):
+        // the badge that opened it is removed by the very operation it starts,
+        // so the hook's default restore target would be detached. Resolved at
+        // close time via the surviving project header row.
+        rebindRestoreRef.current = headerEl
+          ? () => headerEl.querySelector('button')
+          : null;
+        // Warm the lazy dialog chunk during the picker window (#606): the
+        // pick round-trip hides the load.
+        prefetchView('rebindFolderDialog');
         try {
           // Single folder, with a title matching the rebind semantics
           // (review #463 Minor 6): no longer borrowing KB's multi-select
@@ -2486,6 +3036,8 @@ const NAV_PREFETCH = {
           // class, and the warn keeps the detail available for diagnostics.
           console.warn('pick rebind folder failed', error);
           setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          rebindPickingRef.current = false;
         }
       };
       const confirmRebindWorkspace = async (confirmExisting) => {
@@ -2514,13 +3066,20 @@ const NAV_PREFETCH = {
           // runtime the idle gate refused (round-8 MAJOR-2: closing on the
           // post-busy-only case left "retry once when idle" with no entry
           // point, because the unavailable-root badge disappears once the root
-          // has moved). Rerunning the backend with the same from/to converges
+          // has moved — the badge renders strictly off the `available` wire
+          // field, the backend's per-root is_dir() stat; review #463 round-14
+          // B1 restored it after main #566 dropped it and badged every root).
+          // Rerunning the backend with the same from/to converges
           // (the snapshot includes unsynced sessions; already-rebound ones are
           // no-ops). The post-busy ids are kept for the next retry's
           // feed-back (F-Major).
           if (failed > 0 || postBusy > 0) {
             setRebindDraft(prev => prev && {
               ...prev,
+              // The run proceeded past the fence: the old-root warning is
+              // consumed (review #463 round-14 should-fix 3) — a later
+              // reappearance of the old root must re-arm the strong confirm.
+              warnExisting: false,
               partial: {
                 rebound,
                 failed,
@@ -2554,26 +3113,104 @@ const NAV_PREFETCH = {
           // lives in a pure helper so both halves of the contract are unit
           // tested (review #463 round-8 minor 10).
           const classified = classifyRebindError(error, t);
+          // Carryover honesty (review #463 round-14 should-fix 1): a
+          // roots-commit failure carries this run's moved ids as an error
+          // suffix — the session lanes were already durable at `to`. Feed
+          // them into the retry's post-busy carryover, or a refused eviction
+          // of an already-rebound session is dropped (untouched this run,
+          // carryover empty) and the dialog closes "up to date" with an
+          // old-cwd runtime still resident.
+          // The suffix ids UNION with the previous carryover (review #463
+          // round-15 Major 1): replacing would drop a still-busy carryover
+          // session from a prior run — it can never re-enter
+          // rebound_session_ids (a converged to-lane session routes to
+          // retry_evict_candidates only), so the next retry would close the
+          // dialog "up to date" while its old-cwd runtime stays resident.
+          // The backend honors only the intersection with its own retry
+          // population, so the union cannot widen the eviction set.
+          const carryoverPartial = (classified.reboundIds && classified.reboundIds.length > 0)
+            ? (prev) => {
+                // Full partial shape (the dialog reads failedIds.length
+                // unconditionally): the moved sessions are conservatively
+                // reported as post-busy — their runtime reclaim never ran on
+                // the error path, so "retry when idle" is the honest state.
+                const mergedIds = mergeRebindCarryoverIds(
+                  prev.partial && prev.partial.postBusyIds,
+                  classified.reboundIds,
+                );
+                // Spread first, counts after (review #463 round-17 SF-4): a
+                // trailing spread dragged the PREVIOUS run's rebound/failed
+                // counts into this error state — a mixed-run report where
+                // the same id could appear in two contradicting rows. This
+                // arm's only honest counts are the merged carryover. The
+                // spread tolerates a null partial natively (object spread
+                // ignores null/undefined; round-18 Blocker 1 — the explicit
+                // `|| {}` fallback trips unicorn/no-useless-fallback-in-spread).
+                return {
+                  ...prev.partial,
+                  rebound: 0,
+                  failed: 0,
+                  failedIds: [],
+                  postBusy: mergedIds.length,
+                  postBusyIds: mergedIds,
+                  // Round-18 minor 1: the post-busy recheck never ran on an
+                  // error path, so the "started a new turn during the rebind"
+                  // diagnosis would be fabricated — the dialog renders the
+                  // neutral carryover copy for this shape.
+                  carryover: true,
+                };
+              }
+            : null;
           if (classified.kind === 'old-root-exists') {
             setRebindDraft(prev => prev && { ...prev, warnExisting: true, error: null });
           } else if (classified.kind === 'sessions-busy') {
             // Busy rejection is the fence's high-frequency happy path
             // (Minor 7): map it to i18n copy; only session ids follow the
             // marker, and they are shown verbatim for troubleshooting.
+            // warnExisting is kept as-is out of deliberate conservatism
+            // (round-20 minor 14): both busy emission sites actually fire
+            // AFTER the old-root check, so the flag is already consumed —
+            // keeping it costs ZERO extra confirm round-trips (the comment
+            // previously claimed one; inverted per round-24 minor 18).
             setRebindDraft(prev => prev && {
               ...prev,
               busySessionIds: classified.busySessionIds,
               error: null,
+              ...(carryoverPartial ? { partial: carryoverPartial(prev) } : {}),
             });
           } else if (classified.kind === 'copy') {
-            setRebindDraft(prev => prev && { ...prev, error: classified.message });
+            // Consume the old-root warning ONLY when the run actually
+            // proceeded past the old-root check (round-17 SF-4): IN_PROGRESS
+            // / TO_ROOT / TO_NESTED / TO_UNUSABLE all classify as `copy` and
+            // all fire BEFORE require_confirm_existing, and clearing on them
+            // would let a re-appeared old root ride the stale flag silently.
+            // Clearing on a genuine post-fence failure (review #463 round-14
+            // should-fix 3) still re-arms the strong confirm on a later
+            // reappearance of the old root.
+            setRebindDraft(prev => prev && {
+              ...prev,
+              warnExisting: classified.passedFence ? false : prev.warnExisting,
+              error: classified.message,
+              ...(carryoverPartial ? { partial: carryoverPartial(prev) } : {}),
+            });
           } else {
-            console.warn('rebind workspace failed', error);
+            // Log hygiene (review #463 round-14 should-fix 5): the raw error
+            // chain embeds host paths; it is shown in the dialog verbatim by
+            // design, but stays out of the console. The classified kind is
+            // the path-free diagnostic.
+            console.warn('rebind workspace failed:', classified.kind);
             // On failure keep the dialog open with the error inline
             // (review #463 M7): in-place display persists and sits next to
             // the retry; an unmapped backend error is shown verbatim as a
-            // diagnostic detail rather than guessed at.
-            setRebindDraft(prev => prev && { ...prev, error: classified.message });
+            // diagnostic detail rather than guessed at. Its provenance is
+            // unknown (round-17 SF-4), so the strong-confirm flag is kept:
+            // an extra confirm round-trip at worst, never a skipped one.
+            setRebindDraft(prev => prev && {
+              ...prev,
+              warnExisting: prev.warnExisting,
+              error: classified.message,
+              ...(carryoverPartial ? { partial: carryoverPartial(prev) } : {}),
+            });
           }
         } finally {
           setProjectOpsBusy(false);
@@ -2669,8 +3306,11 @@ const NAV_PREFETCH = {
           // `color_scheme` is the authoritative preference (system/light/dark);
           // `theme` mirrors the resolved value so consumers that only know the
           // legacy field (e.g. an older build running after a downgrade) keep rendering.
+          // Resolve against the current OS snapshot rather than the React hook:
+          // the media-query change event may not have reached `systemDark` yet
+          // when the user picks "system", which would persist a stale appearance.
           bridge.settings.saveSettings({
-            theme: resolveTheme(scheme, systemDark) === 'dark' ? 'genesis' : 'liquid-light',
+            theme: resolveTheme(scheme) === 'dark' ? 'genesis' : 'liquid-light',
             color_scheme: scheme,
           });
         }
@@ -2779,6 +3419,13 @@ const NAV_PREFETCH = {
         if (bridge.available) bridge.settings.saveSettings({ sidebar: { date_grouping: !!enabled } });
       }
 
+      // Streaming fade-in toggle: a pure UI preference persisted to
+      // settings.chat.streaming_animation; the animation module itself is
+      // synced by the effect watching the derived value below.
+      function handleSetChatStreamingAnimation(enabled) {
+        if (bridge.available) bridge.settings.saveSettings({ chat: { streaming_animation: !!enabled } });
+      }
+
       // 移动壳层派生数据：顶栏标题跟随当前视图（对话态显示会话标题）；
       // 未读红点与侧栏入口同源，避免两套提醒逻辑漂移。
       const scheduledUnread = !!(bs && ((bs.scheduledTasks || []).some(task => task.hasUnreadRuns)
@@ -2798,6 +3445,14 @@ const NAV_PREFETCH = {
 
       // 侧栏任务列表按日期折叠(默认开;settings.sidebar.date_grouping === false 时平铺)
       const sidebarDateGrouping = !bs || !bs.settings || !bs.settings.sidebar || bs.settings.sidebar.date_grouping !== false;
+      // Streaming fade-in for chat responses (default on; only an explicit
+      // settings.chat.streaming_animation === false turns it off).
+      const chatStreamingAnimation = !bs || !bs.settings || !bs.settings.chat || bs.settings.chat.streaming_animation !== false;
+      // Keep the animation module in sync with the resolved preference (also
+      // covers the default-on state before the first settings snapshot lands).
+      useEffect(() => {
+        setStreamFadePreference(chatStreamingAnimation);
+      }, [chatStreamingAnimation]);
       // 一键折叠/展开「任务列表」下的全部分组:直接写入各组的展开 map,
       // 不引入总开关变量;按钮状态由当前可见组的真实聚合推导——
       // 全部展开显示「折叠」,其余(含全折叠/混合)显示「展开」,
@@ -2857,6 +3512,7 @@ const NAV_PREFETCH = {
             onExportArchive={chat.taskKind !== 'codex' && !exportingSessionIds.has(chat.id) && bridge.sessions.exportSessionArchive ? handleExportSessionArchive : undefined}
             onArchive={handleArchiveSession}
             onMoveToProject={projectMovesAvailable ? openMovePicker : undefined}
+            onViewWorkspace={can('desktopChrome') ? openSessionWorkspaceViewer : undefined}
             dndPayload={projectMovesAvailable && sidebarCodeListActive
               ? cachedItemCallback(sidebarDndPayloads, chat, (c) => ({ sessionId: c.id }))
               : undefined}
@@ -2892,15 +3548,11 @@ const NAV_PREFETCH = {
         cardpool: (geom) => beginTearOff('cardpool', undefined, t.cardPool, geom),
         knowledge: (geom) => beginTearOff('knowledge', undefined, t.knowledge, geom),
       }), [t, beginTearOff]);
-      const openSearchOverlay = useCallback(() => setSearchOverlayOpen(true), []);
+      const openSearchOverlay = useCallback(() => {
+        prefetchView('searchOverlay');
+        setSearchOverlayOpen(true);
+      }, []);
       const apiKeyGateOpen = shouldShowApiKeyGate(bs, currentView, bridge.available);
-      const vllmSetupModalOpen = !!(
-        can('localModelSetup')
-        && bs
-        && bs.vllmSetup
-        && bs.vllmSetup.eligible
-        && !bs.vllmSetupDismissed
-      );
       const browserOverlayIntent = [
         archiveConfirm ? 'archive-confirm' : '',
         searchOverlayOpen ? 'search' : '',
@@ -2908,14 +3560,17 @@ const NAV_PREFETCH = {
         savedConfirm ? 'saved-confirm' : '',
         can('webAccessAdmin') && webAccessOpen ? 'web-access' : '',
         apiKeyGateOpen ? 'api-key' : '',
-        vllmSetupModalOpen ? 'vllm-setup' : '',
         bs && bs.pinvouModal ? 'pinvou-review' : '',
         isCompactShell && isSidebarOpen ? 'mobile-sidebar' : '',
         isCompactShell && mobileMoreOpen ? 'mobile-more' : '',
         moveToProjectSession ? 'move-picker' : '',
+        rebindDraft ? 'rebind' : '',
       ].filter(Boolean).join('|');
       const browserOverlayPublicationReady = !!browserOverlayIntent
         && publishedBrowserOverlayIntent === browserOverlayIntent;
+      // Compact-shell drawer opens only after its overlay intent is published;
+      // defined once because the drawer style needs it for transform+visibility.
+      const mobileDrawerOpen = isCompactShell && isSidebarOpen && browserOverlayPublicationReady;
       // Keep the surface hidden while one already-published overlay hands off to
       // another. The replacement itself is still withheld until its own barrier
       // attempt has settled.
@@ -2979,6 +3634,7 @@ const NAV_PREFETCH = {
       //   onRightDockPanelSelectionChange：browser_native_surface.test.mjs
       const chatViewBaseProps = {
         theme: activeTheme,
+        onOpenWorkspacePicker: ({ lane, mode }) => { setPickerExcluded(null); setWorkspacePicker({ lane, mode }); },
         t,
         bs,
         onOpenEditor: handleOpenPersonaEditor,
@@ -2987,8 +3643,14 @@ const NAV_PREFETCH = {
         onGotoSettings: () => openSettingsSection('general'),
         onGotoModelSettings: () => openSettingsSection('model'),
         onGotoTools: () => navigateFromScheduledRun('toolStore'),
+        // Reference-card navigation (session mention): reuse the sidebar's session switch (with view routing and browser transition).
+        onSwitchSession: handleSwitchSession,
         browserDockOpen: browserPaneOpen,
         onOpenBrowserDock: openBrowserDock,
+        // Align feedback (and other keychain notices) surface as the host
+        // toast: without this prop every align outcome is silent in the chat
+        // lane (review #484 M4).
+        onNotify: setSettingsToast,
       };
       // The three byte-identical empty states in the sidebar task list (task groups / date groups / flat list) share one node.
       const sidebarTaskEmptyNode = (
@@ -3065,25 +3727,33 @@ const NAV_PREFETCH = {
           )}
 
           {archiveConfirm && browserOverlayPublicationReady && createPortal(
-            <ArchiveConfirmDialog
-              theme={activeTheme}
-              t={t}
-              onCancel={() => setArchiveConfirm(null)}
-              onConfirm={confirmArchiveSession}
-            />,
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyArchiveConfirmDialog
+                  theme={activeTheme}
+                  t={t}
+                  onCancel={() => setArchiveConfirm(null)}
+                  onConfirm={confirmArchiveSession}
+                />
+              </Suspense>
+            </ViewErrorBoundary>,
             document.body
           )}
 
           {archiveToast && createPortal(
-            <ArchiveToast
-              t={t}
-              onClose={() => setArchiveToast(false)}
-              onView={() => {
-                setArchiveToast(false);
-                setSearchShowArchived(true);
-                navigateFromScheduledRun('search');
-              }}
-            />,
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyArchiveToast
+                  t={t}
+                  onClose={() => setArchiveToast(false)}
+                  onView={() => {
+                    setArchiveToast(false);
+                    setSearchShowArchived(true);
+                    navigateFromScheduledRun('search');
+                  }}
+                />
+              </Suspense>
+            </ViewErrorBoundary>,
             document.body
           )}
 
@@ -3097,57 +3767,143 @@ const NAV_PREFETCH = {
             document.body
           )}
 
-          {rebindDraft && (
-            <RebindFolderDialog
-              from={rebindDraft.from}
-              to={rebindDraft.to}
-              warnExisting={rebindDraft.warnExisting}
-              errorMessage={rebindDraft.error}
-              partial={rebindDraft.partial || null}
-              busySessionIds={rebindDraft.busySessionIds || null}
-              t={t}
+          {manageFoldersProject && (
+            <Suspense fallback={null}>
+            <ManageProjectFoldersDialog
+              open
+              project={manageFoldersProject}
+              neverRoots={(sidebarProjectsData && sidebarProjectsData.neverMaterializeRoots) || []}
+              mode={activeLaneMode()}
+              // Same §6 stage-gate mirror as the picker: on the codex lane a
+              // third-party ACP agent only receives the primary root, so an
+              // added folder is recorded-not-delivered and the notice must
+              // say so (review #484 round-9 N1).
+              deliveryLimited={currentView === 'codex' && (codexLaneDeliveryReported ? codexLaneDeliveryLimited : true)}
               busy={projectOpsBusy}
-              onCancel={() => setRebindDraft(null)}
-              onConfirm={confirmRebindWorkspace}
+              t={t}
+              onClose={closeManageFolders}
+              onAddFolder={handleManageAddFolder}
+              onRemoveRoot={handleManageRemoveRoot}
+              onSetPrimary={handleManageSetPrimary}
+              onRename={(name) => handleRenameProject(manageFoldersProject.id, name)}
+              onExcludeRoot={(root) => handleSetNeverMaterialize(root, true)}
+              onRevokeExclusion={(root) => handleSetNeverMaterialize(root, false)}
             />
+            </Suspense>
+          )}
+
+          {viewWorkspaceChat && (
+            // Conditional mount (the ManageProjectFoldersDialog idiom): the
+            // snapshot shown belongs to the chat captured at open time.
+            <Suspense fallback={null}>
+            <SessionWorkspaceDialog
+              open
+              sessionTitle={viewWorkspaceChat.title}
+              roots={viewWorkspaceChat.workspaceRoots && viewWorkspaceChat.workspaceRoots.length
+                ? viewWorkspaceChat.workspaceRoots
+                : (viewWorkspaceChat.workspacePath ? [viewWorkspaceChat.workspacePath] : [])}
+              t={t}
+              onClose={() => setViewWorkspaceChat(null)}
+            />
+            </Suspense>
+          )}
+
+          {workspacePicker && (
+          // Conditional mount (the ManageProjectFoldersDialog idiom): the query
+          // and the expanded row must not leak across opens — remounting resets
+          // them, so a leftover filter can never render a false empty state.
+          <Suspense fallback={null}>
+          <WorkspacePickerDialog
+            open
+            rows={workspacePickerRows}
+            mode={workspacePicker.mode}
+            language={language}
+            busy={pickerBusy}
+            // Browse must also degrade when its channel is missing —
+            // rendering the row while handlePickerBrowse would silently
+            // no-op is a dead entry (review #484 round-10 m6; the AGENTS.md
+            // convention asks for an explicit unsupported signal, and the
+            // typed degrade lives in the picker's webOnly surface).
+            webOnly={!can('desktopChrome') || !bridge.projects || !bridge.files || !bridge.files.pickWorkspaceFolder}
+            excludedFolder={pickerExcluded}
+            deliveryLimited={!!workspacePicker.deliveryLimited}
+            t={t}
+            onClose={dismissWorkspacePicker}
+            onSelectProject={handlePickerSelectProject}
+            onTemporary={handlePickerTemporary}
+            onBrowse={handlePickerBrowse}
+            onBrowseExcluded={(folder) => applyWorkspaceTarget({ lane: pickerLane(), path: folder, projectId: null, roots: [folder] }).catch(reportPickerApplyFailure)}
+            onDismissExcluded={() => setPickerExcluded(null)}
+          />
+          </Suspense>
+          )}
+
+          {rebindDraft && browserOverlayPublicationReady && (
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyRebindFolderDialog
+                  from={rebindDraft.from}
+                  to={rebindDraft.to}
+                  warnExisting={rebindDraft.warnExisting}
+                  errorMessage={rebindDraft.error}
+                  partial={rebindDraft.partial || null}
+                  busySessionIds={rebindDraft.busySessionIds || null}
+                  t={t}
+                  busy={projectOpsBusy}
+                  restoreTargetRef={rebindRestoreRef}
+                  onCancel={() => setRebindDraft(null)}
+                  onConfirm={confirmRebindWorkspace}
+                />
+              </Suspense>
+            </ViewErrorBoundary>
           )}
 
           {moveToProjectSession && browserOverlayPublicationReady && (
-            <MoveToProjectDialog
-              session={moveToProjectSession}
-              projects={sidebarProjectsData ? sidebarProjectsData.projects : []}
-              currentProjectId={resolveSessionProjectId(
-                moveToProjectSession,
-                sidebarProjectsData ? sidebarProjectsData.projects : [],
-                sidebarProjectsData ? sidebarProjectsData.assignments : {},
-              )}
-              presetProjectId={moveToPresetProject}
-              t={t}
-              busy={projectOpsBusy}
-              restoreTargetRef={movePickerRestoreRef}
-              onClose={() => { setMoveToPresetProject(null); setMoveToProjectSession(null); }}
-              onMove={(projectId, addWorkspaceRoot) => handleMoveSessionToProject(
-                moveToProjectSession.id, projectId, addWorkspaceRoot)}
-            />
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyMoveToProjectDialog
+                  session={moveToProjectSession}
+                  projects={sidebarProjectsData ? sidebarProjectsData.projects : []}
+                  currentProjectId={resolveSessionProjectId(
+                    moveToProjectSession,
+                    sidebarProjectsData ? sidebarProjectsData.projects : [],
+                    sidebarProjectsData ? sidebarProjectsData.assignments : {},
+                  )}
+                  presetProjectId={moveToPresetProject}
+                  t={t}
+                  busy={projectOpsBusy}
+                  restoreTargetRef={movePickerRestoreRef}
+                  onClose={() => { setMoveToPresetProject(null); setMoveToProjectSession(null); }}
+                  onMove={(projectId, addWorkspaceRoot) => handleMoveSessionToProject(
+                    moveToProjectSession.id, projectId, addWorkspaceRoot)}
+                />
+              </Suspense>
+            </ViewErrorBoundary>
           )}
 
-          {searchOverlayOpen && browserOverlayPublicationReady && createPortal(
-            <SearchOverlay
-              theme={activeTheme}
-              history={chatHistory}
-              t={t}
-              onSelect={handleSearchSelect}
-              onClose={() => setSearchOverlayOpen(false)}
-            />,
-            document.body
+          {searchOverlayOpen && browserOverlayPublicationReady && (
+            <ViewErrorBoundary t={t}>
+              {createPortal(
+                <Suspense fallback={null}>
+                  <LazySearchOverlay
+                    theme={activeTheme}
+                    history={chatHistory}
+                    t={t}
+                    onSelect={handleSearchSelect}
+                    onClose={() => setSearchOverlayOpen(false)}
+                  />
+                </Suspense>,
+                document.body,
+              )}
+            </ViewErrorBoundary>
           )}
 
           {can('desktopChrome') && <TitleBar t={t} sidebarOpen={isSidebarOpen} />}
 
           {isCompactShell && (
-            <MobileTopBar theme={activeTheme} t={t} title={mobileTitle}
+            <Suspense fallback={null}><MobileTopBar theme={activeTheme} t={t} title={mobileTitle}
               onMenu={() => setIsSidebarOpen(true)}
-              onNewChat={currentView === 'chat' || currentView === 'codex' ? () => handleNewChat() : undefined} />
+              onNewChat={currentView === 'chat' || currentView === 'codex' ? () => handleNewChat() : undefined} /></Suspense>
           )}
 
           <SidePanelLayoutProvider onPresenceChange={setOpenSidePanelCount}>
@@ -3158,13 +3914,24 @@ const NAV_PREFETCH = {
           >
           <div className={`flex flex-1 min-h-0 ${activeTheme === 'dark' ? (isSidebarOpen ? 'bg-[#1E1F20]' : 'bg-[#131314]') : 'bg-[#F0F4F9]'}`}>
 
-          {isWeb && isSidebarOpen && browserOverlayPublicationReady && (
+          {isWeb && (
             <button
               type="button"
               data-testid="mobile-navigation-close"
+              // Driven by mobileDrawerOpen, not isSidebarOpen, so the dim and the
+              // drawer clear the overlay publication barrier together instead of
+              // showing a dimmed screen with no drawer for the barrier window.
               aria-label={t.uiMainApp.closeNavigation}
-              onClick={() => setIsSidebarOpen(false)}
-              className="fixed inset-0 z-30 hidden bg-black/40 max-sm:block"
+              onClick={(event) => {
+                // A real pointer click leaves focus on this button; blur before
+                // it turns aria-hidden — ARIA forbids aria-hidden on the focused
+                // element, and the old unmount-based close dropped focus to <body>.
+                event.currentTarget.blur();
+                setIsSidebarOpen(false);
+              }}
+              aria-hidden={!mobileDrawerOpen}
+              tabIndex={mobileDrawerOpen ? 0 : -1}
+              className={`fixed inset-0 z-30 hidden bg-black/40 max-sm:block transition-opacity duration-300 motion-reduce:transition-none ${mobileDrawerOpen ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
             />
           )}
 
@@ -3179,14 +3946,25 @@ const NAV_PREFETCH = {
               // z-40 sidebar).
               width: isSidebarOpen && !isCompactShell ? sidebarWidth : undefined,
               ...(isCompactShell ? {
-                display: isSidebarOpen && browserOverlayPublicationReady ? 'flex' : 'none',
+                // The drawer stays mounted: display:none cannot transition, so
+                // open/close animates transform while `visibility` (in the
+                // compact transition list below) flips only after the slide-out
+                // finishes and immediately on slide-in. Full height overlays the
+                // top bar and tab bar; the env() insets track the same top/bottom
+                // safe areas as the app root padding above (portrait notch /
+                // home indicator; landscape side insets are not tracked).
                 position: 'fixed',
                 left: 0,
-                top: 48,
-                bottom: 56,
+                top: 'env(safe-area-inset-top)',
+                bottom: 'env(safe-area-inset-bottom)',
+                transform: mobileDrawerOpen ? 'translateX(0)' : 'translateX(-100%)',
+                visibility: mobileDrawerOpen ? 'visible' : 'hidden',
               } : {}),
             }}
-            className={`${isSidebarOpen ? (isCompactShell ? 'w-[280px]' : '') : 'w-[68px]'} relative shrink-0 flex flex-col z-40 ${sidebarResizing ? '' : 'transition-all duration-300'} ${
+            // Compact transitions stay scoped to the slide: broad transition-all
+            // would also fade the dark open/closed shades on every toggle and
+            // animate height when env() insets change with device rotation.
+            className={`${isCompactShell ? 'w-[280px]' : (isSidebarOpen ? '' : 'w-[68px]')} relative shrink-0 flex flex-col z-40 ${sidebarResizing ? '' : (isCompactShell ? 'transition-[transform,visibility] duration-300 motion-reduce:transition-none' : 'transition-all duration-300 motion-reduce:transition-none')} ${
               activeTheme === 'light'
                 ? 'bg-[#F0F4F9]'
                 : (isSidebarOpen ? 'bg-[#1E1F20]' : 'bg-[#131314]')
@@ -3208,7 +3986,7 @@ const NAV_PREFETCH = {
               {isSidebarOpen && !isCompactShell && (
                 <button
                   type="button"
-                  onClick={() => setSearchOverlayOpen(true)}
+                  onClick={openSearchOverlay}
                   title={t.searchChats}
                   aria-label={t.searchChats}
                   className={`ml-auto w-10 h-10 shrink-0 rounded-full flex items-center justify-center transition-colors ${
@@ -3350,7 +4128,7 @@ const NAV_PREFETCH = {
                 <div data-testid="sidebar-recents" className="pt-5 pb-2 max-sm:pt-2">
                   <div ref={taskFilterRef} className="relative mb-2">
                     {/* 第一行:「任务列表」标题 + 查看全部/筛选按钮;
-                        第二行:全部/代码 胶囊 + 一键折叠(分组)按钮。
+                        第二行:全部/项目 胶囊 + 一键折叠(分组)按钮。
                         胶囊选择任务列表展示形态(标准列表 / code 样式按文件夹分组),
                         与是否处于 code 模式无关;折叠按钮切换下方任务分组
                         (日期组 / 文件夹组)的整体展开状态。 */}
@@ -3385,7 +4163,7 @@ const NAV_PREFETCH = {
                         </button>
                         </span>
                       </div>
-                      {/* 全部/代码 胶囊 + 一键折叠(分组)按钮:位于「任务列表」标题下方。
+                      {/* 全部/项目 胶囊 + 一键折叠(分组)按钮:位于「任务列表」标题下方。
                           flex-wrap 兜底:ja 等语言在 220px 最小宽度下此行已无富余
                           (实测正好占满),字体渲染偏宽的环境让折叠按钮换行而非溢出。 */}
                       <div className="flex flex-wrap items-center justify-between gap-2 px-1">
@@ -3494,7 +4272,7 @@ const NAV_PREFETCH = {
                                 : workspaceDisplayName(group.path);
                             return (
                               <div key={group.key}>
-                                <ProjectGroupHeader
+                                <Suspense fallback={null}><ProjectGroupHeader
                                   label={label}
                                   kind={group.kind}
                                   count={group.rows.length + (sidebarGroupPinnedCounts[group.key] || 0)}
@@ -3502,24 +4280,19 @@ const NAV_PREFETCH = {
                                   onToggle={() => setFolderGroupOpen(prev => ({ ...prev, [group.key]: !isOpen }))}
                                   theme={activeTheme}
                                   t={t}
-                                  title={group.kind === 'folder' ? group.path : undefined}
                                   busy={projectOpsBusy}
                                   testId="sidebar-folder-group"
                                   // bridge.projects 仅桌面存在:web 上目录组不渲染
                                   // 死入口(点击无反馈违反显式不支持约定)。
                                   onConvert={bridge.projects && group.kind === 'folder' ? (name) => handleConvertFolderToProject(group.path, name) : undefined}
-                                  onRename={group.kind === 'project' ? (name) => handleRenameProject(group.projectId, name) : undefined}
-                                  onDelete={group.kind === 'project' ? () => handleDeleteProject(group.projectId) : undefined}
+                                  onRename={bridge.projects && group.kind === 'project' ? (name) => handleRenameProject(group.projectId, name) : undefined}
+                                  onDelete={bridge.projects && group.kind === 'project' ? () => handleDeleteProject(group.projectId) : undefined}
                                   onDropSession={bridge.projects && group.kind === 'project' ? (sessionId) => handleDropSessionOnProject(sessionId, group.projectId) : undefined}
-                                  unavailableRoots={group.kind === 'project'
-                                    ? (group.roots || [])
-                                        .filter(root => !(root && typeof root === 'object' ? root.available : root))
-                                        .map(root => String(typeof root === 'object' ? root.path : root))
-                                    : []}
-                                  onRebind={bridge.projects && group.kind === 'project' ? (rootPath) => startRebindWorkspace(rootPath) : undefined}
+                                  onRebind={bridge.projects && group.kind === 'project' ? (rootPath, headerEl) => startRebindWorkspace(rootPath, headerEl) : undefined}
+                                  {...sidebarGroupHeaderProps(group)}
                                   dropActive={dropTargetGroupKey === group.key}
                                   onDropActive={(active) => setDropTargetGroupKey(active ? group.key : null)}
-                                />
+                                /></Suspense>
                                 {isOpen && (
                                   <div className="mt-1 space-y-0.5">
                                     {group.rows.map(renderSidebarTaskItem)}
@@ -3604,7 +4377,11 @@ const NAV_PREFETCH = {
                 onPointerDown={beginSidebarResize}
                 onDoubleClick={resetSidebarWidth}
                 onKeyDown={keyboardSidebarResize}
-                className={`absolute top-0 bottom-0 right-0 w-[6px] border-0 cursor-col-resize z-50 touch-none transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#0B57D0] ${
+                // h-full must stay: Tailwind preflight pins every <hr> to
+                // height:0, which would turn the 6px strip into a zero-area
+                // element that pointer hit-testing can never reach (the
+                // top-0/bottom-0 stretch only applies when height is auto).
+                className={`absolute top-0 bottom-0 right-0 h-full w-[6px] border-0 cursor-col-resize z-50 touch-none transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#0B57D0] ${
                   sidebarResizing
                     ? 'bg-[#0B57D0]/40'
                     : (activeTheme === 'dark' ? 'hover:bg-[#A8C7FA]/30' : 'hover:bg-[#0B57D0]/25')
@@ -3630,8 +4407,10 @@ const NAV_PREFETCH = {
 
             {/* 单一常驻 Suspense 边界:React 19 下切视图时旧视图在本边界内被替换,
                 chunk 未就绪(未被预取覆盖的入口)保持旧视图不闪 fallback;失败由
-                ViewErrorBoundary 兜底(reload 重试绕开 React.lazy 的失败缓存)。 */}
-            <ViewErrorBoundary t={t}>
+                ViewErrorBoundary 兜底(reload 重试绕开 React.lazy 的失败缓存)。
+                resetKey=currentView:某视图 chunk 失败仅锁该次渲染,切走时边界
+                复位,其余视图不受一次失败牵连。 */}
+            <ViewErrorBoundary t={t} resetKey={currentView}>
               <Suspense fallback={<ViewFallback />}>
             {currentView === 'monitor' && <LazyMonitorView theme={activeTheme} t={t} bs={bs} />}
             {currentView === 'settings' && (
@@ -3659,6 +4438,8 @@ const NAV_PREFETCH = {
                   t={t}
                   sidebarDateGrouping={sidebarDateGrouping}
                   onSidebarDateGroupingChange={handleSetSidebarDateGrouping}
+                  chatStreamingAnimation={chatStreamingAnimation}
+                  onChatStreamingAnimationChange={handleSetChatStreamingAnimation}
                   updateFocusTick={settingsUpdateFocusTick}
                   initialSection={settingsInitialSection}
                   onCloseSettings={() => navigateFromScheduledRun(settingsReturnViewRef.current || 'chat')}
@@ -3666,7 +4447,7 @@ const NAV_PREFETCH = {
               </ViewErrorBoundary>
             )}
             {isCompactShell && browserActive && currentView === 'browser' && (
-              <BrowserView
+              <LazyBrowserView
                 key={browserSessionId}
                 theme={activeTheme}
                 t={t}
@@ -3702,10 +4483,16 @@ const NAV_PREFETCH = {
                 onSessionsChange={setCodexSessions}
                 onSwitchHomeMode={handleSwitchHomeMode}
                 onOpenSettingsSection={openSettingsSection}
+                onOpenWorkspacePicker={({ mode, deliveryLimited }) => { setPickerExcluded(null); setWorkspacePicker({ lane: 'codex', mode, deliveryLimited }); }}
+                workspacePickerRequest={pickerCodexRequest}
+                onWorkspacePickerRequestConsumed={() => setPickerCodexRequest(null)}
+                onLaneModeChange={setCodexLaneMode}
+                onLaneDeliveryChange={(limited) => { setCodexLaneDeliveryLimited(limited); setCodexLaneDeliveryReported(true); }}
                 bs={bs}
                 onGotoModelSettings={() => openSettingsSection('model')}
                 onGotoSettings={() => openSettingsSection('general')}
                 onGotoTools={() => navigateFromScheduledRun('toolStore')}
+                onNotify={setSettingsToast}
               />
             )}
             {currentView === 'scheduled' && (
@@ -3769,141 +4556,50 @@ const NAV_PREFETCH = {
               </ViewErrorBoundary>
             )}
 
-            {/* 存入成功 → iOS 确认窗:去查看我的卡牌 / 暂不 */}
             {savedConfirm && browserOverlayPublicationReady && (
-              // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard users close the dialog through its real buttons
-              // biome-ignore lint/a11y/noStaticElementInteractions: this is a pointer-only backdrop around an accessible dialog card
-              <div className="fixed inset-0 z-[80] flex items-center justify-center p-4" style={{ background:'rgba(0,0,0,.4)' }} onClick={() => setSavedConfirm(null)}>
-                {/* biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by real buttons inside the card */}
-                {/* biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container */}
-                <div onClick={(e) => e.stopPropagation()} className="w-[270px] rounded-[14px] overflow-hidden text-center"
-                  style={{ background: activeTheme === 'dark' ? 'rgba(44,44,46,.95)' : 'rgba(250,250,250,.95)', backdropFilter:'blur(20px)', WebkitBackdropFilter:'blur(20px)', fontFamily:'-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif' }}>
-                  <div className="px-4 pt-5 pb-4">
-                    <div className="text-[17px] font-semibold" style={{ color: activeTheme === 'dark' ? '#fff' : '#000' }}>{t.cpSavedTitle}</div>
-                    <div className="text-[13px] mt-1.5" style={{ color: activeTheme === 'dark' ? 'rgba(235,235,245,.6)' : 'rgba(60,60,67,.6)' }}>{t.cpSavedDesc(savedConfirm.name || '')}</div>
-                  </div>
-                  <div className="flex" style={{ borderTop: '0.5px solid ' + (activeTheme === 'dark' ? 'rgba(84,84,88,.65)' : 'rgba(60,60,67,.29)') }}>
-                    <button type="button" onClick={() => setSavedConfirm(null)} className="flex-1 h-11 text-[17px]" style={{ color: activeTheme === 'dark' ? '#0A84FF' : '#007AFF' }}>{t.cpSavedLater}</button>
-                    <div style={{ width:'0.5px', background: activeTheme === 'dark' ? 'rgba(84,84,88,.65)' : 'rgba(60,60,67,.29)' }} />
-                    <button type="button" onClick={() => { setPoolMyOnly(true); setSavedConfirm(null); setCurrentView('cardpool'); }} className="flex-1 h-11 text-[17px] font-semibold" style={{ color: activeTheme === 'dark' ? '#0A84FF' : '#007AFF' }}>{t.cpSavedView}</button>
-                  </div>
-                </div>
-              </div>
+              <ViewErrorBoundary t={t}>
+                <Suspense fallback={null}>
+                  <LazySavedPersonaConfirmDialog
+                    savedConfirm={savedConfirm}
+                    theme={activeTheme}
+                    t={t}
+                    onClose={() => setSavedConfirm(null)}
+                    onView={() => { setPoolMyOnly(true); setSavedConfirm(null); setCurrentView('cardpool'); }}
+                  />
+                </Suspense>
+              </ViewErrorBoundary>
             )}
 
-            {/* API Key 拦截遮罩 —— 云端模型未配 key 时只盖住聊天界面,强制先配置。
-                根因:此前前后端都无 key gate,空 key 打云端 → 401 静默无回应。
-                设置页必须保持可操作,否则“去配置”后遮罩仍在,用户反而无法录入 Key。
-                条件:credential_state 为 missing 或 unavailable 且非本地模型。本地 vLLM
-                和 loopback OpenAI-compatible 端点允许无鉴权。unavailable 同样需拦截:macOS 上用户在 Keychain
-                授权弹窗点"拒绝"时 credential_state 变 unavailable(见 prefs.rs:785),
-                此时不盖遮罩用户仍可发消息 → 命中 Keychain 错误,与 missing 同等后果。 */}
             {apiKeyGateOpen && browserOverlayPublicationReady && (
-              <div className="fixed inset-0 z-[57] flex items-center justify-center p-6" style={{ background: 'rgba(0,0,0,.5)' }}>
-                <div className="w-full max-w-[400px] rounded-2xl p-6 ts-modal-in"
-                     style={{ background: activeTheme === 'dark' ? '#1E1F20' : '#FFFFFF', color: activeTheme === 'dark' ? '#E3E3E3' : '#1F1F1F', boxShadow: '0 12px 48px rgba(0,0,0,.35)' }}>
-                  <div className="flex items-center gap-2 mb-3">
-                    <PinvouLogo className="h-[22px] w-[22px] select-none" />
-                    <div className="text-[17px] font-semibold">{t.apiKeyGateTitle}</div>
-                  </div>
-                  <div className="text-[14px] leading-relaxed mb-4" style={{ opacity: .85 }}>{t.apiKeyGateDesc}</div>
-                  <div className="flex justify-end">
-                    <button type="button" onClick={() => openSettingsSection('model')}
-                      className="h-9 px-4 rounded-lg text-[14px] font-medium text-white" style={{ background: '#0A84FF' }}>{t.apiKeyGateBtn}</button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* 厂商预装本地大模型一键引导 —— 全局首屏弹窗;引导中禁止背景关窗 */}
-            {vllmSetupModalOpen && browserOverlayPublicationReady && (
-              // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard users close the dialog through its real buttons
-              // biome-ignore lint/a11y/noStaticElementInteractions: this is a pointer-only backdrop around an accessible dialog card
-              <div className="fixed inset-0 z-[56] flex items-center justify-center p-6" style={{ background: 'rgba(0,0,0,.5)' }}
-                   onClick={() => { if (!bs.vllmBootstrapping) bridge.vllm.dismissVllmSetup(); }}>
-                {/* biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by real buttons inside the dialog */}
-                {/* biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container */}
-                <div className="w-full max-w-[440px] rounded-2xl p-6 ts-modal-in" onClick={(e) => e.stopPropagation()}
-                     style={{ background: activeTheme === 'dark' ? '#1E1F20' : '#FFFFFF', color: activeTheme === 'dark' ? '#E3E3E3' : '#1F1F1F', boxShadow: '0 12px 48px rgba(0,0,0,.35)' }}>
-                  <div className="flex items-center gap-2 mb-3">
-                    <PinvouLogo className="h-[22px] w-[22px] select-none" />
-                    <div className="text-[17px] font-semibold">{vllmDeclineConfirm && !bs.vllmBootstrapping && !bs.vllmBootstrapDone && !bs.vllmBootstrapError ? t.vllmDeclineTitle : t.vllmSetupTitle}</div>
-                  </div>
-                  {bs.vllmBootstrapping ? (
-                    <VllmSetupProgress phase={bs.vllmSetupPhase} attempt={bs.vllmSetupAttempt} isDark={activeTheme === 'dark'} t={t} />
-                  ) : bs.vllmBootstrapDone ? (
-                    <div>
-                      <div className="text-[14px] leading-relaxed mb-4">{t.vllmSetupDone}</div>
-                      <div className="flex justify-end">
-                        <button type="button" onClick={() => bridge.available && bridge.updater.restartApp()}
-                          className="h-9 px-4 rounded-lg text-[14px] font-medium text-white" style={{ background: '#0A84FF' }}>{t.restartNow}</button>
-                      </div>
-                    </div>
-                  ) : bs.vllmBootstrapError ? (
-                    <div>
-                      <div className="text-[14px] font-medium mb-1" style={{ color: '#E5484D' }}>{t.vllmSetupFailed}</div>
-                      <div className="text-[13px] leading-relaxed mb-4 break-words" style={{ opacity: .75 }}>{bs.vllmBootstrapError}</div>
-                      <div className="flex justify-end gap-2">
-                        <button type="button" onClick={() => bridge.vllm.dismissVllmSetup()}
-                          className="h-9 px-4 rounded-lg text-[14px]" style={{ background: activeTheme === 'dark' ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)' }}>{t.vllmSetupSkip}</button>
-                        <button type="button" onClick={() => bridge.vllm.bootstrapLocalVllm()}
-                          className="h-9 px-4 rounded-lg text-[14px] font-medium text-white" style={{ background: '#0A84FF' }}>{t.vllmSetupRetry}</button>
-                      </div>
-                    </div>
-                  ) : vllmDeclineConfirm ? (
-                    <div>
-                      <div className="text-[14px] leading-relaxed mb-4" style={{ opacity: .85 }}>{t.vllmDeclineDesc}</div>
-                      <div className="flex justify-end gap-2">
-                        <button type="button" onClick={() => setVllmDeclineConfirm(false)}
-                          className="h-9 px-4 rounded-lg text-[14px]" style={{ background: activeTheme === 'dark' ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)' }}>{t.vllmDeclineReconsider}</button>
-                        <button type="button" onClick={() => { setVllmDeclineConfirm(false); bridge.vllm.declineVllmSetup(); }}
-                          className="h-9 px-4 rounded-lg text-[14px] font-medium text-white" style={{ background: '#E5484D' }}>{t.vllmDeclineConfirm}</button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div>
-                      <div className="text-[14px] leading-relaxed mb-4" style={{ opacity: .85 }}>{t.vllmSetupDesc}</div>
-                      <div className="flex items-center justify-between gap-2">
-                        <button type="button" onClick={() => setVllmDeclineConfirm(true)}
-                          className="h-9 px-3 rounded-lg text-[13px] hover:underline" style={{ color: activeTheme === 'dark' ? '#8E8E8E' : '#757575' }}>{t.vllmSetupNever}</button>
-                        <div className="flex gap-2">
-                          <button type="button" onClick={() => bridge.vllm.dismissVllmSetup()}
-                            className="h-9 px-4 rounded-lg text-[14px]" style={{ background: activeTheme === 'dark' ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)' }}>{t.vllmSetupSkip}</button>
-                          <button type="button" onClick={() => bridge.vllm.bootstrapLocalVllm()}
-                            className="h-9 px-4 rounded-lg text-[14px] font-medium text-white" style={{ background: '#0A84FF' }}>{t.vllmSetupEnable}</button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
+              // The gate must cover chat in every state of its lazy chunk:
+              // while loading (Suspense fallback) AND after a chunk failure
+              // (ViewErrorBoundary's in-flow error card). Both layers sit
+              // inside this outer backdrop, so React.lazy's cached rejection
+              // can never leave the composer interactable.
+              <div
+                className="fixed inset-0 z-[57] flex items-center justify-center overflow-auto p-6"
+                style={{ background: 'rgba(0,0,0,.5)' }}
+                aria-busy="true"
+              >
+                <ViewErrorBoundary t={t}>
+                  <Suspense fallback={null}>
+                    <LazyApiKeyGateDialog
+                      theme={activeTheme}
+                      t={t}
+                      onOpenModelSettings={() => openSettingsSection('model')}
+                    />
+                  </Suspense>
+                </ViewErrorBoundary>
               </div>
             )}
 
             {/* Pinvou 检阅弹窗(品/悟) —— 居中弹窗 + 毛玻璃背景(虚化身后 app);全局,任何视图都能弹;点背景或卡内「跳过」关闭 */}
             {bs && bs.pinvouModal && browserOverlayPublicationReady && (
-              // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard users close the dialog through its real close button
-              // biome-ignore lint/a11y/noStaticElementInteractions: this is a pointer-only backdrop around an accessible dialog card
-              <div className="fixed inset-0 z-[55] flex items-center justify-center p-6"
-                   style={{ background: activeTheme === 'dark' ? 'rgba(0,0,0,.45)' : 'rgba(255,255,255,.35)', backdropFilter: 'blur(20px) saturate(140%)', WebkitBackdropFilter: 'blur(20px) saturate(140%)' }}
-                   onClick={() => { if (!bs.pinvouModal.loading) bridge.interaction.dismissPinvouReview(); }}>
-                {/* loading 期间禁止背景点击关窗:召唤(直连 vLLM,5-30s)仍在后台跑、守卫仍 held,
-                    点背景误关会表现为"闪一下没反应、要等一会才能再点"。锁住后 spinner 全程可见,
-                    出结果/错误后才可点背景关。 */}
-                {/* biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the top-right close button (a real button below) */}
-                {/* biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container */}
-                <div className="relative w-full max-w-[720px] overflow-hidden bg-white dark:bg-[#1C1C1E] rounded-[20px] shadow-[0_20px_60px_rgba(0,0,0,0.28)] ts-modal-in"
-                     onClick={(e) => e.stopPropagation()}
-                     style={{ fontFamily:'-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif' }}>
-                  {/* 关闭按钮：所有状态(含 loading)常驻;loading 时点它=取消等待并关窗,in-flight 结果由守卫丢弃 */}
-                  <button type="button" onClick={() => bridge.available && bridge.interaction.dismissPinvouReview()} aria-label={t.pvSkip}
-                    className="absolute top-3.5 right-3.5 z-10 w-7 h-7 flex items-center justify-center rounded-full bg-black/[0.06] dark:bg-white/10 text-[#8E8E93] hover:bg-black/10 dark:hover:bg-white/15 active:scale-90 transition-colors">
-                    <X size={16} />
-                  </button>
-                  <div className="max-h-[90vh] overflow-y-auto custom-scrollbar px-5 pt-5 pb-6">
-                    <PinvouSummonCard item={bs.pinvouModal} theme={activeTheme} t={t} isLocal={activeModelIsLocal(bs)} />
-                  </div>
-                </div>
-              </div>
+              <ViewErrorBoundary t={t}>
+                <Suspense fallback={null}>
+                  <LazyPinvouSummonModal item={bs.pinvouModal} theme={activeTheme} t={t} isLocal={activeModelIsLocal(bs)} />
+                </Suspense>
+              </ViewErrorBoundary>
             )}
 
             </div>
@@ -3946,14 +4642,18 @@ const NAV_PREFETCH = {
                 </div>
                 <div className="min-h-0 flex-1">
                   {browserActive ? (
-                    <BrowserView
-                      key={browserSessionId}
-                      theme={activeTheme}
-                      t={t}
-                      sessionId={browserSessionId}
-                      nativeSurfaceSuspended={browserSurfaceSuspended}
-                      ownershipSlot={browserOwnershipSlot}
-                    />
+                    <ViewErrorBoundary t={t} variant="panel">
+                      <Suspense fallback={null}>
+                        <LazyBrowserView
+                          key={browserSessionId}
+                          theme={activeTheme}
+                          t={t}
+                          sessionId={browserSessionId}
+                          nativeSurfaceSuspended={browserSurfaceSuspended}
+                          ownershipSlot={browserOwnershipSlot}
+                        />
+                      </Suspense>
+                    </ViewErrorBoundary>
                   ) : (
                     <div
                       className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-[13px]"
@@ -3994,7 +4694,7 @@ const NAV_PREFETCH = {
           </SidePanelLayoutProvider>
 
           {isCompactShell && (
-            <MobileTabBar theme={activeTheme} tabs={[
+            <Suspense fallback={null}><MobileTabBar theme={activeTheme} tabs={[
               { key: 'chat', label: t.currentChat, icon: <MessageSquare size={18} />,
                 active: currentView === 'chat' || !!(currentView === 'scheduled' && bs && bs.scheduledRunContext),
                 onClick: () => mobileNavigate('chat') },
@@ -4006,11 +4706,11 @@ const NAV_PREFETCH = {
               { key: 'more', label: t.mobileMore, icon: <MoreHorizontal size={18} />,
                 active: mobileMoreActive, dot: hasUpdate || scheduledUnread,
                 onClick: () => setMobileMoreOpen(true) },
-            ]} />
+            ]} /></Suspense>
           )}
 
           {isCompactShell && mobileMoreOpen && browserOverlayPublicationReady && (
-            <MobileMoreSheet theme={activeTheme} title={t.mobileMore} onClose={() => setMobileMoreOpen(false)} items={[
+            <Suspense fallback={null}><MobileMoreSheet theme={activeTheme} title={t.mobileMore} onClose={() => setMobileMoreOpen(false)} items={[
               { key: 'search', label: t.searchChats, icon: <Search size={18} />,
                 active: currentView === 'search', onClick: () => mobileNavigate('search') },
               ...(browserActive ? [{ key: 'browser', label: t.browser, icon: <Globe size={18} />,
@@ -4026,20 +4726,31 @@ const NAV_PREFETCH = {
                 active: currentView === 'toolStore', onClick: () => mobileNavigate('toolStore') },
               { key: 'settings', label: t.settings, icon: <Settings size={18} />,
                 active: currentView === 'settings', dot: hasUpdate, onClick: () => mobileNavigate('settings') },
-            ]} />
+            ]} /></Suspense>
           )}
 
-          <UpdateNoticeButton
-            theme={activeTheme}
-            bs={bs}
-            t={t}
-            onShowChangelog={() => {
-              // Same settings entry path as the sidebar gear (openSettingsSection records the
-              // return view and lets navigateFromScheduledRun own the view transition).
-              openSettingsSection('update');
-              setSettingsUpdateFocusTick(v => v + 1);
-            }}
-          />
+          {(hasUpdate || updateNoticePreviewEnabled) && (
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyUpdateNoticeButton
+                  bs={bs}
+                  t={t}
+                  // 68 = the collapsed rail's w-[68px] (kept literal here; Tailwind
+                  // needs the class spelled out at the rail below).
+                  sidebarOffset={isCompactShell ? 0 : (isSidebarOpen ? sidebarWidth : 68)}
+                  bottomInset={isCompactShell ? 56 : 0}
+                  hidden={isCompactShell && isSidebarOpen}
+                  measureKey={currentView}
+                  onShowChangelog={() => {
+                    // Same settings entry path as the sidebar gear (openSettingsSection records the
+                    // return view and lets navigateFromScheduledRun own the view transition).
+                    openSettingsSection('update');
+                    setSettingsUpdateFocusTick(v => v + 1);
+                  }}
+                />
+              </Suspense>
+            </ViewErrorBoundary>
+          )}
         </div>
       );
     };
@@ -4052,9 +4763,9 @@ const NAV_PREFETCH = {
     const root = createRoot(document.querySelector('#root'));
     window.__PINVOU_STARTUP__.mark('react:create_root_done');
     const __q = new URLSearchParams(window.location.search);
-    // 首帧语言引导:zh 词典内嵌(Promise 已 resolve,仅一个微任务),en/ja 系统
-    // 用户先取惰性词典 chunk 再首渲染,保证 t = dict[language] 首帧即有效。
-    // 装载失败(资源损坏)按 zh 兜底渲染,不空白。
+    // 首帧语言引导:三种语言一致走惰性 chunk;先取所选语言词典再首渲染,
+    // 保证 t = dict[language] 首帧即有效。装载失败(离线/重部署后哈希失效)
+    // 时降级装载 zh,渲染腿 dict[language] || zhDict() 以中文兜底而非白屏。
     const __initialLang = initialSystemLanguage();
     const __storedLang = (() => {
       if (!isWeb) return null;
@@ -4063,16 +4774,22 @@ const NAV_PREFETCH = {
         return value && ['zh', 'en', 'ja'].includes(value) ? value : null;
       } catch { return null; }
     })();
-    ensureLanguage(__storedLang || __initialLang).catch(() => {}).then(function () {
-      if (__q.get('detached') === '1') {
-        window.__PINVOU_DETACHED__ = true;
-        root.render(
-          <Suspense fallback={<div className="p-6 text-sm opacity-60">…</div>}>
-            <LazyDetachedShell kind={__q.get('kind') || 'monitor'} id={__q.get('id') || ''} />
-          </Suspense>
-        );
-      } else {
-        window.__PINVOU_STARTUP__.mark('react:render_call');
-        root.render(<App />);
-      }
+    // 双失败引导终态(round-49 M2):装载返回 null(首选与 zh chunk 都不可达)
+    // 时照常挂载会让词典依赖组件在首帧 TypeError;由 mountWhenLanguageReady
+    // 以词典无关的静态失败/重试态替代(见 shared/entry-boot.js)。
+    mountWhenLanguageReady({
+      load: () => ensureLanguageWithZhFallback(__storedLang || __initialLang),
+      mount: function () {
+        if (__q.get('detached') === '1') {
+          window.__PINVOU_DETACHED__ = true;
+          root.render(
+            <Suspense fallback={<div className="p-6 text-sm opacity-60">…</div>}>
+              <LazyDetachedShell kind={__q.get('kind') || 'monitor'} id={__q.get('id') || ''} />
+            </Suspense>
+          );
+        } else {
+          window.__PINVOU_STARTUP__.mark('react:render_call');
+          root.render(<App />);
+        }
+      },
     });

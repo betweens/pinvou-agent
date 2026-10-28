@@ -50,10 +50,6 @@ pub struct MemoryOrganizeState {
     pub warnings: Vec<MemoryWarning>,
 }
 
-fn resolve_memory_session_id(session_id: Option<String>, store: &SessionStore) -> Option<String> {
-    session_id.or_else(|| store.active_id())
-}
-
 fn emit_memory_write_events(
     app: &AppHandle,
     session_id: &str,
@@ -76,17 +72,28 @@ fn emit_memory_write_events(
 // chat.rs/forwarder.rs. Command callers read the fresh snapshot from the
 // command's return value instead.
 
-fn refresh_memory_runtime_for_command(
-    session_id: Option<String>,
-    store: &SessionStore,
-) -> Result<Option<crate::features::memory::RuntimeMemorySnapshot>, String> {
-    match resolve_memory_session_id(session_id, store) {
-        Some(sid) => {
-            let snapshot = crate::features::memory::runtime_snapshot(&sid)
-                .map_err(|e| format!("render runtime memory: {e}"))?;
-            Ok(Some(snapshot))
+/// Single home of the runtime-refresh fallback ladder (resolve → snapshot →
+/// on failure the shared "render runtime memory" detail string, stderr log,
+/// and `runtime_refresh_failed` warning); the write-command wrapper, the
+/// snapshot-document lane, and the overview lane all consume it and add only
+/// their own bookkeeping.
+fn runtime_snapshot_best_effort(
+    sid: Option<String>,
+) -> (
+    Option<crate::features::memory::RuntimeMemorySnapshot>,
+    Option<MemoryWarning>,
+) {
+    match sid.map(|sid| crate::features::memory::runtime_snapshot(&sid)) {
+        Some(Ok(snapshot)) => (Some(snapshot), None),
+        Some(Err(error)) => {
+            let detail = format!("render runtime memory: {error}");
+            eprintln!("[memory] {detail}");
+            (
+                None,
+                Some(memory_warning("runtime_refresh_failed", "runtime", detail)),
+            )
         }
-        None => Ok(None),
+        None => (None, None),
     }
 }
 
@@ -97,16 +104,8 @@ fn refresh_memory_runtime_best_effort(
     Option<crate::features::memory::RuntimeMemorySnapshot>,
     Vec<MemoryWarning>,
 ) {
-    match refresh_memory_runtime_for_command(session_id, store) {
-        Ok(runtime) => (runtime, Vec::new()),
-        Err(detail) => {
-            eprintln!("[memory] {detail}");
-            (
-                None,
-                vec![memory_warning("runtime_refresh_failed", "runtime", detail)],
-            )
-        }
-    }
+    let (runtime, warning) = runtime_snapshot_best_effort(resolve_session_id(session_id, store));
+    (runtime, warning.into_iter().collect())
 }
 
 /// Shared tail of every memory write command: emit the write's
@@ -124,7 +123,7 @@ fn finish_memory_write<T>(
     persistence_warnings: Vec<MemoryWarning>,
 ) -> Result<MemoryWriteState<T>, String> {
     if let (Some(sid), Some(event)) = (
-        resolve_memory_session_id(session_id.clone(), store),
+        resolve_session_id(session_id.clone(), store),
         event.as_ref(),
     ) {
         emit_memory_write_events(app, &sid, std::slice::from_ref(event));
@@ -265,19 +264,15 @@ fn refresh_memory_snapshot_document(
         never,
     } = sources;
     let mut runtime_available = !runtime_render_failed;
-    let runtime = match (runtime, resolve_memory_session_id(session_id, store)) {
+    let runtime = match (runtime, resolve_session_id(session_id, store)) {
         (Some(snapshot), _) => Some(snapshot.clone()),
         (None, Some(sid)) if !runtime_render_failed => {
-            match crate::features::memory::runtime_snapshot(&sid) {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    let detail = format!("render runtime memory: {error}");
-                    eprintln!("[memory] {detail}");
-                    warnings.push(memory_warning("runtime_refresh_failed", "runtime", detail));
-                    runtime_available = false;
-                    None
-                }
+            let (snapshot, warning) = runtime_snapshot_best_effort(Some(sid));
+            if let Some(warning) = warning {
+                warnings.push(warning);
+                runtime_available = false;
             }
+            snapshot
         }
         _ => None,
     };
@@ -410,22 +405,11 @@ pub async fn get_memory_overview(
         never,
     } = sources_loaded;
     let authoritative_sources_available = sources.values().all(|status| status.available);
-    let runtime = match resolve_memory_session_id(session_id, &store) {
-        Some(sid) => match crate::features::memory::runtime_snapshot(&sid) {
-            Ok(snapshot) => {
-                sources.insert(
-                    "runtime".to_string(),
-                    MemorySourceStatus {
-                        available: true,
-                        code: None,
-                    },
-                );
-                Some(snapshot)
-            }
-            Err(error) => {
-                let detail = format!("render runtime memory: {error}");
-                eprintln!("[memory] {detail}");
-                warnings.push(memory_warning("runtime_refresh_failed", "runtime", detail));
+    let runtime = match resolve_session_id(session_id, &store) {
+        Some(sid) => {
+            let (snapshot, warning) = runtime_snapshot_best_effort(Some(sid));
+            if let Some(warning) = warning {
+                warnings.push(warning);
                 sources.insert(
                     "runtime".to_string(),
                     MemorySourceStatus {
@@ -433,9 +417,17 @@ pub async fn get_memory_overview(
                         code: Some("runtime_refresh_failed".to_string()),
                     },
                 );
-                None
+            } else {
+                sources.insert(
+                    "runtime".to_string(),
+                    MemorySourceStatus {
+                        available: true,
+                        code: None,
+                    },
+                );
             }
-        },
+            snapshot
+        }
         None => {
             sources.insert(
                 "runtime".to_string(),
@@ -528,7 +520,7 @@ pub async fn organize_memory(
     // preparation). Without an active session yet (e.g. a brand-new draft),
     // degrade to the pool's shared bridge with global prefs loaded directly,
     // the same `get_image_input_capability` fallback.
-    let bridge = match resolve_memory_session_id(None, &store) {
+    let bridge = match resolve_session_id(None, &store) {
         Some(sid) => pool.fresh_bridge_for(&sid).await.map_err(|error| {
             // The `fresh_bridge_for` error chain can carry endpoint/credential
             // probing details; pass it through `redact_secret` before returning
@@ -780,20 +772,27 @@ pub async fn edit_last_turn(
     let reservation = pool
         .reserve_turn(&sid)
         .map_err(|e| format!("reserve edit_last_turn: {e:#}"))?;
-    let mode_state = store.mode_state(&sid);
-    let full = super::multiagent::prepend_delegation_replay_reminder(
-        pool.inner(),
-        &sid,
-        mode_state.multi_agent,
-        new_message.clone(),
-    );
-    let display_message = user_display_message(new_message);
+    // 编辑重发只发编辑后的原文：`EditLastTurn` 不携带 route，由引擎按当前
+    // 配置重推导 provider 路由（含专家 fleet 配置随配置重读）；底座重推导时
+    // 会重申宿主已申报的路由限额，不因重推导退回目录猜测。蜂群契约在 spawn
+    // 级 instructions，无需（也不应）在此重新拼接任何提醒内容。
+    let display_message = user_display_message(new_message.clone());
 
     // 定时会话不走 ensure_chat_session:编辑重发与继续追问同路,EnginePool 内部
     // 按 scheduled_profile 做 turn gate;会话管理类命令(删除/改名/归档)仍然拒绝。
-    pool.edit_last_turn_reserved(&sid, full, display_message, reservation)
+    crate::features::assistant::timing::start_turn(&sid);
+    if let Err(error) = pool
+        .edit_last_turn_reserved(&sid, new_message, display_message, reservation)
         .await
-        .map_err(|e| format!("edit_last_turn: {e:#}"))
+    {
+        crate::features::assistant::timing::finish_turn(
+            &sid,
+            "send_error",
+            Some(&format!("{error:#}")),
+        );
+        return Err(format!("edit_last_turn: {error:#}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

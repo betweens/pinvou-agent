@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { BookOpen, Check, ChevronDown, ClipboardList, X, Zap } from '../../components/icons.jsx';
 import { bridge } from '../../hooks/useBridge.js';
+import { isWeb } from '../../shared/platform.js';
 import { ComposerPopover } from '../../components/ComposerPopover.jsx';
 import { invokeTauri, isTauriAvailable } from '../../platform/tauri/client.js';
 
@@ -136,11 +137,25 @@ const ComposerKbSelector = ({
     modelSetup.startupLoading === true
     || (runtimeReadyKnown && modelStatus.ready === false && modelSetup.startupReady !== true)
   );
-  const modelBlocked = modelMissing || modelNotReady;
+  // 后端状态里权威的能力位（与命令层下载/装载闸同一来源）：false = 本设备
+  // 编译期即无本地嵌入（loongarch64），模型永远无法就绪——挂载按既有的全文
+  // 检索降级姿态放行（kb_search 在该平台跳过模型重载、直接 FTS），模型检查
+  // 只在「支持平台」上继续把关。字段缺失（旧快照/mock）按未知 → 不放行。
+  const platformEmbedUnsupported = !!(modelStatus && modelStatus.localEmbedSupported === false);
+  const modelBlocked = !platformEmbedUnsupported && (modelMissing || modelNotReady);
   const triggerBlocked = modelBlocked
     && mountedEntries.every(entry => entry.source !== 'remote')
     && (collections || []).every(collection => !(collection.source === 'remote' && collection.ready !== false));
-  const modelBlockedCopy = modelMissing ? t.kbMountNoModel : t.kbMountNotReady;
+  // 平台无本地 embedding（localEmbedSupported=false，如 linux/loongarch64；能力快照
+  // 到达前同样按 false 兜底）时，「先去知识库下载」的引导不成立，改用平台不支持说明。
+  // 不支持时短路两个分支：该平台上模型永远无法就绪，「仍在加载」会变成永远
+  // 无法兑现的承诺（如共享宿主残留的模型目录会让 installed=true、ready=false）。
+  // web 端快照永远缺失，但阻塞通常只是「宿主桌面端尚未安装模型」——归因到
+  // 桌面端而不是宣称平台不支持（KnowledgeView 知识库门同向）。
+  const localEmbedSupported = !!(bs && bs.platformCapabilities && bs.platformCapabilities.localEmbedSupported);
+  const modelBlockedCopy = localEmbedSupported
+    ? (modelMissing ? t.kbMountNoModel : t.kbMountNotReady)
+    : (isWeb ? t.kbEmbedWebTitle : t.kbEmbedUnsupported);
 
   function toggle() { const next = !open; setOpen(next); if (next) { refreshModelStatus(); if (collections === null) loadList(); } }
   function pick(collection) {
@@ -154,8 +169,11 @@ const ComposerKbSelector = ({
       }
       return;
     }
-    if (explicitMountState) setOpen(false);
-    if (onMount) { onMount(collection.id); return; }
+    if (explicitMountState) {
+      setOpen(false);
+      if (onMount) onMount(collection.id);
+      return;
+    }
     if (!bridge.available) return;
     bridge.knowledge.mountCollection(collection.id);
   }
@@ -193,7 +211,10 @@ const ComposerKbSelector = ({
   }
   function unmount() {
     setOpen(false);
-    if (onUnmount) { onUnmount(); return; }
+    if (explicitMountState) {
+      if (onUnmount) onUnmount();
+      return;
+    }
     if (bridge.available) bridge.knowledge.unmountCollection();
   }
 
@@ -201,7 +222,7 @@ const ComposerKbSelector = ({
     <div className="relative">
       <button type="button" ref={triggerRef} onClick={toggle} data-testid="kb-mount-trigger" title={active ? mountedTitle : (triggerBlocked ? modelBlockedCopy : t.kbMountTitle)}
         className={`relative shrink-0 flex items-center justify-center transition-colors border ${compact ? 'w-9 h-9 rounded-full' : 'h-8 gap-1.5 rounded-[12px] px-2.5 text-[12px] font-semibold'} ${active
-          ? (compact ? 'bg-transparent text-[#1A73E8] dark:text-[#A8C7FA] border-transparent' : 'bg-[#007AFF]/10 dark:bg-[#0A84FF]/18 text-[#007AFF] dark:text-[#5AC8FA] border-[#007AFF]/20 dark:border-[#0A84FF]/25')
+          ? (compact ? 'bg-transparent text-[#1A73E8] dark:text-[#A8C7FA] border-transparent' : 'bg-[#007AFF]/10 dark:bg-[#0A84FF]/[0.18] text-[#007AFF] dark:text-[#5AC8FA] border-[#007AFF]/20 dark:border-[#0A84FF]/25')
           : triggerBlocked
             ? 'bg-transparent text-gray-400 dark:text-gray-600 border-transparent opacity-70'
             : (compact ? 'bg-transparent hover:bg-black/5 dark:hover:bg-white/10 text-gray-700 dark:text-gray-200 border-transparent' : 'bg-black/[0.045] dark:bg-white/[0.055] hover:bg-black/[0.07] dark:hover:bg-white/[0.09] text-gray-700 dark:text-gray-200 border-black/[0.045] dark:border-white/[0.06]')}`}>

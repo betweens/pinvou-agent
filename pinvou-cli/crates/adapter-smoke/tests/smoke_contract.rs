@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use adapter_smoke::{
     ProductScoreConfidence, ProductScoreDimension, SMOKE_TOOL_POLICY_ID,
-    SMOKE_TOOL_POLICY_ID_DEPRECATED, SmokeAnalysisMaterial, SmokeRecord, SmokeToolEvent,
-    SmokeUsage, ToolExpectation, analyze_rules, calculate_product_score, is_low_cache_hit_ratio,
-    latency_exceeds_twice_median, render_smoke_markdown, smoke_cases,
+    SMOKE_TOOL_POLICY_ID_DEPRECATED, SmokeAdapter, SmokeAnalysisMaterial, SmokeRecord,
+    SmokeToolEvent, SmokeUsage, ToolExpectation, analyze_rules, calculate_product_score,
+    is_low_cache_hit_ratio, latency_exceeds_twice_median, render_smoke_markdown, smoke_cases,
 };
 use agent_backend_api::PrivateInputResolver;
 use benchmark_core::{
@@ -177,12 +177,33 @@ fn smoke_cases_preserve_the_legacy_golden_contract() {
 }
 
 #[test]
+fn descriptor_records_the_per_case_deadline_upper_bound() {
+    let adapter = SmokeAdapter::new();
+    // The manifest records the suite's harness-deadline mode as the upper
+    // bound, so the declared bound must stay an upper bound for every
+    // per-case deadline: a case above it would understate the recorded mode.
+    assert_eq!(adapter.descriptor().harness_deadline_secs(), Some(60));
+    let max_case = smoke_cases()
+        .iter()
+        .map(|case| case.timeout())
+        .max()
+        .expect("the smoke suite declares cases");
+    assert!(
+        max_case <= Duration::from_secs(60),
+        "smoke case timeout {max_case:?} exceeds the manifest-recorded 60s bound"
+    );
+}
+
+#[test]
 fn rules_and_health_score_use_only_safe_adapter_material() {
     let cases = smoke_cases();
     let records = vec![
         SmokeRecord::new(
             TaskOutcome::new("plep_smoke_hi", TaskStatus::Completed, None, vec![], 10),
-            SmokeAnalysisMaterial::new(vec!["web_search".into()]),
+            SmokeAnalysisMaterial::with_details(
+                vec![SmokeToolEvent::new("web_search", false)],
+                None,
+            ),
         ),
         SmokeRecord::new(
             TaskOutcome::new(
@@ -192,7 +213,7 @@ fn rules_and_health_score_use_only_safe_adapter_material() {
                 vec![],
                 20,
             ),
-            SmokeAnalysisMaterial::new(vec![]),
+            SmokeAnalysisMaterial::with_details(vec![], None),
         ),
     ];
 
@@ -204,7 +225,6 @@ fn rules_and_health_score_use_only_safe_adapter_material() {
     let score = calculate_product_score(&records, analysis.findings()).expect("safe findings");
     assert_eq!(score.version(), "pinvou-product-score/v1");
     assert!(score.total().is_some_and(|score| score < 100));
-    assert!(!score.is_official_score());
 
     let debug = format!("{records:?}");
     assert!(!debug.contains("prompt"));

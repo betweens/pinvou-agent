@@ -1,6 +1,6 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Archive, Check, Download, Edit2, FolderOpen, Layers, MoreHorizontal, PinIcon, PinOffIcon, Sparkles, Trash2, X } from '../icons.jsx';
+import { Archive, Briefcase, Check, Download, Edit2, FolderOpen, Layers, MoreHorizontal, PinIcon, PinOffIcon, Sparkles, Trash2, X } from '../icons.jsx';
 import { useLongPressDrag } from '../../hooks/useLongPressDrag.js';
 import { usePortalMenu } from '../../hooks/usePortalMenu.js';
 import { isImeComposing } from '../../shared/ime-guard.mjs';
@@ -43,133 +43,6 @@ import { PROJECT_SESSION_DRAG_TYPE } from '../../features/projects/projectGroupi
       );
     });
 
-    // Shared iOS-style confirm dialog: backdrop + Escape handling + panel +
-    // 2-button footer. ArchiveConfirmDialog and ArchivedDeleteConfirmDialog
-    // differ only in copy and the confirm-action tint; the destructive
-    // variant is the newer semantics and wins for the shared role/aria
-    // attributes (role=alertdialog).
-    const ConfirmDialogShell = ({ theme, t, labelledById, title, message, detail, actionLabel, destructive = false, onCancel, onConfirm }) => {
-      const isDark = theme === 'dark';
-      useEffect(() => {
-        const onKey = (e) => {
-          if (e.key === 'Escape') onCancel();
-        };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-      }, [onCancel]);
-      return (
-        // Backdrop click-to-close; keyboard path: Escape (effect listener below) and the real "Cancel" button inside the dialog.
-        // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer; the keyboard path is handled by the Escape listener and the cancel button
-        <div
-          role="presentation"
-          className="fixed inset-0 z-[200] flex items-center justify-center p-4"
-          style={{
-            background: 'rgba(0,0,0,.34)',
-            backdropFilter: 'blur(14px) saturate(140%)',
-            WebkitBackdropFilter: 'blur(14px) saturate(140%)',
-            fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif'
-          }}
-          onClick={onCancel}
-        >
-          {/* biome-ignore lint/a11y/useKeyWithClickEvents: dialog body only stops bubbling to avoid accidentally triggering backdrop close; not an interactive control itself */}
-          <div
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby={labelledById}
-            className="w-[320px] max-w-[calc(100vw-48px)] overflow-hidden rounded-[16px] shadow-2xl bg-[rgba(250,250,250,.96)] dark:bg-[rgba(44,44,46,.96)] text-[#000] dark:text-[#F2F2F7]"
-            style={{
-              // isDark dynamic-value: 保留 (boxShadow)
-              boxShadow: isDark ? '0 24px 60px rgba(0,0,0,.55)' : '0 24px 60px rgba(0,0,0,.22)'
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="px-6 pt-6 pb-5 text-center">
-              <div id={labelledById} className="text-[20px] font-semibold leading-[26px]">{title}</div>
-              <div className="mt-2.5 text-[15px] leading-[22px] text-[rgba(60,60,67,.72)] dark:text-[rgba(235,235,245,.72)]">
-                <div>{message}</div>
-                {detail && <div className="mt-1">{detail}</div>}
-              </div>
-            </div>
-            <div className="h-px bg-[rgba(60,60,67,.24)] dark:bg-[rgba(84,84,88,.65)]" />
-            <div className="grid grid-cols-2">
-              <button
-                type="button"
-                onClick={onCancel}
-                className="h-[50px] text-[17px] active:opacity-70 text-[#007AFF] dark:text-[#0A84FF]"
-              >
-                {t.cpCancel}
-              </button>
-              <button
-                type="button"
-                onClick={onConfirm}
-                className={`h-[50px] text-[17px] font-semibold active:opacity-70 ${destructive ? 'text-[#FF3B30]' : 'text-[#007AFF] dark:text-[#0A84FF]'} border-l border-l-[rgba(60,60,67,.24)] dark:border-l-[rgba(84,84,88,.65)]`}
-              >
-                {actionLabel}
-              </button>
-            </div>
-          </div>
-        </div>
-      );
-    };
-
-    const ArchiveConfirmDialog = ({ theme, t, onCancel, onConfirm }) => (
-      <ConfirmDialogShell
-        theme={theme}
-        t={t}
-        labelledById="archive-confirm-title"
-        title={t.archiveConfirmTitle}
-        message={t.archiveConfirmMessage}
-        detail={t.archiveConfirmDetail}
-        actionLabel={t.archiveConfirmAction}
-        onCancel={onCancel}
-        onConfirm={onConfirm}
-      />
-    );
-
-    const ArchivedDeleteConfirmDialog = ({ theme, t, onCancel, onConfirm }) => (
-      <ConfirmDialogShell
-        theme={theme}
-        t={t}
-        labelledById="archived-delete-confirm-title"
-        title={t.archivedDeleteTitle}
-        message={t.archivedDeleteMessage}
-        actionLabel={t.archivedDeleteAction}
-        destructive
-        onCancel={onCancel}
-        onConfirm={onConfirm}
-      />
-    );
-
-    const ArchiveToast = ({ t, onClose, onView }) => {
-      return (
-        <div
-          className="fixed left-1/2 top-6 z-[210] -translate-x-1/2 px-2 py-2 rounded-[18px] flex items-center gap-1 shadow-2xl bg-[rgba(250,250,250,.94)] dark:bg-[rgba(44,44,46,.94)] text-[#1C1C1E] dark:text-[#F2F2F7] border border-[rgba(0,0,0,.08)] dark:border-[rgba(255,255,255,.10)]"
-          style={{
-            backdropFilter: 'blur(18px) saturate(150%)',
-            WebkitBackdropFilter: 'blur(18px) saturate(150%)',
-            fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif'
-          }}
-        >
-          <div className="pl-3 pr-2 text-[14px] leading-5 whitespace-nowrap">{t.archiveSuccess}</div>
-          <button
-            type="button"
-            onClick={onView}
-            className="h-8 min-w-[76px] px-3 rounded-[12px] text-[14px] font-semibold whitespace-nowrap active:opacity-70 text-[#007AFF] dark:text-[#0A84FF] bg-[rgba(0,122,255,.10)] dark:bg-[rgba(10,132,255,.12)]"
-          >
-            {t.archiveSuccessView}
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            className="w-8 h-8 rounded-full text-[18px] leading-none active:opacity-70 text-[rgba(60,60,67,.62)] dark:text-[rgba(235,235,245,.62)]"
-            aria-label={t.cpCancel}
-          >
-            ×
-          </button>
-        </div>
-      );
-    };
-
     // 近期会话项：支持重命名(内联编辑) + 删除(内联二次确认)
     // Inline styles are extracted into pure functions: dragging lowers opacity; the persona target row builds its highlight color at runtime (isDark-dependent, cannot use static dark: variants).
     const recentItemRowStyle = (dragging, personaTarget, isDark) => {
@@ -186,7 +59,7 @@ import { PROJECT_SESSION_DRAG_TYPE } from '../../features/projects/projectGroupi
     // derived by the parent's useMemo and callbacks come from the parent's
     // useCallback / per-item closure cache (see renderSidebarTaskItem in
     // main.jsx); the default shallow compare then skips correctly.
-    const RecentItem = memo(function RecentItem({ chat, active, personaTarget, theme, t, onSelect, onRename, onDelete, onTogglePinned, onOpenFolder, onExportArchive, onArchive, onMoveToProject, dragKind = 'session', dragging, onPickUp, dndPayload, dndDisabled, onDragEnd }) {
+    const RecentItem = memo(function RecentItem({ chat, active, personaTarget, theme, t, onSelect, onRename, onDelete, onTogglePinned, onOpenFolder, onExportArchive, onArchive, onMoveToProject, onViewWorkspace, dragKind = 'session', dragging, onPickUp, dndPayload, dndDisabled, onDragEnd }) {
       const isDark = theme === 'dark';
       const [editing, setEditing] = useState(false);
       const [confirming, setConfirming] = useState(false);
@@ -198,12 +71,17 @@ import { PROJECT_SESSION_DRAG_TYPE } from '../../features/projects/projectGroupi
       function save() { const tx = val.trim(); setEditing(false); if (tx && tx !== chat.title) onRename(chat.id, tx); }
       // Portal "more" menu placement/close lives in the shared hook (same
       // plumbing as the project-group header menu). Height covers the tallest
-      // variant actually rendered — 6 menu items at h-9 (36px) + 9px divider +
-      // 8px vertical padding ≈ 233: codex rows render move-to-project, other
-      // rows render export-archive, and the two are taskKind-exclusive. It
-      // only drives the bottom-edge flip decision and the portal clips
-      // (per-menu height convention, see ProjectGroupHeader).
-      const { menuOpen, menuStyle, closeMenu, toggleMenu, openMenuAt } = usePortalMenu({ height: 233 });
+      // variant actually rendered — 8 enabled entries on a desktop bound row
+      // at h-9 (36px) + 9px divider + 8px vertical padding ≈ 305: toggle-pin,
+      // rename, the desktop-gated view-workspace entry, move-to-project,
+      // delete, open-folder, export-archive, archive. (The old 269 estimate
+      // assumed move-to-project and export-archive were taskKind-exclusive —
+      // they are gated on independent props and co-exist on bound rows, so
+      // the flip decision missed by one row near the viewport bottom;
+      // review #484 round-11 m7.) It only drives the bottom-edge flip
+      // decision and the portal clips (per-menu height convention, see
+      // ProjectGroupHeader).
+      const { menuOpen, menuStyle, closeMenu, toggleMenu, openMenuAt } = usePortalMenu({ height: 305 });
       // 移动菜单项把流程移交给 App 级弹窗:菜单门户与弹窗在同一次提交里
       // 卸载/挂载,被聚焦的菜单项随门户消失,弹窗的焦点还原来不及捕获它;
       // 且此刻行的 :hover/focus-within 都已失效,hover 显隐的按钮容器是
@@ -225,6 +103,12 @@ import { PROJECT_SESSION_DRAG_TYPE } from '../../features/projects/projectGroupi
             <Edit2 size={15} />
             <span>{t.riRename}</span>
           </button>
+          {onViewWorkspace && (
+            <button type="button" className={menuItemCls} data-testid="session-view-workspace" onClick={() => { closeMenu(); onViewWorkspace(chat); }}>
+              <Briefcase size={15} />
+              <span>{t.riViewWorkspace}</span>
+            </button>
+          )}
           {onMoveToProject && (
             <button type="button" className={menuItemCls} onClick={() => { rowLabelRef.current?.focus(); closeMenu(); onMoveToProject(chat); }}>
               <Layers size={15} />
@@ -367,4 +251,4 @@ import { PROJECT_SESSION_DRAG_TYPE } from '../../features/projects/projectGroupi
       );
     });
 
-export { NavItem, ArchiveConfirmDialog, ArchivedDeleteConfirmDialog, ArchiveToast, RecentItem };
+export { NavItem, RecentItem };

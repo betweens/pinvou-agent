@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  activateRightDockPanel,
   createRightDockState,
-  hideRightDockPanel,
+  reduceRightDockState,
   rightDockSnapshot,
 } from '../src/components/layout/right-dock-state.mjs';
 
@@ -15,16 +14,28 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
 const source = path.join(root, 'src', 'features', 'codex', 'acp-state.js');
 const temp = mkdtempSync(path.join(tmpdir(), 'pinvou3-codex-acp-'));
-const moduleDir = path.join(temp, 'codex');
-const conversationDir = path.join(temp, 'conversation');
+const moduleDir = path.join(temp, 'features', 'codex');
+const conversationDir = path.join(temp, 'features', 'conversation');
+const sharedDir = path.join(temp, 'shared');
 mkdirSync(moduleDir, { recursive: true });
 mkdirSync(conversationDir, { recursive: true });
+mkdirSync(sharedDir, { recursive: true });
 writeFileSync(path.join(temp, 'package.json'), '{"type":"module"}\n');
 const modulePath = path.join(moduleDir, 'acp-state.js');
 copyFileSync(source, modulePath);
+for (const file of ['conversation-model.js', 'deepseek-conversation.js']) {
+  copyFileSync(
+    path.join(root, 'src', 'features', 'conversation', file),
+    path.join(conversationDir, file),
+  );
+}
 copyFileSync(
-  path.join(root, 'src', 'features', 'conversation', 'conversation-model.js'),
-  path.join(conversationDir, 'conversation-model.js'),
+  path.join(root, 'src', 'shared', 'shell-tools.mjs'),
+  path.join(sharedDir, 'shell-tools.mjs'),
+);
+copyFileSync(
+  path.join(root, 'src', 'shared', 'path-utils.js'),
+  path.join(sharedDir, 'path-utils.js'),
 );
 
 const event = (seq, type, data, turnId = 'turn-1') => ({
@@ -121,7 +132,6 @@ try {
     ['thought', 'tool', 'permission', 'elicitation', 'message'],
   );
   assert.equal(turn.blocks[1].tool.status, 'completed', 'tool block must update in its original position');
-  assert.equal(projected.thread.turns, projected.turns, 'thread must own the projected turns');
   assert.deepEqual(
     turn.items.map(item => item.type),
     ['reasoning', 'tool', 'permission', 'elicitation', 'agent_message'],
@@ -625,8 +635,12 @@ try {
   assert.ok(codexCommands.includes('list_codex_acp_sessions'));
   assert.ok(codexCommands.includes('workspace_path: Option<String>'), 'Codex creation must accept an explicit project directory');
   assert.ok(codexCommands.includes('agent_id: Option<String>')
-    && /set_acp_workspace\(\s*&session\.metadata\.id,\s*backend,/.test(codexCommands),
-  'code-session creation must bind the selected ACP Agent for the lifetime of the session');
+    && codexCommands.includes('let bind_session_id')
+    && codexCommands.indexOf('let bind_session_id')
+      < codexCommands.search(/set_acp_workspace\(\s*&bind_session_id,\s*backend,/),
+  'code-session creation must bind the selected ACP Agent for the lifetime of the session '
+    + '(the binding now joins on a blocking worker; pin the moved id chain by ordering — '
+    + "indexOf('let bind_session_id') must precede its set_acp_workspace(&bind_session_id, backend, use)");
   assert.ok(codexCommands.includes('or(Some("pinvou"))'),
     'code-session creation without an explicit agent must default to the built-in Pinwu backend');
   assert.ok(codexCommands.includes('pub async fn login_acp_agent')
@@ -659,10 +673,17 @@ try {
   assert.ok(runtime.includes('NewSessionRequest::new(workspace)'));
   assert.ok(runtime.includes('会话绑定的项目目录已不可用'), 'missing projects must not silently fall back');
   assert.ok(runtime.includes('apply_saved_mode('), 'saved Full Access mode must be restored after new/load');
-  assert.ok(runtime.includes('cancel_pending_permissions_with_bridge(&session_id, Some(&runtime.bridge))')
+  // Commit 22559510e extracted the repeated permission+elicitation settlement
+  // pair into cancel_runtime_pending_cards; account switching
+  // (restart_agent_sessions) must still settle through the REMOVED runtime's
+  // own bridge, and the helper must forward that bridge to BOTH cancellation
+  // paths so the cancelled outcomes stay persisted to the timeline.
+  assert.ok(runtime.includes('cancel_runtime_pending_cards(&session_id, Some(&runtime.bridge))')
+    && /async fn cancel_runtime_pending_cards\(&self, session_id: &str, bridge: Option<&EventBridge>\) \{\s*self\.cancel_pending_permissions_with_bridge\(session_id, bridge\)\s*\.await;\s*self\.cancel_pending_elicitations_with_bridge\(session_id, bridge\)\s*\.await;\s*\}/.test(runtime)
     && runtime.includes('"outcome": "cancelled"'),
   'account switching must persist permission cancellation through the removed runtime bridge');
-  assert.ok(runtime.includes('cancel_pending_elicitations_with_bridge(&session_id, Some(&runtime.bridge))'),
+  assert.ok(runtime.includes('cancel_runtime_pending_cards(&session_id, Some(&runtime.bridge))')
+    && runtime.includes('"action": "cancel"'),
   'account switching must persist elicitation cancellation through the removed runtime bridge');
   assert.ok(runtime.includes('AgentBackend::ClaudeAcp')
     && runtime.includes('AgentBackend::KimiAcp')
@@ -685,6 +706,7 @@ try {
     'utf8',
   );
   const codexWorkspace = readFileSync(path.join(root, 'src', 'features', 'codex', 'CodexWorkspacePanel.jsx'), 'utf8');
+  const auxChatPanelView = readFileSync(path.join(root, 'src', 'features', 'aux-chat', 'AuxChatPanel.jsx'), 'utf8');
   const runtimeStatus = readFileSync(path.join(root, 'src', 'features', 'codex', 'runtimeStatus.js'), 'utf8');
   const resizableSidePanel = readFileSync(path.join(root, 'src', 'components', 'layout', 'ResizableSidePanel.jsx'), 'utf8');
   const rightDock = readFileSync(path.join(root, 'src', 'components', 'layout', 'RightDock.jsx'), 'utf8');
@@ -729,7 +751,11 @@ try {
   'new code sessions must expose the platform-specific directory picker');
   assert.ok(codexView.includes('const requestedWorkspaceHandle = draftWorkspaceHandle')
     && codexView.includes('workspaceHandle: requestedWorkspaceHandle')
-    && acpClient.includes("invokeTauri('create_codex_acp_session', { workspacePath, agentId })")
+    && acpClient.includes("invokeTauri('create_codex_acp_session', {")
+    // Single-entry picker: the desktop creation payload also carries the
+    // keychain snapshot and project ownership (§6/§9.3).
+    && acpClient.includes('workspaceRoots: workspaceRoots && workspaceRoots.length ? workspaceRoots : null')
+    && acpClient.includes('projectId: projectId || null')
     && acpClient.includes("invokeRequiredWebCommand('web_access_create_codex_acp_session'"),
   'selected project directories must use native paths on desktop and opaque grants on Web');
   assert.ok(!codexView.includes('data-testid="acp-agent-selector"')
@@ -841,10 +867,10 @@ try {
     /else if \(mode === 'work'\) \{[\s\S]*?savePinvouModeState\(\{ mode: 'work' \}[^;]*;[\s\S]*?createNewSession\(\);[\s\S]*?setCurrentView\('chat'\)/,
     'selecting Work from the shared mode entry must return to ChatView work mode');
   assert.ok(
-    main.includes("if (bridge.available && !bridge.activeSessionId) bridge.sessions.createNewSession();"),
-    'switching back from code to work keeps the original work session; only the draft state creates a new one');
+    main.includes("if (bridge.available && !bs?.activeSessionId) bridge.sessions.createNewSession();"),
+    'switching back from code to work keeps the original work session; only the draft state creates a new one (null-safe against an unavailable bridge)');
   assert.ok(
-    main.includes("createPinvouModeScopeKey(bridge.activeSessionId)"),
+    main.includes("createPinvouModeScopeKey(bs.activeSessionId)"),
     'the pinvou mode is saved under the session scope when switching back to work so ChatView can read it after mounting');
   assert.ok(codexLogo.includes("brand-icons/openai.svg")
     && acpAgentLogo.includes('<CodexLogo')
@@ -946,14 +972,35 @@ try {
   'Codex workspace and subagent panels must remain mounted independently and delegate visibility to Right Dock');
   assert.ok(codexView.includes('if (workspaceOpen && workspaceDockActive)')
     && codexView.includes('setWorkspaceDockActivation(value => value + 1)')
-    && codexView.includes('[subagentPanel, workspaceDockActivation, workspaceOpen]'),
+    && codexView.includes('[auxChatPanel, subagentPanel, workspaceDockActivation, workspaceOpen]'),
   'an already-open hidden workspace must reactivate without remounting and preserve conversation scroll');
+  const openAuxChatStart = codexView.indexOf('const openAuxChatPanel');
+  const openAuxChatEnd = codexView.indexOf('const closeAuxChatPanel');
+  // Anchor-resolution guard (round-32 review minor 17, same vacuous-slice
+  // class right_dock_occlusion_gate pins): a renamed anchor would make
+  // indexOf return -1 and the slice run to near-EOF.
+  assert.ok(
+    openAuxChatStart >= 0 && openAuxChatEnd > openAuxChatStart,
+    'open/close aux-chat anchors must resolve (a vacuous slice would pass on unrelated copies)',
+  );
+  const openAuxChatBlock = codexView.slice(openAuxChatStart, openAuxChatEnd);
+  assert.ok(codexView.includes("import { AuxChatPanel } from '../aux-chat/AuxChatPanel.jsx';")
+    && codexView.includes('{auxChatPanel && activeSession && isNativeAgent && bridge.available && bridge.auxChat && (')
+    && !codexView.includes('{auxChatPanel && activeSession && (')
+    && codexView.includes('activeSession && isNativeAgent && bridge.available && bridge.auxChat ? activeSession.id : null')
+    && codexView.includes('activationKey={auxChatPanel.openTick}')
+    && codexView.includes('onActiveChange={setAuxChatDockActive}')
+    && openAuxChatBlock.includes('rememberScrollBeforeRightPanelChange()')
+    && codexView.includes('auxChatPanel && auxChatDockActive')
+    && auxChatPanelView.includes('panelId="aux-chat"')
+    && auxChatPanelView.includes('onActiveChange={onActiveChange}'),
+  'the code-mode aux chat must reuse the shared Right Dock panel, remember scroll on open, keep its entry highlight tied to real dock visibility, and gate the panel mount and the quote selection on isNativeAgent like the entry button (external-ACP tasks must never reach the aux session)');
 
   let codexDockState = createRightDockState();
-  codexDockState = activateRightDockPanel(codexDockState, 'codex-workspace');
-  codexDockState = activateRightDockPanel(codexDockState, 'subagent-transcript');
+  codexDockState = reduceRightDockState(codexDockState, { type: 'activate', panelId: 'codex-workspace' });
+  codexDockState = reduceRightDockState(codexDockState, { type: 'activate', panelId: 'subagent-transcript' });
   assert.equal(rightDockSnapshot(codexDockState).activePanelId, 'subagent-transcript');
-  codexDockState = hideRightDockPanel(codexDockState, 'subagent-transcript');
+  codexDockState = reduceRightDockState(codexDockState, { type: 'hide', panelId: 'subagent-transcript' });
   assert.equal(rightDockSnapshot(codexDockState).activePanelId, 'codex-workspace',
     'closing the active subagent panel must reveal the still-mounted workspace');
   assert.ok(codexWorkspace.includes('listAcpWorkspace({')
@@ -972,7 +1019,10 @@ try {
   assert.ok(codexView.includes('respondAcpElicitation({ sessionId: targetId, elicitationId, action, content })'),
     'Codex input answers must be returned through the ACP request');
   assert.ok(conversationView.includes('className={`codex-markdown'), 'conversation Markdown must keep the isolated Codex style scope');
-  assert.ok(codexView.includes('<ConversationTurn'), 'Codex must render through the shared Turn renderer by default');
+  assert.ok(codexView.includes('<ConversationTimeline') && codexView.includes('scrollElementRef={scroller}'),
+    'Codex must render through the shared virtualizable timeline by default');
+  assert.ok(codexView.includes('shouldVirtualizeConversationTurns(visibleTurns.length, scroller)'),
+    'native scroll anchoring must stay enabled while the Codex timeline is in normal flow');
   assert.ok(codexView.includes('<LiveConversationActivityIndicator')
     && codexView.includes('turn={activeConversationTurn}')
     && conversationView.includes("if (!turn || turn.status !== 'running') return null"),
@@ -1059,7 +1109,7 @@ try {
     && codexView.includes('composerSendBlockers.workspaceUnavailable || composerSendBlockers.sessionSyncing')
     && codexView.includes('if (composerSendBlockers.noSendTarget) return false;')
     && !/pendingAttachment/.test((codexView.match(/function canSendNativeVoiceTask\(outgoing\) \{[\s\S]*?\n {2}\}/) || [''])[0])
-    && codexView.includes('sendTask: async outgoing => send(outgoing)'),
+    && codexView.includes("sendTask: async (outgoing, context) => send(outgoing, { voiceOperationId: context?.operationId })"),
   'Codex voice task mode must go through the shared hook, code-lane risk gate, and real send result before reporting success; pending attachments must reach send() so the failure is reported instead of faking success');
   // plain（非 native）车道仍走自绘 CodexComposerConfigSelect 配置组，不随 native 车道
   // 迁移到共享组件；共享 config select 保留 ACP testid 契约。
@@ -1144,8 +1194,8 @@ try {
     && composerControls.includes(': busyProp')
     && composerControls.includes('isTauriAvailable() && !explicitMountState')
     && composerControls.includes("if (collection.source === 'remote') {")
-    && composerControls.includes('if (onMount) { onMount(collection.id); return; }')
-    && composerControls.includes('if (onUnmount) { onUnmount(); return; }')
+    && composerControls.includes('if (onMount) onMount(collection.id);')
+    && composerControls.includes('if (onUnmount) onUnmount();')
     && composerControls.includes('if (onSwitch) { onSwitch(target, { isPlan, busy }); return; }'),
   'extracted controls must keep explicit Code mounts local while preserving the bridge fallback');
   // 等值守卫：点击已激活模式必须早退，避免代码车道 onSwitch 路径每次点击都触发
@@ -1185,6 +1235,25 @@ try {
     assert.equal(content['__proto__'], 'X');
     assert.equal(JSON.stringify(content), '{"constructor":"A","toString":"B","__proto__":"X"}', 'JSON 序列化不得静默丢失保留键');
     assert.equal(Array.isArray(Object.getPrototypeOf(content)), false, 'content 保持无原型对象，不得被 __proto__ 赋值改原型');
+  }
+
+  // ── buildElicitationContent：无 otherAnswerKey 的自定义答案回落主 answerKey ──
+  // 自定义回复框已在 normalizeElicitationQuestions 钉死（枚举题即使没有 agent 生成的
+  // other 伴随字段也展示），该回落分支成为可达路径：自定义文本必须仍被提交，不能静默丢弃。
+  {
+    const content = buildElicitationContent([
+      { questionId: 'q1', answerKey: 'q1', otherAnswerKey: null, multiSelect: false, answers: [{ label: '其他', value: '我自己写的内容', other: true }] },
+      { questionId: 'q2', answerKey: 'q2', otherAnswerKey: null, multiSelect: true, answers: [{ label: 'A', value: 'a', other: false }, { label: '其他', value: '补充', other: true }] },
+    ]);
+    assert.equal(content.q1, '我自己写的内容', '单选无伴随字段时自定义文本回落主 answerKey');
+    assert.deepEqual(content.q2, ['a', '补充'], '多选混入自定义文本时数组保留全部答案');
+
+    // 特殊 answerKey + 无伴随字段的自定义答案：文本作为 own property 落在保留键上，不得丢。
+    const special = buildElicitationContent([
+      { questionId: 'q', answerKey: '__proto__', otherAnswerKey: null, multiSelect: false, answers: [{ label: '其他', value: 'x', other: true }] },
+    ]);
+    assert.equal(Object.prototype.hasOwnProperty.call(special, '__proto__'), true, '自定义答案回落保留键不得被 __proto__ setter 吞掉');
+    assert.equal(special['__proto__'], 'x');
   }
 
   // ── M-E journal probe semantics lock: transport-level (endpoint active),

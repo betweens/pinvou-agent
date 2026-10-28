@@ -6,7 +6,7 @@
   const registry = window.__PINVOU_TAURI_BRIDGE_FEATURES__ = window.__PINVOU_TAURI_BRIDGE_FEATURES__ || {};
   registry.chat = function (context) {let pinvouSharedtauriChatCache = null;
 function pinvouSharedtauriChat() {
-  if (!pinvouSharedtauriChatCache) pinvouSharedtauriChatCache = window.PinvouBridgeShared.create("tauriChat", { state, sessionStates, messageHasToolBlock, addChatItem, notify, bt, summonPinvou, invoke });
+  if (!pinvouSharedtauriChatCache) pinvouSharedtauriChatCache = window.PinvouBridgeShared.create("tauriChat", { state, sessionStates, addChatItem, notify, bt, sendMessage, invoke, pendingAssistantBlocks: { get value() { return context.pendingAssistantBlocks; }, set value(v) { context.pendingAssistantBlocks = v; } }, flushPendingTextBlock, autoCreateScheduledTaskDraft, runSyncOnSession, ensureSessionBufferLoaded, getBuffer, touchSessionBuffer, recordAuthoritySyncDiagnostic, reconcileRemoteTurn, doSendFor, flushQueued, itemIdSeq: { get value() { return context.itemIdSeq; }, set value(v) { context.itemIdSeq = v; } } });
   return pinvouSharedtauriChatCache;
 }
 
@@ -16,6 +16,9 @@ function pinvouSharedtauriChat() {
     const notify = context.notify;
     const TAURI = context.TAURI;
     const sessionStates = context.sessionStates;
+    // Lazy accessor to the voice feature (chat is installed before voice in
+    // bridge.js, so the reference is resolved lazily on first call).
+    const voice = context.voice || function () { return {}; };
     const turnUsageDirty = context.turnUsageDirty;
     const safeConsoleInfo = context.safeConsoleInfo;
     const recordAuthoritySyncDiagnostic = context.recordAuthoritySyncDiagnostic || function () {};
@@ -27,6 +30,7 @@ function pinvouSharedtauriChat() {
     const ensureSessionBufferLoaded = context.ensureSessionBufferLoaded;
     const ensureSession = context.ensureSession;
     const getBuffer = context.getBuffer;
+    const touchSessionBuffer = context.touchSessionBuffer;
     const recordPinvouSceneForMessage = context.recordPinvouSceneForMessage || function () {};
     const recordSteeredMessages = context.recordSteeredMessages || function () {};
     const reconcileRemoteTurn = context.reconcileRemoteTurn;
@@ -34,14 +38,17 @@ function pinvouSharedtauriChat() {
     const adoptManagedAttachments = context.adoptManagedAttachments || function () { return Promise.resolve(); };
     const discardManagedAttachment = context.discardManagedAttachment || function () { return Promise.resolve(); };
     const userMessageDisplayText = context.userMessageDisplayText;
-    const parseScheduledTaskDraftFromText = context.parseScheduledTaskDraftFromText;
     const autoCreateScheduledTaskDraft = context.autoCreateScheduledTaskDraft;
 
   // Composer 草稿是纯前端短期状态：写入时不 notify，避免每次按键都克隆
   // 整个 chat slice 并触发 App 重渲染。会话切换本身会 notify，ChatView 会在
   // activeSessionId 变化后主动读取目标 working set 的草稿。
-function getComposerDraft() { return pinvouSharedtauriChat().getComposerDraft(); }
 function setComposerDraft(value) { return pinvouSharedtauriChat().setComposerDraft(value); }
+
+  // Composer restores (steer-failure, session-switch mid-send, materialize
+  // abort) strip the injection block on restore; one shared implementation in
+  // bridge-shared-helpers.js now serves both platform lanes (round-8 minor 10).
+  function stripMentionBlockForComposerRestore(text) { return pinvouSharedtauriChat().stripMentionBlockForComposerRestore(text); }
 
   // Single observable, session-scoped path for restoring dropped/failed steer
   // text (self-review P0 + re-review #1) and send text abandoned by a session
@@ -56,20 +63,137 @@ function setComposerDraft(value) { return pinvouSharedtauriChat().setComposerDra
   // targets the active working set and would leak background text into the
   // active draft. Must be called outside runSyncOnSession(sid): inside it,
   // state.activeSessionId is temporarily sid even for background sessions.
+  // Returns whether anything went back: a refs-only message strips to ""
+  // (nothing recoverable to hand back), an attachment-only chip has no text,
+  // and a missing background buffer restores nothing — in all of them the
+  // caller's notice must not claim a restoration that did not happen.
   function restoreSteerText(sid, text) {
-    const value = String(text || "");
-    if (!sid || !value) return;
+    const value = stripMentionBlockForComposerRestore(text);
+    if (!sid || !value) return false;
     if (sid === state.activeSessionId) {
       const current = String(state.composerDraft || "");
       setComposerDraft(current ? current + "\n" + value : value);
       state.draftEpoch = (state.draftEpoch || 0) + 1;
       notify();
-      return;
+      return true;
     }
     const buffer = sessionStates[sid];
-    if (!buffer) return;
+    if (!buffer) return false;
     const current = String(buffer.composerDraft || "");
     buffer.composerDraft = current ? current + "\n" + value : value;
+    return true;
+  }
+
+  // Retained recovery for a task draft whose send was abandoned mid-await:
+  // when the user moved on to another session (or the session creation
+  // failed), the text cannot go into the unrelated active composer, so it is
+  // kept in this single in-memory slot. Returning to the draft consumes it
+  // once (append-only); the slot is not keyed by draft identity — the next
+  // draft return is the one chance to hand the text back before it is lost.
+  const pendingTaskDraftRecovery = { buffer: null };
+  function readComposerDraftWithRecovery() {
+    // Consumed once on returning to the draft, never while an unrelated
+    // session is open. No epoch gate: re-entering the draft always allocates
+    // a new epoch (enterDraft increments unconditionally), so an epoch match
+    // could never fire and the retained text would be silently dropped.
+    if (pendingTaskDraftRecovery.buffer && !state.activeSessionId) {
+      state.composerDraft = [state.composerDraft, pendingTaskDraftRecovery.buffer.text].filter(Boolean).join("\n");
+      // The text is visibly back in the live draft: the voice association
+      // follows it, or a manual retry would be orphaned in the dead
+      // recording-time epoch.
+      if (pendingTaskDraftRecovery.buffer.operationId) {
+        voice().rebindVoiceOperationToDraft(pendingTaskDraftRecovery.buffer.operationId, state.draftEpoch);
+      }
+      pendingTaskDraftRecovery.buffer = null;
+    }
+    return String(state.composerDraft || "");
+  }
+
+  // Settles the voice operation of a dispatched send: acceptance ends the
+  // operation (the next recording sweeps it). A false/"restored" return keeps
+  // the retryable association and is settled by the ChatView funnel and
+  // restoreTaskDraft instead.
+  function settleAcceptedVoiceSubmission(meta, sessionId) {
+    const operationId = meta && meta.voiceOperationId;
+    if (operationId) voice().completeVoiceSubmission(operationId, sessionId || null, true);
+  }
+
+  // Scoped task-draft restore: resolves by the original ownership (session,
+  // created-but-abandoned session, or the operation's voice binding), never
+  // into the unrelated active session. A proven same-draft rollback (see
+  // sessions.js ensureSession) rebinds the voice association so a manual
+  // retry keeps it. Returns whether the restore landed — round-23 asto
+  // minor 1: restoreSteerText's own verdict must be honored (a created
+  // session whose background buffer was evicted/purged mid-create restores
+  // nothing); reporting success anyway made the caller skip its own recovery
+  // and the text was gone.
+  function restoreTaskDraft(text, owner) {
+    if (!owner || owner.restored) return false;
+    if (owner.operationId && owner.rollbackFromDraftEpoch !== undefined) {
+      voice().rebindVoiceDraftAfterRollback(owner.operationId, owner.rollbackFromDraftEpoch, owner.draftEpoch);
+    }
+    const sid = owner.sessionId || owner.createdSessionId
+      || (owner.operationId && voice().voiceOperationSessionId(owner.operationId));
+    // Every restore branch settles the submission (un-park + consume a
+    // queued dismiss); without it a rejected send would leave the operation
+    // parked forever and never adoptable by a retry.
+    if (sid) {
+      if (owner.operationId) voice().completeVoiceSubmission(owner.operationId, sid, false);
+      // Honor the verdict: false means the text landed NOWHERE (evicted or
+      // purged buffer) — keep owner.restored unset so a retry by the caller
+      // (voice lane) is not blocked, and report the miss.
+      if (!restoreSteerText(sid, text)) return false;
+    } else if (state.activeSessionId) {
+      // Retain one departed draft in memory, never in the unrelated active session.
+      if (owner.operationId) voice().completeVoiceSubmission(owner.operationId, null, false);
+      const retained = pendingTaskDraftRecovery.buffer ? pendingTaskDraftRecovery.buffer.text : "";
+      const retainedOperationId = pendingTaskDraftRecovery.buffer ? pendingTaskDraftRecovery.buffer.operationId : null;
+      pendingTaskDraftRecovery.buffer = {
+        text: [retained, text].filter(Boolean).join("\n"),
+        // The newest operation wins: the rebind on draft return adopts the
+        // most recent stranded send (one operation per manual send).
+        operationId: owner.operationId || retainedOperationId || null,
+      };
+    } else {
+      // Back in the draft — any epoch, because re-entering the draft
+      // allocates a new one (enterDraft increments unconditionally).
+      if (owner.operationId) {
+        voice().completeVoiceSubmission(owner.operationId, null, false);
+        // The text is visibly back in the live draft: rebind the operation to
+        // the new epoch so a manual retry adopts it instead of orphaning the
+        // association in the dead recording-time epoch (the complete above
+        // may already have terminalized it via a queued cancel; the rebind
+        // refuses terminal operations).
+        voice().rebindVoiceOperationToDraft(owner.operationId, state.draftEpoch);
+      }
+      prefillComposer(text, true);
+    }
+    owner.restored = true;
+    return true;
+  }
+
+  // Shared tail of the steer-loss branches (review round-8 M1): attempt the
+  // session-scoped restore, then emit the notice variant that tells the
+  // truth about what happened. restoreSteerText returns false for a
+  // refs-only message (it strips to "" — nothing goes back to the input), so
+  // the generic "your text was restored to the input" would lie; each call
+  // site passes the refs-only variant that matches its delivery semantics:
+  //   steerFailedQueued       — the chip is kept as a degraded plain entry
+  //                             (delivery proven not to have happened);
+  //   steerFailedUnconfirmed  — the engine copy's fate is unproven
+  //                             (timeout / not_pending / unreachable): the
+  //                             message is NOT re-queued, a late commit
+  //                             still renders through the withdrawn
+  //                             registration;
+  //   steerFailedLost         — non-delivery is proven but nothing is left
+  //                             to keep (the chip was consumed by a zap/×).
+  function restoreSteerWithNotice(sid, text, refsOnlyKey) {
+    const restored = restoreSteerText(sid, text);
+    runSyncOnSession(sid, function () {
+      addSystemItem("⚠️ " + bt(restored ? "steerFailed" : refsOnlyKey));
+    });
+    notify();
+    return restored;
   }
 
   // Per-session in-flight interrupt flag: while an interrupt is in flight,
@@ -89,6 +213,37 @@ function setComposerDraft(value) { return pinvouSharedtauriChat().setComposerDra
   // window: dropped proves the old copy is safe to mutate, while committed
   // proves the old copy won and the requested mutation must be abandoned.
   const queueMutationTerminals = {};
+
+  // Zap-owned reconcile claims: runQueuedZap registers its steer id before
+  // withdrawSteerOutcome so a chat:steer_dropped landing inside the
+  // withdraw-await window routes to the zap recovery (failure notice +
+  // restore) instead of settleSteerDropped's silent chip-absent branch —
+  // that branch assumed no zap was mid-flight and silently consumed the
+  // withdrawn registration, dismantling both safety nets for the exact
+  // window the zap opened (the outcome reconcile watchdog is armed only
+  // after the withdraw outcome returns). Claims are consumed by the
+  // recovery or cleared when the withdraw outcome proves resend (no
+  // reconcile window remains).
+  const zapReconcileClaims = {};
+  function beginZapReconcileClaim(sid, steerId) {
+    if (!sid || !steerId) return;
+    let byId = zapReconcileClaims[sid];
+    if (!byId) {
+      byId = Object.create(null);
+      zapReconcileClaims[sid] = byId;
+    }
+    byId[steerId] = true;
+  }
+  function takeZapReconcileClaim(sid, steerId) {
+    const byId = zapReconcileClaims[sid];
+    if (!byId || !byId[steerId]) return false;
+    delete byId[steerId];
+    return true;
+  }
+  function clearZapReconcileClaim(sid, steerId) {
+    const byId = zapReconcileClaims[sid];
+    if (byId) delete byId[steerId];
+  }
 
   function beginQueueMutationReconciliation(sid, steerId) {
     let byId = queueMutationTerminals[sid];
@@ -131,29 +286,7 @@ function setComposerDraft(value) { return pinvouSharedtauriChat().setComposerDra
     item.id = ++context.itemIdSeq;
     state.chatItems.push(item);
   }
-  function messageHasToolBlock(type, toolCallId) {
-    if (!toolCallId) return false;
-    for (let i = state.messages.length - 1; i >= 0; i--) {
-      const blocks = state.messages[i] && state.messages[i].content;
-      if (!Array.isArray(blocks)) continue;
-      for (let j = blocks.length - 1; j >= 0; j--) {
-        const block = blocks[j];
-        if (!block || block.type !== type) continue;
-        if ((type === "tool_use" ? block.id : block.tool_use_id) === toolCallId) return true;
-      }
-    }
-    return false;
-  }
-  function toolCallAlreadyStarted(toolCallId) {
-    if (!toolCallId) return false;
-    if ((context.pendingAssistantBlocks || []).some(function (block) {
-      return block && block.type === "tool_use" && block.id === toolCallId;
-    })) return true;
-    if (state.chatItems.some(function (item) {
-      return item && item.type === "tool" && item.toolId === toolCallId;
-    })) return true;
-    return messageHasToolBlock("tool_use", toolCallId);
-  }
+  function toolCallAlreadyStarted(toolCallId) { return pinvouSharedtauriChat().toolCallAlreadyStarted(toolCallId); }
 function toolCallAlreadyFinished(toolCallId) { return pinvouSharedtauriChat().toolCallAlreadyFinished(toolCallId); }
 function hasChatItemForTool(type, toolCallId) { return pinvouSharedtauriChat().hasChatItemForTool(type, toolCallId); }
 function addSystemItem(text, meta) { return pinvouSharedtauriChat().addSystemItem(text, meta); }
@@ -170,23 +303,8 @@ function timeStr() { return pinvouSharedtauriChat().timeStr(); }
       context.pendingAssistantText = "";
     }
   }
-  function flushAssistantMessageToHistory() {
-    flushPendingTextBlock();
-    if (context.pendingAssistantBlocks.length) {
-      const assistantText = context.pendingAssistantBlocks
-        .filter(function (block) { return block && block.type === "text" && block.text; })
-        .map(function (block) { return block.text; })
-        .join("\n\n");
-      if (state.activeSessionId && state.activeSessionId === state.scheduledTaskCreationSessionId) {
-        const scheduledTaskDraft = parseScheduledTaskDraftFromText(assistantText);
-        if (scheduledTaskDraft) {
-          autoCreateScheduledTaskDraft(scheduledTaskDraft, state.activeSessionId);
-        }
-      }
-      state.messages.push({ role: "assistant", content: context.pendingAssistantBlocks });
-      context.pendingAssistantBlocks = [];
-    }
-  }
+  function flushAssistantMessageToHistory() { return pinvouSharedtauriChat().flushAssistantMessageToHistory(); }
+
   function resetPendingAssistant() {
     context.pendingAssistantText = "";
     context.pendingAssistantBlocks = [];
@@ -217,20 +335,6 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
       if (TAURI && TAURI.event && TAURI.event.emit) TAURI.event.emit(name, { session_id: sid });
     } catch { /* 桌宠是纯装饰,广播失败不影响对话 */ }
   }
-  function trackSceneBehavior(sid, scene) {
-    const raw = String(scene || "");
-    if (!sid || !raw) return;
-    const parts = raw.split(":");
-    invoke("track_behavior_event", {
-      request: {
-        eventName: "scene_triggered",
-        sessionId: sid,
-        sceneL1: parts[0] || "unknown",
-        sceneL2: parts.slice(1).join(":") || parts[0] || "unknown",
-      },
-    }).catch(function () {});
-  }
-
   // 真正发送:在 sid 的工作集上加 user 气泡 + 流式占位 + busy,然后 invoke chat。
   // active/后台通用(后台走 runSyncOnSession 临时切工作集)。
   function doSendFor(sid, text, displayText, attachmentsPayload, meta, restrictTools, surfaceFailure) {
@@ -289,7 +393,7 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
         // 新一轮已被后端受理：会话中未提交的「打开」（pending enable）自此进入
         // 上下文并锁死（ComposerToolMenu 监听）。bridge 层不反向依赖 features，
         // 与 chat-events.js 的 pinvou:tools-changed 一样内联派发。
-        try { window.dispatchEvent(new CustomEvent("pinvou:chat-round-committed", { detail: { scope: "plain" } })); } catch { /* dispatch may fail in non-DOM test harness */ }
+        try { window.PinvouToolStoreEvents.notifyChatRoundCommitted(); } catch { /* dispatch may fail in non-DOM test harness */ }
         recordAuthoritySyncDiagnostic("local_turn_admitted", Object.assign({
           operation: "send",
         }, authoritySyncBufferSnapshot(sid, turnOwnerBuffer)));
@@ -298,7 +402,6 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
           runSyncOnSession(sid, function () {
             recordPinvouSceneForMessage(sid, submittedMessagePos, meta.pinvouScene);
           });
-          trackSceneBehavior(sid, meta.pinvouScene);
         }
         return true;
       })
@@ -411,51 +514,7 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
       });
   }
 
-  async function sendMessageToSession(sessionId, text, meta) {
-    const sid = String(sessionId || "").trim();
-    const content = String(text || "").trim();
-    if (!sid) throw new Error(bt("targetSessionMissing"));
-    if (!content) throw new Error(bt("replyContentEmpty"));
-    const exists = state.sessions.some(function (session) { return String(session.id) === sid; });
-    if (!exists) throw new Error(bt("targetSessionMissing"));
-
-    await ensureSessionBufferLoaded(sid);
-    let targetBuffer = getBuffer(sid);
-    const targetQueue = targetBuffer && targetBuffer.queued;
-    if (isBusyFor(sid) || (targetQueue && targetQueue.length > 0)) {
-      runSyncOnSession(sid, function () {
-        state.queued.push(makeQueuedMessage(
-          ++context.itemIdSeq, content, content, content, [], meta || null, false
-        ));
-      });
-      notify();
-      if (!isBusyFor(sid)) flushQueued(sid);
-      return { accepted: true, queued: true };
-    }
-    if (targetBuffer && targetBuffer.remoteTurnActive && !(await reconcileRemoteTurn(sid))) {
-      recordAuthoritySyncDiagnostic("remote_sync_blocked_action", Object.assign({
-        operation: "send_to_session",
-      }, authoritySyncBufferSnapshot(sid, targetBuffer)));
-      throw new Error(bt("targetSessionSyncing"));
-    }
-    targetBuffer = getBuffer(sid);
-    if (isBusyFor(sid) || (targetBuffer.queued && targetBuffer.queued.length > 0)) {
-      runSyncOnSession(sid, function () {
-        state.queued.push(makeQueuedMessage(
-          ++context.itemIdSeq, content, content, content, [], meta || null, false
-        ));
-      });
-      notify();
-      if (!isBusyFor(sid)) flushQueued(sid);
-      return { accepted: true, queued: true };
-    }
-    const completion = doSendFor(sid, content, content, [], meta || null, false, true)
-      .then(
-        function () { return { ok: true }; },
-        function (error) { return { ok: false, error }; }
-      );
-    return { accepted: true, queued: false, completion };
-  }
+  async function sendMessageToSession(sessionId, text, meta) { return pinvouSharedtauriChat().sendMessageToSession(sessionId, text, meta); }
 
   // Backfill once the steer invoke resolves with a steer_id: settle any
   // committed/dropped events that arrived early; if the chip was taken by
@@ -497,6 +556,10 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
     console.warn("[pinvou3][chat-ui] steer failed, restoring draft", {
       sid, error: err && err.toString ? err.toString() : err,
     });
+    // The 25s transport timeout leaves delivery UNPROVEN (the engine is
+    // typically alive-but-wedged, not gone) — round-26 asto m3: a chip that
+    // degraded back to a queued entry must not auto-resend on that verdict.
+    const steerTimedOut = String(err && err.message) === "steer_chat timed out";
     const failureQueue = steeredQueueFor(sid);
     const failureIndex = failureQueue ? failureQueue.indexOf(queuedItem) : -1;
     // Snapshot restore is sid-guarded (do not clobber the new session's UI
@@ -508,6 +571,9 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
       state.scheduledTaskCreationSessionId = snap.scheduledTaskCreationSessionId;
       state.activeSkill = snap.activeSkill;
     }
+    // Whether restoreSteerText actually handed the text back (a refs-only
+    // steer strips to nothing): routes the failure notice below.
+    let steerFailureNoticeRestored;
     if (failureIndex >= 0 && state.activeSessionId === sid &&
         String(state.composerDraft || "").trim() === "") {
       // Refill only when this callback actually took over the chip and the
@@ -515,8 +581,17 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
       // refilling here would resurrect abandoned text or duplicate a zap
       // resend already in flight. restoreSteerText makes the restore visible
       // (draftEpoch bump) without a prefill write-through.
-      failureQueue.splice(failureIndex, 1);
-      restoreSteerText(sid, steerInputText);
+      // Restore FIRST, splice only on success (review round-6 M1): a
+      // refs-only steer strips to nothing and restores nothing — the chip
+      // must stay queued (degraded to a plain entry, re-sent by flushQueued)
+      // so the queued notice variant below is truthful.
+      steerFailureNoticeRestored = restoreSteerText(sid, steerInputText);
+      if (steerFailureNoticeRestored) {
+        failureQueue.splice(failureIndex, 1);
+      } else {
+        queuedItem.steered = false;
+        queuedItem.steerId = null;
+      }
     } else if (failureIndex >= 0) {
       // Composer occupied or session switched away: degrade the chip in place
       // to a plain local queue entry (same semantics as the zap failure
@@ -531,8 +606,19 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
     // false — the text was deliberately discarded (×) or is being re-sent by
     // the zap's own gated path.
     if (failureIndex >= 0) {
+      // Route by what actually happened: restored → the input holds the
+      // stripped body; not restored (refs-only strip, occupied composer,
+      // session switched) → the chip stays queued and is re-sent by
+      // flushQueued — both variants below are truthful on every path. The
+      // 25s-timeout rejection keeps the reason clause accurate (round-25
+      // asto minor 5): the engine is typically alive-but-wedged there, so
+      // the "session unavailable or engine not running" cause gets its own
+      // timed-out variants instead of misattributing the failure.
+      const steerFailedKey = steerTimedOut
+        ? (steerFailureNoticeRestored ? "steerFailedTimedOut" : "steerFailedQueuedTimedOut")
+        : (steerFailureNoticeRestored ? "steerFailed" : "steerFailedQueued");
       runSyncOnSession(sid, function () {
-        addSystemItem("⚠️ " + bt("steerFailed"));
+        addSystemItem("⚠️ " + bt(steerFailedKey));
       });
     }
     notify();
@@ -540,29 +626,42 @@ function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedtauriChat
     // was yielded by the then-steered queue head (flushQueued's q[0].steered
     // check) and nothing will retrigger after the chip is degraded/removed —
     // compensate with one flush when idle, or the chip hangs forever (sixth
-    // review round).
-    if (!isBusyFor(sid)) flushQueued(sid);
+    // review round). Suppressed on the timeout verdict (round-26 asto m3):
+    // the degraded chip would auto-send with delivery unproven; the late
+    // withdrawal/event reconciliation settles it once the truth is known.
+    if (!steerTimedOut && !isBusyFor(sid)) flushQueued(sid);
   }
 
   // Return protocol (issue #406 — ChatView clears the composer before the
   // await, so every non-dispatching exit must say so; resolving undefined
   // used to read as "accepted" and silently dropped the draft):
   // - true         dispatched: sent, steered (busy chip) or queued for delivery.
-  // - "restored"   nothing dispatched, but the text is already back in the
-  //                composer (bridge-side restore) — the caller must not
-  //                restore again, it would duplicate the draft.
+  // - "restored"   nothing dispatched, and the bridge-side restore landed —
+  //                the caller must not restore again, it would duplicate the
+  //                draft. A refs-only message strips to "" (nothing
+  //                restorable) but resolves "restored" too: the abort
+  //                semantics are the same (never dispatched, draft alive).
   // - false        nothing dispatched and the text was NOT restored
-  //                (notice-only early returns) — the caller owns putting the
-  //                draft back (handleSend's empty-vs-typed restore).
+  //                (notice-only early returns, or the scoped restore found
+  //                no landing buffer — round-23 asto minor 1) — the caller
+  //                owns putting the draft back (handleSend's empty-vs-typed
+  //                restore, the voice lane's restoreTaskDraft retry).
   // Main-path send failures still throw (surfaceFailure) and the caller
   // restores through its catch.
-  async function sendMessage(text, meta) {let pinvouSharedtauriChatN31666Cache = null;
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- single send state machine (ownership guard + first-turn materialization + busy steer); split tracked separately
+  async function sendMessage(text, meta, voiceOwner) {let pinvouSharedtauriChatN31666Cache = null;
 function pinvouSharedtauriChatN31666() {
   if (!pinvouSharedtauriChatN31666Cache) pinvouSharedtauriChatN31666Cache = window.PinvouBridgeShared.create("tauriChat:31666", { state, sid: { get value() { return sid; } } });
   return pinvouSharedtauriChatN31666Cache;
 }
 
 
+    // Ownership guard: capability preparation or first-turn materialization can
+    // outlive the originating voice composer (the user switched sessions or
+    // re-entered a draft meanwhile); a send whose original ownership is gone
+    // must not be admitted into whichever session is active now.
+    if (voiceOwner && ((state.activeSessionId || null) !== voiceOwner.sessionId
+      || (!voiceOwner.sessionId && Number(state.draftEpoch || 0) !== voiceOwner.draftEpoch))) return false;
     text = (text || "").trim();
     const readyAttachments = state.attachments.filter(function (a) { return a.status === "ready" && a.result; });
     if (!text && readyAttachments.length === 0) return false;
@@ -577,20 +676,52 @@ function pinvouSharedtauriChatN31666() {
       // 必须用返回值判空：切走场景 ensureSession 返回 null 但 activeSessionId
       // 非空（用户已切到别的会话），按 activeSessionId 继续会把本条消息发进
       // 错误会话（审计 #257）。
-      const materialized = await ensureSession();
-      if (!materialized) {
-        // 物化中止（如草稿态多智能体开关落盘失败 / await 期间切走）：把输入放回
-        // 输入框，不静默丢字；错误提示由 ensureSession 内如实给出（复核 P1）。
-        // append=true: failure-recovery semantics — the user may have started
-        // the next message during the await; replacing would clobber it.
-        prefillComposer(text, true);
-        // The prefill IS the restore; "restored" stops the caller from doing
-        // it a second time (the prefill lands asynchronously and would then
-        // append a duplicate).
-        return "restored";
+      const draftOwner = { sessionId: null, draftEpoch: Number(state.draftEpoch || 0),
+        operationId: meta && meta.voiceOperationId, restored: false };
+      const materialized = await ensureSession(draftOwner);
+      if (!materialized || state.activeSessionId !== materialized) {
+        if (materialized) draftOwner.createdSessionId = materialized;
+        // Round-26 asto m2(a): ensureSession's commit-then-navigate tail
+        // COMMITS the session to a background buffer (the draft epoch is
+        // dead) yet returns null, so the write below the early-return never
+        // fired and the round-25 "restored-materialized" mapping missed this
+        // path. The rollback tail is excluded: it re-enters the draft with a
+        // fresh epoch (draft alive), so it reports nothing and the chips stay
+        // scoped to the dead epoch per the disclosed limitation.
+        if (!materialized && draftOwner.createdSessionId
+          && draftOwner.rollbackFromDraftEpoch === undefined && meta) {
+          meta.materializedSessionId = draftOwner.createdSessionId;
+        }
+        // Recover in the created session or the original draft epoch, never in
+        // the unrelated active composer; "restored" stops the caller from doing
+        // it a second time, including when recovery stays in a background buffer.
+        // The mention injection block never re-enters any composer or buffer
+        // (the chips were consumed by the send attempt) — restore the stripped
+        // body. A refs-only message strips to "": nothing is restorable, but
+        // the abort semantics are unchanged — the send never dispatched and
+        // the draft is still alive — so it resolves "restored" too (round-18
+        // MAJOR-1, superseding round-8 M1's false here): the caller's failure
+        // tail treats "restored" as the aborted-materialization verdict and
+        // clears the provisional draft→session mapping the scope effect
+        // recorded for the navigation, keeping the draft's chips scoped to
+        // the draft instead of arming them live in the unrelated session.
+        // (abandonToOwnSession below keeps false for refs-only: its mapping,
+        // when one exists, is a REAL materialization that must stand.)
+        const restoredBody = stripMentionBlockForComposerRestore(text);
+        if (!restoredBody) return "restored";
+        return restoreTaskDraft(restoredBody, draftOwner) ? "restored" : false;
       }
+      // Round-24 MAJOR (PR #586 review): report the committed materialization
+      // through the caller-owned meta out-param — the composer's scope effect
+      // cannot observe a draft→session transition that lands while ChatView is
+      // unmounted, so the send closure records the ledger mapping itself.
+      if (meta) meta.materializedSessionId = materialized;
     }
     const sid = state.activeSessionId;
+    // An async writeback/task send explicitly carries its operationId: hand it
+    // to the submission gate before the bridge resolves the current session
+    // (the first turn's backend admission associates the real session).
+    if (meta && meta.voiceOperationId) voice().beginVoiceSubmission(meta.voiceOperationId, sid);
     function abandonPreparedAttachments() {
       state.attachments = state.attachments.filter(function (attachment) {
         return !readyAttachments.includes(attachment);
@@ -600,24 +731,27 @@ function pinvouSharedtauriChatN31666() {
       });
       notify();
     }
+    // Navigation interrupted the send: the prepared attachments are released
+    // and the text goes back to the session it was typed in (buffer draft),
+    // never into the session now on screen — "restored" keeps the caller
+    // from prefilling it there (#406). A refs-only message restores nothing:
+    // resolve false so the caller's non-dispatch recovery keeps its chips
+    // armed (round-8 M1).
+    function abandonToOwnSession() {
+      abandonPreparedAttachments();
+      return restoreSteerText(sid, text) ? "restored" : false;
+    }
     try {
       await adoptManagedAttachments(readyAttachments, sid);
     } catch (error) {
       if (state.activeSessionId !== sid) {
-        abandonPreparedAttachments();
-        // The user navigated away during the await: the text goes back to the
-        // session it was typed in (buffer draft), never into the session now
-        // on screen — "restored" keeps the caller from prefilling it there.
-        restoreSteerText(sid, text);
-        return "restored";
+        return abandonToOwnSession();
       }
       addSystemItem(bt("deviceUploadFailed") + String(error && error.message ? error.message : error));
       return false;
     }
     if (state.activeSessionId !== sid) {
-      abandonPreparedAttachments();
-      restoreSteerText(sid, text);
-      return "restored";
+      return abandonToOwnSession();
     }
     const activeTurnBuffer = getBuffer(sid);
     // 展示文本：把附件 chip 名附在用户消息末尾
@@ -748,6 +882,7 @@ function restoreUiTurnState(consumed) { return pinvouSharedtauriChatN31666().res
 
     if (isBusyFor(sid)) {
       busySteerBranch();
+      settleAcceptedVoiceSubmission(meta, sid);
       return true;
     }
     // Legacy behavior: with state.queued non-empty, still go through
@@ -756,14 +891,13 @@ function restoreUiTurnState(consumed) { return pinvouSharedtauriChatN31666().res
       const queuedPreparation = consumeUiTurnState();
       queuePrepared(queuedPreparation);
       flushQueued(sid);
+      settleAcceptedVoiceSubmission(meta, sid);
       return true;
     }
     if (activeTurnBuffer && activeTurnBuffer.remoteTurnActive &&
         !(await reconcileRemoteTurn(sid))) {
       if (state.activeSessionId !== sid) {
-        abandonPreparedAttachments();
-        restoreSteerText(sid, text);
-        return "restored";
+        return abandonToOwnSession();
       }
       recordAuthoritySyncDiagnostic("remote_sync_blocked_action", Object.assign({
         operation: "send",
@@ -772,14 +906,13 @@ function restoreUiTurnState(consumed) { return pinvouSharedtauriChatN31666().res
       return false;
     }
     if (state.activeSessionId !== sid) {
-      abandonPreparedAttachments();
-      restoreSteerText(sid, text);
-      return "restored";
+      return abandonToOwnSession();
     }
     if (isBusyFor(sid) || state.queued.length > 0) {
       const racedQueuePreparation = consumeUiTurnState();
       queuePrepared(racedQueuePreparation);
       if (!isBusyFor(sid)) flushQueued(sid);
+      settleAcceptedVoiceSubmission(meta, sid);
       return true;
     }
 
@@ -813,6 +946,7 @@ function restoreUiTurnState(consumed) { return pinvouSharedtauriChatN31666().res
       return !readyAttachments.includes(attachment);
     });
     notify();
+    settleAcceptedVoiceSubmission(meta, sid);
     return true;
   }
   // WebUI 草稿首条消息失败时的专用重试入口。桌面端没有远程草稿，
@@ -859,6 +993,30 @@ function prefillComposer(text, append) { return pinvouSharedtauriChat().prefillC
     item.steerId = null;
     item.cancelled = false;
     delete item.zapGate;
+  }
+
+  // Tail of detachQueuedForMutation's dropped-terminal branch (round-8 M1):
+  // a dropped terminal racing an uncertain command response prevents loss,
+  // but it does not turn an edit into a silent resend — the original text is
+  // handed back explicitly and the user can retry the change. A refs-only
+  // message has nothing to hand back; the dropped terminal proves
+  // non-delivery, so the chip returns to its slot as a degraded plain entry
+  // (flushQueued re-sends it) with the queued-variant notice instead of
+  // being silently lost. Returns null (mutation abandoned).
+  function settleDroppedTerminalForMutation(sid, item, index, withdrawnText) {
+    const restoredText = restoreSteerText(sid, withdrawnText === undefined ? item.text : withdrawnText);
+    if (!restoredText) {
+      makeQueuedItemLocal(item);
+      const currentQueue = steeredQueueFor(sid);
+      if (currentQueue) currentQueue.splice(Math.min(index, currentQueue.length), 0, item);
+    }
+    runSyncOnSession(sid, function () {
+      addSystemItem("⚠️ " + bt(restoredText ? "steerEditRestored" : "steerDroppedDuringEdit"));
+    });
+    notify();
+    // Round-26 asto m4: this settlement already told the user the truth —
+    // the caller must not also flash the generic queuedActionFailed.
+    return "noticed";
   }
 
   // Detach a queued item only after its engine-side copy is known to be safe
@@ -914,12 +1072,13 @@ function prefillComposer(text, append) { return pinvouSharedtauriChat().prefillC
         makeQueuedItemLocal(item);
         return { item, index };
       } else if (settled && !settled.ok && settled.timedOut) {
-        runSyncOnSession(sid, function () {
-          addSystemItem("⚠️ " + bt("steerFailed"));
-        });
-        restoreSteerText(sid, item.text);
-        notify();
-        return null;
+        // Delivery state unproven: the detached chip stays dropped (never
+        // degraded into an auto-resend); a refs-only message restores
+        // nothing and the notice reports the unconfirmed variant.
+        restoreSteerWithNotice(sid, item.text, "steerFailedUnconfirmed");
+        // Same double-report shape as the dropped-terminal settlement
+        // (round-26 asto m4): the notice already spoke.
+        return "noticed";
       } else {
         // A legacy successful steer without an engine id cannot be withdrawn
         // safely. Put the original chip back and let transcript settlement
@@ -942,13 +1101,7 @@ function prefillComposer(text, append) { return pinvouSharedtauriChat().prefillC
       // A dropped terminal racing an uncertain command response prevents
       // loss, but it does not turn an edit into a silent resend. Hand the
       // original user text back explicitly; the user can retry the change.
-      const withdrawnText = takeWithdrawn(sid, item.steerId);
-      runSyncOnSession(sid, function () {
-        addSystemItem("⚠️ " + bt("steerFailed"));
-      });
-      restoreSteerText(sid, withdrawnText === undefined ? item.text : withdrawnText);
-      notify();
-      return null;
+      return settleDroppedTerminalForMutation(sid, item, index, takeWithdrawn(sid, item.steerId));
     }
     if (terminal === "committed") return null;
     if (outcome !== "retired") {
@@ -992,6 +1145,11 @@ function prefillComposer(text, append) { return pinvouSharedtauriChat().prefillC
       }
       const detached = await detachQueuedForMutation(sid, queuedId);
       if (!detached) return false;
+      // Round-26 asto m4: a settlement that already emitted its own system
+      // notice propagates the sentinel — the generic failure flash would
+      // double-report and misdirect (the restored variant has the chip
+      // spliced and the text back, not "left unchanged").
+      if (detached === "noticed") return "noticed";
       const queue = steeredQueueFor(sid);
       if (!queue) {
         (detached.item.attachments || []).forEach(discardManagedAttachment);
@@ -1053,28 +1211,7 @@ function prefillComposer(text, append) { return pinvouSharedtauriChat().prefillC
   // ── Pinvou v4 召唤式检阅:Boss 主动呼叫,审当前 session 前面的工作 ──
   // 纯召唤、不替 Boss 决策。
   // 审查卡进 chatItems(当前会话可见);跨会话持久化(进 messages/独立存储)是后续增强。
-  async function summonPinvou(focus, mode) {
-    if (!state.activeSessionId) { addSystemItem(bt("summonNeedsSession")); return; }
-    if (state.pinvouSummoning) return;
-    state.pinvouSummoning = true;
-    const sid = state.activeSessionId; // 召唤发起时的 session;await 返回后校验,防跨 session 串(召唤慢+切走)
-    // 检阅结果弹 modal(不进对话流):一次只一个,裁决/跳过直接操作 state.pinvouModal.review、
-    // 不靠 pos 定位(根治连续召唤 pos 重复串卡)。
-    state.pinvouModal = { loading: true, coverage: mode === "coverage" };
-    notify();
-    try {
-      // focus=产出物 path(品=审产物); mode="coverage"=悟(通盘体检)。
-      const review = await invoke("summon_pinvou", { sessionId: sid, focus: focus || null, mode: mode || null });
-      if (state.activeSessionId !== sid) return; // 召唤期间切了 session → 丢弃,绝不 record/写进别的 session
-      recordPinvouReview(review); // 存 sidecar(供核账读上轮账目);modal.review 同引用,裁决写它=写 sidecar
-      if (state.pinvouModal) { state.pinvouModal.loading = false; state.pinvouModal.review = review; }
-    } catch (e) {
-      if (state.activeSessionId === sid && state.pinvouModal) { state.pinvouModal.loading = false; state.pinvouModal.error = String(e && e.message ? e.message : e); }
-    } finally {
-      state.pinvouSummoning = false;
-      notify();
-    }
-  }
+async function summonPinvou(focus, mode) { return pinvouSharedtauriChat().summonPinvou(focus, mode); }
 
   // 通盘体检(覆盖镜头):查产物"全不全"=缺哪些完整性维度。独立入口,走 mode=coverage。
 function inspectPinvou(focus) { return pinvouSharedtauriChat().inspectPinvou(focus); }
@@ -1085,59 +1222,7 @@ function recordPinvouReview(review) { return pinvouSharedtauriChat().recordPinvo
 
   // §2 按勾选裁决:resolution 已由前端写回 review 对象(引用→sidecar),这里持久化 +
   // 把勾「让AI改」的条目走 B1 发定向修订指令(只改对应段落、禁全文重写)。Boss 驾驶,非自动。
-  async function resolvePinvouReview(resolutions, actions) {
-    // 检阅发生的会话归属捕获：persist 挂起期间用户可能切走，修订指令必须发回
-    // 检阅会话，不得漂进当前 active 会话（审计）。
-    const reviewSid = state.activeSessionId;
-    // 弹窗只一个 review(state.pinvouModal.review),直接在它上面写 resolution——不靠 pos 定位
-    // (根治连续召唤 pos 重复串卡)。它和 sidecar entry.review 同引用,写它=写 sidecar。
-    const isWu = !!(state.pinvouModal && state.pinvouModal.coverage); // 关窗前取,供转交标品/悟
-    const review = state.pinvouModal && state.pinvouModal.review;
-    if (review && resolutions) {
-      (review.recommendations || []).forEach(function (r, k) { if (resolutions.recs && resolutions.recs[k]) r.resolution = resolutions.recs[k]; });
-      (review.issues || []).forEach(function (x, k) { if (resolutions.issues && resolutions.issues[k]) x.resolution = resolutions.issues[k]; });
-      (review.coverage || []).forEach(function (g, k) { if (resolutions.coverage && resolutions.coverage[k]) g.resolution = resolutions.coverage[k]; });
-    }
-    await persistPinvouReviews(); // 落盘,配合后端 preserve_resolutions 防覆盖
-    state.pinvouModal = null; // 裁决完关窗
-    notify();
-    if (!actions || !actions.length) return;
-    // 按动作类型分组,组装一条 Boss 消息发给主 AI(Boss 驾驶,非自动回传):
-    //   fix/verify=产物缺陷定向修订(verify 先核实);adopt=Boss 已定的决策;ask=让 AI 正式问。
-    const fix = actions.filter(function (a) { return a.t === "fix"; });
-    const verify = actions.filter(function (a) { return a.t === "verify"; });
-    const adopt = actions.filter(function (a) { return a.t === "adopt"; });
-    const ask = actions.filter(function (a) { return a.t === "ask"; });
-    const parts = [];
-    if (fix.length) {
-      parts.push(bt("reviewFixHeader"));
-      fix.forEach(function (a) { parts.push("- " + a.text); });
-    }
-    if (verify.length) {
-      if (parts.length) parts.push("");
-      parts.push(bt("reviewVerifyHeader"));
-      verify.forEach(function (a) { parts.push("- " + a.text); });
-    }
-    if (adopt.length) {
-      if (parts.length) parts.push("");
-      parts.push(bt("reviewAdoptHeader"));
-      adopt.forEach(function (a) { parts.push("- " + (a.topic ? a.topic + "：" : "") + a.pick); });
-    }
-    if (ask.length) {
-      if (parts.length) parts.push("");
-      parts.push(bt("reviewAskHeader"));
-      ask.forEach(function (a) { parts.push("- " + a.topic); });
-    }
-    const fill = actions.filter(function (a) { return a.t === "fill"; });
-    if (fill.length) {
-      if (parts.length) parts.push("");
-      parts.push(bt("reviewFillHeader"));
-      fill.forEach(function (a) { parts.push("- " + a.dimension + (a.suggestion ? "：" + a.suggestion : "")); });
-      parts.push(bt("reviewFillFooter"));
-    }
-    // 已切走则放弃发指令（修订指令属于检阅会话，漂进别的会话会误导其上下文）。
-    if (parts.length && reviewSid && state.activeSessionId === reviewSid) sendMessage(parts.join("\n"), { pinvouTransfer: isWu ? "悟" : "品" });
-  }
+async function resolvePinvouReview(resolutions, actions) { return pinvouSharedtauriChat().resolvePinvouReview(resolutions, actions); }
 
   // 整卡跳过:Boss 看了不处理这次检阅 → 直接关窗(sidecar entry 留着、无 resolution,无害)。
 function dismissPinvouReview() { return pinvouSharedtauriChat().dismissPinvouReview(); }
@@ -1313,13 +1398,12 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
       // text (same takeover guard as onSteerFailure).
       if (!q.includes(item)) return;
       if ([WITHDRAW_TIMEOUT, WITHDRAW_ERR, "not_pending"].includes(outcome)) {
+        // Removal only — the withdrawal state is unproven, so the chip must
+        // not degrade into an auto-resend; a refs-only message restores
+        // nothing, and restoreSteerWithNotice then emits the unconfirmed
+        // variant instead of claiming a restoration (round-8 M1).
         q.splice(q.indexOf(item), 1);
-        notify();
-        runSyncOnSession(sid, function () {
-          addSystemItem("⚠️ " + bt("steerFailed"));
-        });
-        restoreSteerText(sid, item.text);
-        notify();
+        restoreSteerWithNotice(sid, item.text, "steerFailedUnconfirmed");
         return;
       }
       item.steered = false;
@@ -1345,13 +1429,15 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
   const outcomeReconcileWatchdog = createSteerWatchdog(function (sid, steerId) {
     const text = takeWithdrawn(sid, steerId);
     if (text === undefined) return; // already reconciled (a settle consumed the registration)
-    runSyncOnSession(sid, function () {
-      addSystemItem("⚠️ " + bt("steerFailed"));
-    });
+    // The reconcile window closed here: drop any zap claim that is still
+    // open so a late duplicate dropped event cannot fire a second, false
+    // recovery notice after this expiry already restored the text.
+    clearZapReconcileClaim(sid, steerId);
     // Session-scoped restore (draftEpoch bump for the owning session when
-    // active) instead of a global prefill that overwrites other restores.
-    restoreSteerText(sid, text);
-    notify();
+    // active) instead of a global prefill that overwrites other restores;
+    // the notice routes on the restore verdict — a refs-only message
+    // restores nothing and reports the unconfirmed variant (round-8 M1).
+    restoreSteerWithNotice(sid, text, "steerFailedUnconfirmed");
   });
   function clearOutcomeReconcileWatchdog(sid, steerId) {
     outcomeReconcileWatchdog.clear(sid, steerId);
@@ -1437,6 +1523,7 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
     delete interruptInFlight[sid];
     delete queueMutationInFlight[sid];
     delete queueMutationTerminals[sid];
+    delete zapReconcileClaims[sid];
     delete steerSettlements[sid];
     steerSettleWatchdog.purge(sid);
     outcomeReconcileWatchdog.purge(sid);
@@ -1555,6 +1642,10 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
   function settleSteerCommitted(sid, steerId) {
     clearSteerSettleWatchdog(sid, steerId);
     clearOutcomeReconcileWatchdog(sid, steerId);
+    // A committed terminal closes the zap reconcile window too: a late
+    // duplicate dropped event must not fire a recovery notice for a message
+    // that was actually delivered.
+    clearZapReconcileClaim(sid, steerId);
     recordQueueMutationTerminal(sid, steerId, "committed");
     if (findSteerChipIndex(sid, steerId) < 0) {
       const withdrawnText = takeWithdrawn(sid, steerId);
@@ -1620,39 +1711,72 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
         // authoritative terminal and explicitly restore the original text.
         return;
       }
+      if (takeZapReconcileClaim(sid, steerId)) {
+        // A zap is mid-withdraw on this exact steer: the dropped terminal is
+        // the authoritative non-delivery proof for the chip the zap already
+        // removed — recover immediately (failure notice + session-scoped
+        // restore) instead of silently consuming the withdrawn registration
+        // here and leaving the zap's own reconcile to find nothing later.
+        // The notice keys on the restore verdict: a restored text reads the
+        // "restored to the input" variant, and only a text that restores
+        // nothing (attachment-only chip, missing background buffer) reads
+        // the lost variant — claiming "could not be restored" while the text
+        // sits back in the composer invites a duplicate send.
+        const claimedText = takeWithdrawn(sid, steerId) || "";
+        const restored = restoreSteerText(sid, claimedText);
+        runSyncOnSession(sid, function () {
+          addSystemItem("⚠️ " + bt(restored ? "steerFailed" : "steerFailedLost"));
+        });
+        notify();
+        return;
+      }
       const withdrawnText = takeWithdrawn(sid, steerId);
       if (withdrawnText !== undefined) {
         if (zapReconciling) {
           // Same recovery as the reconcile watchdog expiry: the dropped
           // event just made the expiry unnecessary by proving
-          // non-delivery.
-          runSyncOnSession(sid, function () {
-            addSystemItem("⚠️ " + bt("steerFailed"));
-          });
-          restoreSteerText(sid, withdrawnText);
-          notify();
+          // non-delivery. The chip is already gone, so a refs-only message
+          // has nothing left to keep — the notice names that honestly
+          // instead of claiming a restoration (round-8 M1).
+          restoreSteerWithNotice(sid, withdrawnText, "steerFailedLost");
         }
         return;
       }
       stashSteerEvent(sid, steerId, "dropped");
       return;
     }
-    let restoredText = null;
-    runSyncOnSession(sid, function () {
-      const q = steeredQueueFor(sid);
-      const index = findSteerChipIndex(sid, steerId);
-      if (!q || index < 0) return;
-      const item = q[index];
-      q.splice(index, 1);
-      addSystemItem("⚠️ " + bt("steerDropped"));
-      restoredText = item.text;
-    });
-    // Restore the text to the draft (sixth review round P2): every other
-    // failure path (steer failure / watchdog / zap degrade) hands the text
-    // back; an engine-side drop (including ⏹ stop clearing) must not be the
-    // only branch that makes the user retype. Session-scoped restore (append
-    // + draftEpoch), not a global prefill.
-    if (restoredText !== null) restoreSteerText(sid, restoredText);
+    // Restore FIRST, splice only on success (the onSteerFailure round-6 M1
+    // pattern, engine-drop edition): a refs-only message strips to nothing
+    // and restores nothing — splicing it unconditionally would consume the
+    // chip while the composer chips were already consumed at dispatch,
+    // losing the message entirely (nothing queued, nothing restored). The
+    // not-restored chip degrades to a plain queued entry re-sent by
+    // flushQueued, and the notice says that honestly.
+    const dropQueue = steeredQueueFor(sid);
+    const dropIndex = dropQueue ? findSteerChipIndex(sid, steerId) : -1;
+    if (dropIndex >= 0) {
+      const item = dropQueue[dropIndex];
+      const restored = restoreSteerText(sid, item.text);
+      runSyncOnSession(sid, function () {
+        const q = steeredQueueFor(sid);
+        const index = q ? findSteerChipIndex(sid, steerId) : -1;
+        if (!q || index < 0) return;
+        if (restored) {
+          q.splice(index, 1);
+          addSystemItem("⚠️ " + bt("steerDropped"));
+        } else {
+          q[index].steered = false;
+          q[index].steerId = null;
+          addSystemItem("⚠️ " + bt("steerDroppedQueued"));
+        }
+      });
+      // The turn already ended (that is what "dropped" means here): nothing
+      // will retrigger the flush — compensate on BOTH verdicts like
+      // onSteerFailure does (round-20 M1: the restored branch also spliced
+      // the steered queue head, and its chat:done flush was consumed by the
+      // steer).
+      if (!isBusyFor(sid)) flushQueued(sid);
+    }
     notify();
   }
   // Mid-turn INTERRUPT: break the current AI step and start a new turn
@@ -1998,13 +2122,13 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
       // watchdog would wait a full window for. Settle now with the same
       // recovery semantics as the watchdog expiry and settleSteerDropped's
       // zap-reconciling branch (failure notice + session-scoped restore);
-      // the chip itself was already removed by the zap.
+      // the chip itself was already removed by the zap, so a refs-only
+      // message has nothing left to keep — the notice says so (round-8 M1).
+      // The window is closed: drop any still-open zap claim so a late
+      // duplicate dropped event cannot fire a second, false recovery notice.
+      clearZapReconcileClaim(sid, item.steerId);
       const withdrawnText = takeWithdrawn(sid, item.steerId);
-      runSyncOnSession(sid, function () {
-        addSystemItem("⚠️ " + bt("steerFailed"));
-      });
-      restoreSteerText(sid, withdrawnText === undefined ? item.text : withdrawnText);
-      notify();
+      restoreSteerWithNotice(sid, withdrawnText === undefined ? item.text : withdrawnText, "steerFailedLost");
       return;
     }
     armOutcomeReconcileWatchdog(sid, item);
@@ -2026,6 +2150,26 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
     }
   }
 
+  // Only an explicit foundation "retired" (or a deterministic rejection of
+  // the steer_chat invoke itself, which never accepted anything) proves
+  // resend safety; not_pending / transport timeout / an unreachable engine
+  // are all uncertain and defer to the reconcile path (zhuowp re-review
+  // P1-1: a reclaimed engine may have committed the steer first).
+  function withdrawOutcomeForbidsResend(outcome) {
+    return ["not_pending", "withdraw_timeout", "withdraw_unreachable"].includes(outcome);
+  }
+
+  // Shared tail of runQueuedZap's withdraw-gated branches: a resend-safe
+  // outcome kills the zap's reconcile claim (the old steer id is dead — no
+  // window remains); a forbids-resend outcome keeps the claim open for
+  // settleSteerDropped until the terminal lands or the watchdog consumes the
+  // registration.
+  function settleWithdrawOutcomeForZap(sid, steerId, outcome) {
+    const forbidsResend = withdrawOutcomeForbidsResend(outcome);
+    if (!forbidsResend) clearZapReconcileClaim(sid, steerId);
+    return forbidsResend;
+  }
+
   async function runQueuedZap(sid, queuedId) {
     const q = steeredQueueFor(sid);
     if (!q) return false;
@@ -2038,17 +2182,17 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
     q.splice(index, 1);
     let skipResend = false;
     let steerSettlement = null;
-    // Only an explicit foundation "retired" (or a deterministic rejection of
-    // the steer_chat invoke itself, which never accepted anything) proves
-    // resend safety; not_pending / transport timeout / an unreachable engine
-    // are all uncertain and defer to the reconcile path (zhuowp re-review
-    // P1-1: a reclaimed engine may have committed the steer first).
-    const withdrawOutcomeForbidsResend = function (outcome) {
-      return ["not_pending", "withdraw_timeout", "withdraw_unreachable"].includes(outcome);
-    };
     if (item.steered && item.steerId && sid) {
+      // Register the claim BEFORE the withdraw await: a chat:steer_dropped
+      // landing inside that await is the authoritative non-delivery proof
+      // for this exact steer, and without the claim settleSteerDropped's
+      // chip-absent branch would silently consume the withdrawn
+      // registration (rememberWithdrawn ran inside withdrawSteerOutcome)
+      // while the reconcile watchdog is armed only after the outcome
+      // returns — both safety nets skipped, the message lost.
+      beginZapReconcileClaim(sid, item.steerId);
       const outcome = await withdrawSteerOutcome(sid, item.steerId, item.text);
-      skipResend = withdrawOutcomeForbidsResend(outcome);
+      skipResend = settleWithdrawOutcomeForZap(sid, item.steerId, outcome);
     } else if (item.steered && sid) {
       // steerId not backfilled (steer_chat invoke in flight): the engine may
       // already hold the steer, and a copy parked by this zap's own keepInbox
@@ -2075,14 +2219,18 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
       const settled = await steerSettlement;
       if (settled && settled.ok && settled.steerId && sid) {
         item.steerId = settled.steerId;
+        // Same withdraw-window claim as the backfilled branch above: the
+        // settlement await moved past the steer invoke, but the withdraw
+        // below has its own window for a dropped terminal to land in.
+        beginZapReconcileClaim(sid, settled.steerId);
         const outcome = await withdrawSteerOutcome(sid, settled.steerId, item.text);
-        skipResend = withdrawOutcomeForbidsResend(outcome);
+        skipResend = settleWithdrawOutcomeForZap(sid, settled.steerId, outcome);
       } else if (settled && !settled.ok && settled.timedOut) {
-        runSyncOnSession(sid, function () {
-          addSystemItem("⚠️ " + bt("steerFailed"));
-        });
-        restoreSteerText(sid, item.text);
-        notify();
+        // Transport timeout: delivery state unproven — never blindly send;
+        // restore the text (steer()'s late-success compensating withdrawal
+        // covers the registered-late case). A refs-only message restores
+        // nothing and the notice reports the unconfirmed variant.
+        restoreSteerWithNotice(sid, item.text, "steerFailedUnconfirmed");
         return true;
       }
       // settled.ok && !settled.steerId (legacy backend, no engine-side
@@ -2204,10 +2352,11 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
       flushQueued,
       sendMessageToSession,
       sendMessage,
-      getComposerDraft,
+      getComposerDraft: function () { return readComposerDraftWithRecovery(); },
       setComposerDraft,
       retryFirstTurn,
       prefillComposer,
+      restoreTaskDraft,
       removeQueued,
       prioritizeQueued,
       editQueued,
@@ -2223,6 +2372,10 @@ function persistPinvouReviews() { return pinvouSharedtauriChat().persistPinvouRe
       steer,
       settleSteerCommitted,
       settleSteerDropped,
+      // test seam: the steer-recovery tests clear the 60s reconcile
+      // watchdog so a red assertion does not stretch the run
+      clearOutcomeReconcileWatchdog,
+      onSteerFailure,
       captureSteerPositions,
       purgeSteerState,
     };

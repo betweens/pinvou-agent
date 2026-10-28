@@ -85,94 +85,12 @@ function enqueueSettingsWrite(write) { return pinvouSharedtauriSettings().enqueu
 async function submitFeedback(request) { return pinvouSharedtauriSettings().submitFeedback(request); }
 async function discoverLocalVllm(request) { return pinvouSharedtauriSettings().discoverLocalVllm(request); }
 
-  // ── 厂商预装本地大模型一键引导 ────────────────────────────
-  let vllmSetupPollTimer = null;
-  let vllmSetupPollStartedAt = 0;
-  const VLLM_SETUP_POLL_INTERVAL_MS = 3000;
-  const VLLM_SETUP_POLL_TIMEOUT_MS = 12 * 60 * 1000;
-  // 首屏检测「预装但未启用」状态;eligible 时前端弹引导框。
-  // 开机加载中不弹框，每 3 秒静默复查；12 分钟后仍 starting 则恢复可重试入口。
-  // autoPoll 只供内部定时器续接；用户手动检测会重置本轮截止时间。
-  // 陈旧检测快照覆盖（审计）：检测与长任务引导（bootstrap_local_vllm）并发时，
-  // 旧快照会把已就绪引擎覆盖回 starting。任何新检测与引导完成都递增序号，
-  // 在途读取一律作废。社区版后端 detect 恒 stopped / bootstrap 恒 Err（厂商版
-  // 语义的桩），此守卫为防御性：后端恢复真实探测时竞态即真实存在。
-  let vllmDetectSeq = 0;
-  async function detectLocalVllmSetup(options) {
-    const autoPoll = !!(options && options.autoPoll);
-    const seq = ++vllmDetectSeq;
-    if (vllmSetupPollTimer) {
-      clearTimeout(vllmSetupPollTimer);
-      vllmSetupPollTimer = null;
-    }
-    if (!autoPoll) vllmSetupPollStartedAt = Date.now();
-    try {
-      const snapshot = await invoke("detect_local_vllm_setup");
-      if (seq !== vllmDetectSeq) return state.vllmSetup; // 已作废的陈旧读取
-      state.vllmSetup = snapshot;
-    } catch {
-      if (seq !== vllmDetectSeq) return state.vllmSetup;
-      state.vllmSetup = null; // 检测失败静默,不打扰(等同不弹)
-      vllmSetupPollStartedAt = 0;
-    }
-    if (state.vllmSetup && state.vllmSetup.engine_state === 'starting' && state.vllmSetup.may_offer_setup !== false) {
-      const elapsed = Date.now() - vllmSetupPollStartedAt;
-      if (vllmSetupPollStartedAt > 0 && elapsed >= VLLM_SETUP_POLL_TIMEOUT_MS) {
-        state.vllmSetup = Object.assign({}, state.vllmSetup, {
-          engine_state: 'failed',
-          eligible: !!state.vllmSetup.may_offer_setup,
-          detection_timed_out: true,
-        });
-        vllmSetupPollStartedAt = 0;
-      } else {
-        vllmSetupPollTimer = setTimeout(function () {
-          vllmSetupPollTimer = null;
-          detectLocalVllmSetup({ autoPoll: true });
-        }, VLLM_SETUP_POLL_INTERVAL_MS);
-      }
-    } else {
-      vllmSetupPollStartedAt = 0;
-    }
-    notify();
-    return state.vllmSetup; // 返回供设置页「检测本机 vLLM」判断 has_packages
-  }
-  // 用户点「启用」:后端一次 pkexec 拉起引擎+装 systemd 服务,轮询就绪后写模型配置。
-  // 引擎首次载模型可能几分钟,全程 vllmBootstrapping 显示 spinner。
-  async function bootstrapLocalVllm() {
-    if (state.vllmBootstrapping) return;
-    state.vllmBootstrapping = true;
-    state.vllmBootstrapError = null;
-    state.vllmBootstrapDone = null;
-    state.vllmSetupPhase = 'authorizing'; // 后端事件到达前先本地置首阶段(pkexec 阻塞期也有步骤显示)
-    state.vllmSetupAttempt = 0;
-    notify();
-    try {
-      state.vllmBootstrapDone = await invoke("bootstrap_local_vllm");
-    } catch (e) {
-      state.vllmBootstrapError = String(e && e.message ? e.message : e);
-    }
-    vllmDetectSeq++; // 引导完成：作废在途的陈旧检测读取（审计）
-    state.vllmBootstrapping = false;
-    notify();
-    // 作废在途读取会中断 autoPoll 续排链（被作废的检测不再续排定时器），
-    // 引导完成后主动重检一次，让引擎就绪状态及时收敛（审计补充）。
-    detectLocalVllmSetup({ autoPoll: true });
-  }
-  // 点「跳过」:仅本次会话内不再弹(不写持久标记,下次启动若仍未配好会再次友好提示)。
-function dismissVllmSetup() { return pinvouSharedtauriSettings().dismissVllmSetup(); }
-  // 点「不再提醒 → 确认」:持久婉拒,开机引导框不再自动弹(仍可在设置→模型管理手动启用)。
-  async function declineVllmSetup() {
-    try { await invoke("decline_local_vllm_setup"); } catch { /* 持久失败也先隐藏本会话,不阻断 */ }
-    state.vllmSetupDismissed = true;
-    notify();
-  }
-async function getEffectiveModelConfig(...args) { return pinvouSharedtauriSettings().getEffectiveModelConfig(...args); }
   // 当前有效模型的图片输入能力(普通会话选图即时警告用);后端按会话模型绑定解析。
 async function getImageInputCapability(...args) { return pinvouSharedtauriSettings().getImageInputCapability(...args); }
 
   // ── 模型列表(「添加模型」方案)─────────────────────────────────
-  // 整表覆盖加载：保存/删除/切换链式 loadModels 并发时旧列表不得覆盖新列表
-  // （审计 b）。请求序号后发者胜（同 vllmDetectSeq 模式）。
+  // Whole-list reload: when save/delete/switch chain loadModels calls concurrently, an older list must not
+  // overwrite a newer one (audit b). The last request sequence wins.
   let modelsLoadSeq = 0;
 async function loadModels() { return pinvouSharedtauriSettings().loadModels(); }
   // model 对象字段须是 snake_case(SavedModel serde):
@@ -232,6 +150,71 @@ async function testImageInputCapability(model, baseUrl, apiKey, modelId) { retur
     });
   }
 
+  // ── Global bring-to-front shortcut ────────────────────────────────
+  // The dedicated Rust command set_global_shortcut_config exclusively owns
+  // registration and persistence (update_settings is never used): success =
+  // status "registered"/"disabled", and a committed save always reports the
+  // accelerator disk now holds — including a disabled save, which may itself
+  // have changed the stored combo (null remains possible on
+  // "invalid"/"conflict", i.e. nothing was persisted). "invalid"/"conflict"
+  // mean the registration was refused (conflict's message is technical
+  // detail, console only; the UI shows localized copy). Hard failures (IPC
+  // exceptions) resolve null so the caller can roll its toggle back and show
+  // the generic failure copy.
+  function setGlobalShortcutConfig(enabled, accelerator) {
+    const sync = function () {
+      return invoke("set_global_shortcut_config", { enabled: !!enabled, accelerator: String(accelerator || "") });
+    };
+    // Retry once on any invocation failure — a transient IPC error, or a
+    // Rust-side persist failure (which rolls the registration back before
+    // returning Err). The full re-apply is safe: apply_config is idempotent
+    // per (enabled, accelerator) and disk stays authoritative (same shape as
+    // setVoiceShortcutEnabled); on persistent failure return null so the
+    // caller can roll its optimistic state back. On success the authoritative
+    // response is mirrored into state.settings so a settings-page remount
+    // reads the persisted combo instead of the startup snapshot.
+    return sync().then(function (result) { return applyGlobalShortcutResult(result, enabled); }, function (error) {
+      console.warn("[settings] global shortcut config sync failed, retrying once", error);
+      return sync().then(function (result) { return applyGlobalShortcutResult(result, enabled); }, function (retryError) {
+        console.warn("[settings] global shortcut config sync failed after retry", retryError);
+        return null;
+      });
+    });
+  }
+  function applyGlobalShortcutResult(result, enabled) {
+    if (!result || typeof result.status !== "string") return null;
+    if (result.status !== "registered" && result.status !== "disabled") return result;
+    if (state.settings) {
+      // Same mechanics as the pet:enabled_changed listener above: the bridge
+      // owns its settings slice; the React layer only reads it. Mirror the
+      // accelerator whenever Rust reports one — a disabled save reports the
+      // combo it just persisted, so the next toggle submits it instead of a
+      // stale mirror. (A missing accelerator must never regress the snapshot
+      // to the raw input.)
+      const mirror = { global_shortcut_enabled: !!enabled };
+      if (typeof result.accelerator === "string" && result.accelerator) {
+        mirror.global_shortcut_accelerator = result.accelerator;
+      }
+      state.settings = Object.assign({}, state.settings, mirror);
+      notify();
+    }
+    return result;
+  }
+
+  // ── Builtin feature toggles (docs/builtin-toolset-contract.md hook) ──────
+  // list_builtin_features is consumed by ChatView (the session-mention feature
+  // gate, PR #586); set_builtin_feature_enabled only wraps the command channel
+  // for future per-feature settings pages — no consumer yet, no UI.
+  async function listBuiltinFeatures() {
+    return invoke("list_builtin_features");
+  }
+  // The Rust command takes `feature_id` (app/commands/builtin.rs); Tauri v2
+  // converts camelCase JS keys to snake_case, so the payload must use
+  // `featureId` — same convention as get_effective_model_config({ sessionId }).
+  async function setBuiltinFeatureEnabled(id, enabled) {
+    return invoke("set_builtin_feature_enabled", { featureId: id, enabled });
+  }
+
     return {
       loadSettings,
       loadSelectedPet,
@@ -242,11 +225,6 @@ async function testImageInputCapability(model, baseUrl, apiKey, modelId) { retur
       saveSearchSettingsAndRestart,
       submitFeedback,
       discoverLocalVllm,
-      detectLocalVllmSetup,
-      bootstrapLocalVllm,
-      dismissVllmSetup,
-      declineVllmSetup,
-      getEffectiveModelConfig,
       getImageInputCapability,
       loadModels,
       saveModel,
@@ -257,7 +235,10 @@ async function testImageInputCapability(model, baseUrl, apiKey, modelId) { retur
       switchModel,
       testModelConnection,
       testImageInputCapability,
-      probeLocalServerKind
+      probeLocalServerKind,
+      setGlobalShortcutConfig,
+      listBuiltinFeatures,
+      setBuiltinFeatureEnabled
     };
   };
 })(window);

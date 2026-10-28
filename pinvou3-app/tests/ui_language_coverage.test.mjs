@@ -1,10 +1,53 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dict } from './helpers/i18n-all.js'; // full three-language dict: browser entry lazy-loads via i18n.js, tests use the aggregate shim
+import {
+  applyConnectorFailure,
+  connectorErrorCopy,
+  connectorErrorCodeForStep,
+  connectorFailure,
+  connectorUiStep,
+  errorCode,
+} from '../src/features/tools/connector-ui-state.js';
 
 const source = relative => readFileSync(new URL(`../src/${relative}`, import.meta.url), 'utf8');
+// Shape pins must not match text inside comments: a guard commented out in
+// the source would otherwise still satisfy every anchor. Round-23 should-fix
+// 2 dropped full-line `//` comments (live-verified — commenting out the
+// send-registry delete left this suite green); round-24 minor-1 closes the
+// two remaining holes at this single strip point, both live-verified against
+// that same delete: wrapping it in `/* … */`, and hiding it as a trailing
+// `//` comment behind live code. Block-comment contents are blanked with
+// newlines preserved (a multi-line comment cannot fuse its neighbours into
+// an anchor match) and `//` comment tails are dropped per line. For POSITIVE
+// pins over-stripping can only fail loudly, never satisfy one; the same does
+// NOT hold for negative pins (round-26 minor M9): stripping inside a future
+// string or template literal containing `/*` could silently satisfy a
+// doesNotMatch anchor, so every negative pin below runs against the RAW
+// text (a pattern absent in the raw text is absent in the strip too).
+const stripComments = text => text
+  .replace(/\/\*[\s\S]*?\*\//g, comment => comment.replace(/[^\n]/g, ''))
+  .split('\n')
+  .map(line => line.replace(/\/\/.*$/, ''))
+  .join('\n');
+
+// The remaining source-consumption pins in this file are i18n coverage only
+// (which components consume which dictionary namespaces, plus zh-literal
+// leakage). The AuxChatPanel async-state-machine pins that used to live here
+// were replaced by executing controller tests in aux_chat_controller.test.mjs
+// (round-30 B1), and the remaining JSX shape pins moved to
+// aux_chat_panel_contract.test.mjs — this file is i18n-only again.
+const auxChatPanel = stripComments(source('features/aux-chat/AuxChatPanel.jsx'));
+const chat = stripComments(source('features/chat/ChatView.jsx'));
+const conversation = stripComments(source('features/conversation/ConversationTimeline.jsx'));
+const codex = stripComments(source('features/codex/CodexAcpView.jsx'));
+// Raw twins for the negative pins (round-26 minor M9, see the stripComments
+// header): doesNotMatch anchors must see comments and string contents too.
+const chatRaw = source('features/chat/ChatView.jsx');
+const conversationRaw = source('features/conversation/ConversationTimeline.jsx');
 
 for (const language of ['zh', 'en', 'ja']) {
+  assert.equal(typeof dict[language].uiScheduled.targetSession, 'string', `${language}: target-session label is required`);
   for (const section of [
     'uiRemote',
     'uiMonitor',
@@ -30,9 +73,89 @@ for (const language of ['zh', 'en', 'ja']) {
     'uiProjects',
     'uiArtifacts',
     'uiToolDetails',
+    'uiBuiltinPlugins',
+    'uiAuxChat',
+    'uiBuiltinFeatures',
+    'uiSessionMention',
+    'uiSessionMessage',
+    'uiScheduledTaskTool',
   ]) {
     assert.ok(dict[language][section], `${language}.${section} must exist`);
   }
+  // Round-8 minor 15: key-pins for the two messaging-critical builtin keys
+  // that previously could be deleted from all three locales with the suite
+  // green — the switch-off notice and the plugin-card write capability line.
+  for (const language of ['en', 'zh', 'ja']) {
+    assert.ok(
+      dict[language].uiBuiltinFeatures.disabledNotice,
+      `${language}.uiBuiltinFeatures.disabledNotice must exist`,
+    );
+    assert.ok(
+      dict[language].uiBuiltinPlugins.dataAccess['sessions.write'],
+      `${language}.uiBuiltinPlugins.dataAccess.sessions.write must exist`,
+    );
+    // Round-26 minor 14: the remaining declared scopes were unpinned —
+    // deleting automations.* from all three locales stayed green and the
+    // plugin card fell back to rendering the raw key. Driven from the
+    // app-automations manifest's declared data_access, so a new scope
+    // without localized copy turns red here too.
+    for (const scope of JSON.parse(
+      readFileSync(new URL('../resources/mcp-servers/app-automations/manifest.json', import.meta.url), 'utf8'),
+    ).data_access ?? []) {
+      assert.ok(
+        dict[language].uiBuiltinPlugins.dataAccess[scope],
+        `${language}.uiBuiltinPlugins.dataAccess.${scope} must exist (declared in the app-automations manifest)`,
+      );
+    }
+  }
+  // 2026-10-18 visual sweep pins. dictJa spreads dictEn, so the section loop
+  // above cannot see ja-only gaps: a ja-missing top-level key silently falls
+  // back to English at runtime — exactly how the knowledge embed chip leaked.
+  // Pin the chip keys with their real ja strings, and keep the monitor
+  // banner's raw-error interpolation retired.
+  for (const language of ['zh', 'en', 'ja']) {
+    assert.ok(dict[language].kbEmbedOn, `${language}.kbEmbedOn must exist`);
+    assert.ok(dict[language].kbEmbedOff, `${language}.kbEmbedOff must exist`);
+    assert.ok(dict[language].uiMonitor.readFailed, `${language}.uiMonitor.readFailed must exist`);
+    assert.ok(
+      !('readError' in dict[language].uiMonitor),
+      `${language}.uiMonitor.readError must stay retired (raw error text must not reach user copy)`,
+    );
+  }
+  assert.equal(dict.ja.kbEmbedOff, '意味検索未設定 · 全文検索のみ');
+  assert.notEqual(
+    dict.ja.kbEmbedOn,
+    dict.en.kbEmbedOn,
+    'ja kbEmbedOn must be translated, not the English fallback',
+  );
+  // All 23 uiAuxChat keys are pinned (round-14 minor-3: the list previously
+  // covered 13, so sendingHint/bindingHint and the six quote* keys could be
+  // deleted from every dictionary with the suite green — and quoteChipCount's
+  // absence renders `undefined` at runtime; round-30 D5 added quoteDuplicate
+  // for the exact-duplicate notice; M6 removed discardStuck with the stuck
+  // family it described — the atomic reset cannot get stuck that way;
+  // round-35 MAJOR-3: newTopicConfirmShort (the visible armed label, whose
+  // absence would render `undefined` on the destructive confirm) joined the
+  // list the round after it shipped — count and list now agree again).
+  for (const key of [
+    'openLabel', 'panelTitle', 'landingHint', 'emptyState', 'inputPlaceholder',
+    'send', 'busyHint', 'bindingHint', 'sendingHint', 'newTopic', 'newTopicConfirm',
+    'newTopicConfirmShort',
+    'sendFailed', 'ensureFailed', 'discardFailed', 'close',
+    'quoteAction', 'quoteChipCount', 'quoteRemove',
+    'quoteLimitSingle', 'quoteLimitCount', 'quoteLimitTotal', 'quoteDuplicate',
+  ]) {
+    assert.ok(dict[language].uiAuxChat[key], `${language}.uiAuxChat.${key} must exist`);
+  }
+  // Count guard (round-36 minor 9): the pin above lists 23 keys but cannot
+  // see additions — a 24th key added to all three dictionaries passes the
+  // existence loop silently and drifts the parity surface. Any key change
+  // must update this count with the list in the same commit.
+  assert.equal(
+    Object.keys(dict[language].uiAuxChat).length,
+    23,
+    `${language}.uiAuxChat must hold exactly the 23 pinned keys`,
+  );
   assert.ok(dict[language].uiSettings.providers, `${language}.uiSettings.providers must exist`);
   for (const key of [
     'addProvider', 'switch', 'official', 'current', 'export', 'import',
@@ -103,7 +226,7 @@ for (const language of ['zh', 'en', 'ja']) {
   for (const role of ['scout', 'manager', 'builder', 'reviewer', 'general']) {
     assert.ok(multiAgent.roleCards[role], `${language}.uiMultiAgent.roleCards.${role} must exist`);
   }
-  for (const key of ['toggleLabel', 'toggleHint', 'close', 'loadingTranscript', 'emptyTranscript', 'blockedTag', 'panelResize', 'panelResizeHint', 'agentsListTitle', 'agentsEmpty', 'backToAgents', 'spawnedAgentsRowHint', 'runningAgentsTitle', 'runningAgentsCollapse', 'runningAgentsExpand']) {
+  for (const key of ['toggleLabel', 'toggleHint', 'close', 'loadingTranscript', 'emptyTranscript', 'blockedTag', 'pendingTag', 'panelResize', 'panelResizeHint', 'agentsListTitle', 'agentsEmpty', 'backToAgents', 'spawnedAgentsRowHint', 'runningAgentsTitle', 'runningAgentsCollapse', 'runningAgentsExpand']) {
     assert.ok(multiAgent[key], `${language}.uiMultiAgent.${key} must exist`);
   }
   for (const fnKey of ['spawnedAgentsRow', 'runningAgentsCount']) {
@@ -116,9 +239,64 @@ for (const language of ['zh', 'en', 'ja']) {
   // the ledger's lowercase cancelled token (case-insensitive match); the key
   // must exist in all three locales.
   assert.ok(dict[language].uiConversation.cancelled, `${language}.uiConversation.cancelled must exist`);
+  // Session mention (PR #586): every key consumed by SessionMentionControls /
+  // ChatView must exist in all three locales (function keys typed as such).
+  for (const key of ['menuTitle', 'menuEmpty', 'dropHint', 'cardUnavailable', 'cardDisabled', 'disabledNotice']) {
+    assert.ok(dict[language].uiSessionMention[key], `${language}.uiSessionMention.${key} must exist`);
+  }
+  for (const fnKey of ['chipRemove', 'cardJump']) {
+    assert.equal(typeof dict[language].uiSessionMention[fnKey], 'function', `${language}.uiSessionMention.${fnKey} must be a function`);
+  }
+  // uiSessionMessage (delivered-message sender card copy): every key must
+  // exist and the fn-shaped entries must be functions — a drifted key
+  // crashes UserBubble's copy.from call for every delivered message
+  // (round-4 C1). Round-18 minor 20: this loop used to sit nested inside
+  // the chipRemove/cardJump loop above, asserting every key twice.
+  for (const key of ['fromUnknown', 'jump', 'unavailable']) {
+    assert.ok(dict[language].uiSessionMessage[key], `${language}.uiSessionMessage.${key} must exist`);
+  }
+  for (const fnKey of ['from', 'jump']) {
+    // Round-19 minor 18: `jump` is fn-shaped — a string drift crashes the
+    // card render for every attributed delivery with the suite green (the
+    // sibling section pins both its fns; this one only truthy-pinned `jump`).
+    assert.equal(typeof dict[language].uiSessionMessage[fnKey], 'function', `${language}.uiSessionMessage.${fnKey} must be a function`);
+  }
+  // Count guard (round-15 m4): ja replaces the whole section object, so a
+  // ja-missing key renders undefined rather than falling back — pin the
+  // exact parity surface (8 keys, same set in all three locales).
+  assert.equal(
+    Object.keys(dict[language].uiSessionMention).length,
+    8,
+    `${language}.uiSessionMention must hold exactly the 8 pinned keys`,
+  );
+  assert.deepEqual(
+    [...Object.keys(dict[language].uiSessionMention)].sort((a, b) => a.localeCompare(b)),
+    ['cardDisabled', 'cardJump', 'cardUnavailable', 'chipRemove', 'disabledNotice', 'dropHint', 'menuEmpty', 'menuTitle'],
+    `${language}.uiSessionMention must be the same key set in every locale`,
+  );
   for (const deadKey of ['confirmTitle', 'impactLabels', 'startDenied', 'stages', 'terminal', 'workerCount', 'advancedEdit', 'planCompileError']) {
     assert.equal(multiAgent[deadKey], undefined, `${language}.uiMultiAgent.${deadKey} is retired and must stay deleted`);
   }
+  // Round-24 minor 9: every uiScheduledTaskTool key pinned like the
+  // uiSessionMention block — the section previously had only the
+  // directional existence check, so a zh-only key deletion stayed green
+  // (the exact drift class this coverage file exists to catch).
+  for (const key of ['listLabel', 'duplicateNote', 'created', 'updated', 'deleted', 'deletedNote', 'pending', 'promptLabel', 'mismatchNote', 'updatedName']) {
+    assert.ok(dict[language].uiScheduledTaskTool[key], `${language}.uiScheduledTaskTool.${key} must exist`);
+  }
+  for (const fnKey of ['limitSuffix', 'nameQuote']) {
+    assert.equal(typeof dict[language].uiScheduledTaskTool[fnKey], 'function', `${language}.uiScheduledTaskTool.${fnKey} must be a function`);
+  }
+  assert.equal(
+    Object.keys(dict[language].uiScheduledTaskTool).length,
+    12,
+    `${language}.uiScheduledTaskTool must hold exactly the 12 pinned keys`,
+  );
+  assert.deepEqual(
+    [...Object.keys(dict[language].uiScheduledTaskTool)].sort((a, b) => a.localeCompare(b)),
+    ['created', 'deleted', 'deletedNote', 'duplicateNote', 'limitSuffix', 'listLabel', 'mismatchNote', 'nameQuote', 'pending', 'promptLabel', 'updated', 'updatedName'],
+    `${language}.uiScheduledTaskTool must be the same key set in every locale`,
+  );
   // agentCard spawning-era keys: 'spawning' died with the inline expert card
   // (the aggregate count row only speaks in past-tense totals).
   assert.equal(multiAgent.agentCard.spawning, undefined, `${language}.uiMultiAgent.agentCard.spawning is retired and must stay deleted`);
@@ -162,6 +340,35 @@ for (const language of ['zh', 'en', 'ja']) {
       `${language} dictionary misses zh keys (renders undefined): ${missing.slice(0, 10).join(', ')}`,
     );
   }
+}
+
+// Connector card desc overlay parity (wecom): localizeTool spreads the
+// uiToolDetails entry over the tsToolsData baseline, so an overlay desc that
+// trails a baseline capability bump silently hides the new capability in that
+// language (the 1.3.4 pack bump added 制作演示文稿 to the baseline and its
+// BUILTIN_CLI_BUNDLES mirror but missed all three overlays). The zh overlay is
+// the same-language twin of the baseline and must stay identical to it; en/ja
+// re-word, so their shipped capabilities are pinned by the rendered term
+// instead. Intentionally condensed siblings (tmeet, ima) are exempt — they
+// never claimed baseline equality.
+{
+  const baseline = source('features/tools/tool-common.jsx').match(/backendId: 'wecom', wecomCli: true,.*?desc: '([^']+)'/);
+  assert.ok(baseline, 'tsToolsData must carry the wecom card desc');
+  assert.equal(
+    dict.zh.uiToolDetails.tools.wecom.desc,
+    baseline[1],
+    'the zh wecom overlay desc must stay identical to the tsToolsData baseline it overrides at render time',
+  );
+  assert.match(
+    dict.en.uiToolDetails.tools.wecom.desc,
+    /presentations/,
+    'the en wecom overlay desc must keep presenting the presentations capability',
+  );
+  assert.match(
+    dict.ja.uiToolDetails.tools.wecom.desc,
+    /プレゼンテーション/,
+    'the ja wecom overlay desc must keep presenting the presentations capability',
+  );
 }
 
 // uiComputerUse (round-17): type parity across languages — a template
@@ -210,8 +417,13 @@ assert.match(viewErrorBoundary, /this\.props\.heading \|\| copy\.viewLoadFailed/
 assert.doesNotMatch(viewErrorBoundary, />设置页加载失败</);
 
 const petWindow = source('features/pet/PetWindow.jsx');
-assert.match(petWindow, /invokeTauri\(['"]get_settings['"]\)/);
-assert.match(petWindow, /listen\(['"]ui:language_changed['"]/);
+// The language follow (get_settings seed + ui:language_changed listener)
+// lives in the shared hook since the FFE7-1 extraction; the pet window must
+// still adopt it and the hook must keep both sides of the contract.
+assert.match(petWindow, /useFollowMainWindowLanguage\(/);
+const followHook = source('hooks/useFollowMainWindowLanguage.js');
+assert.match(followHook, /invokeTauri\(['"]get_settings['"]\)/);
+assert.match(followHook, /listen\(['"]ui:language_changed['"]/);
 assert.match(petWindow, /const petCopy = t\.uiPet/);
 
 assert.match(source('features/monitor/MonitorView.jsx'), /t\.uiMonitor/);
@@ -228,7 +440,6 @@ assert.match(settings, /const settingsCopy = t\.uiSettingsDetail/);
 assert.match(settings, /settingsCopy\.addSearch/);
 assert.match(settings, /settingsCopy\.deleteModelTitle/);
 assert.doesNotMatch(settings, />添加搜索源</);
-const chat = source('features/chat/ChatView.jsx');
 assert.match(chat, /const chatCopy = t\.uiChat/);
 assert.match(chat, /chatCopy\.asrDownloadTitle/);
 assert.match(chat, /chatCopy\.memoryMeta/);
@@ -236,18 +447,18 @@ assert.match(chat, /chatCopy\.sceneModes/);
 assert.match(chat, /chatViewCopy\.placeholderSceneAdjust/);
 assert.match(chat, /chatViewCopy\.placeholderSceneDataViz/);
 assert.match(chat, /chatViewCopy\.placeholderScenePoster/);
-assert.doesNotMatch(chat, /designGeneralPlaceholder/);
-assert.doesNotMatch(chat, /label:\s*'个人工作台'/);
-assert.doesNotMatch(chat, /label:\s*'公文写作'/);
-assert.doesNotMatch(chat, /label:\s*'数据可视化'/);
-assert.doesNotMatch(chat, /`取消\$\{scene\.label\}`/);
-assert.doesNotMatch(chat, /:\s*'描述你想生成或调整的内容'/);
-assert.doesNotMatch(chat, />下载语音识别模型</);
+assert.doesNotMatch(chatRaw, /designGeneralPlaceholder/);
+assert.doesNotMatch(chatRaw, /label:\s*'个人工作台'/);
+assert.doesNotMatch(chatRaw, /label:\s*'公文写作'/);
+assert.doesNotMatch(chatRaw, /label:\s*'数据可视化'/);
+assert.doesNotMatch(chatRaw, /`取消\$\{scene\.label\}`/);
+assert.doesNotMatch(chatRaw, /:\s*'描述你想生成或调整的内容'/);
+assert.doesNotMatch(chatRaw, />下载语音识别模型</);
+assert.match(auxChatPanel, /const copy = t\.uiAuxChat/);
+assert.match(auxChatPanel, /copy=\{conversationCopy\}/);
 assert.match(source('features/pet/PetSettingsSection.jsx'), /t\.uiPetSettings/);
-const conversation = source('features/conversation/ConversationTimeline.jsx');
 assert.match(conversation, /conversationCopy\(copy\)/);
-assert.doesNotMatch(conversation, />等待授权</);
-const codex = source('features/codex/CodexAcpView.jsx');
+assert.doesNotMatch(conversationRaw, />等待授权</);
 assert.match(codex, /const codexCopy = t\.uiCodex/);
 assert.match(codex, /copy=\{t\.uiConversation\}/);
 assert.match(codex, /copy=\{t\.uiCodexWorkspace\}/);
@@ -292,6 +503,188 @@ for (const language of ['zh', 'en', 'ja']) {
   for (const id of workbenchTemplateIds) {
     assert.ok(dict[language].uiChatScenes.workbenchTemplates[id], `${language}.uiChatScenes.workbenchTemplates.${id} must exist`);
   }
+}
+
+// Connector flow-card failures: stored as error codes and localized at render
+// time, so en/ja users never see raw (often Chinese) backend text. The raw
+// backend diagnostic is never rendered in the flow card (same border as the
+// Official repo's PR #442: the localized category message is the only copy).
+// cli_data_access_disabled is dingtalk's org-level CLI block: only an org
+// admin can fix it, so the copy carries the remediation instead of the
+// generic retry advice.
+const connectorErrorCodes = ['runtime_prepare_failed', 'cli_install_failed', 'auth_start_failed', 'registration_failed', 'auth_failed', 'skills_enable_failed', 'cli_data_access_disabled', 'consent_persist_failed', 'unknown'];
+for (const language of ['zh', 'en', 'ja']) {
+  for (const code of connectorErrorCodes) {
+    const copy = dict[language].uiToolStore.connectorErrors[code];
+    assert.equal(typeof copy, 'string', `${language}.uiToolStore.connectorErrors.${code} must exist`);
+    assert.ok(copy.length > 0, `${language}.uiToolStore.connectorErrors.${code} must not be empty`);
+  }
+  assert.ok(typeof dict[language].updateCheckFailed === 'string' && dict[language].updateCheckFailed.length > 0, `${language}.updateCheckFailed must exist and not be empty`);
+  assert.ok(typeof dict[language].updateInstallFailed === 'string' && dict[language].updateInstallFailed.length > 0, `${language}.updateInstallFailed must exist and not be empty`);
+  for (const retired of ['connFailed', 'dingtalkSkillsFailed', 'tmeetAuthIncomplete']) {
+    assert.equal(dict[language].uiToolStore[retired], undefined, `${language}.uiToolStore.${retired} is replaced by connectorErrors`);
+  }
+  // Round-37 F1 (review #455): presence guards for the keys whose deletion
+  // previously failed nothing — dropping one from a locale must fail now.
+  for (const key of ['installedReady', 'welcomeOptInFailed']) {
+    assert.equal(typeof dict[language].uiChat[key], 'string', `${language}.uiChat.${key} must exist and not be empty`);
+    assert.ok(dict[language].uiChat[key].length > 0, `${language}.uiChat.${key} must not be empty`);
+  }
+  for (const key of ['switchedOffPacks', 'notAppliedPacks']) {
+    assert.equal(typeof dict[language].uiChatScenes[key], 'function', `${language}.uiChatScenes.${key} must exist`);
+  }
+  assert.equal(
+    typeof dict[language].uiToolStore.connectorErrors.consent_persist_failed,
+    'string',
+    `${language}.uiToolStore.connectorErrors.consent_persist_failed must exist and not be empty`
+  );
+}
+// The render lookup must resolve own keys only: `constructor`/`toString` pass the
+// snake_case code pattern but would resolve to Object.prototype functions.
+const connectorErrorsDict = dict.en.uiToolStore.connectorErrors;
+assert.equal(connectorErrorCopy(connectorErrorsDict, 'auth_failed'), connectorErrorsDict.auth_failed);
+assert.equal(connectorErrorCopy(connectorErrorsDict, 'constructor'), '');
+assert.equal(connectorErrorCopy(connectorErrorsDict, 'toString'), '');
+assert.equal(connectorErrorCopy(connectorErrorsDict, 'valueOf'), '');
+assert.equal(connectorErrorCopy(connectorErrorsDict, 'hasOwnProperty'), '');
+assert.equal(connectorErrorCopy(connectorErrorsDict, 42), '');
+assert.equal(connectorErrorCopy(connectorErrorsDict, null), '');
+assert.equal(connectorErrorCopy(null, 'auth_failed'), '');
+assert.equal(errorCode({ code: 'auth_failed', message: 'raw diagnostic' }), 'auth_failed');
+assert.equal(errorCode(new Error('cli_install_failed: raw backend detail')), 'cli_install_failed');
+assert.equal(errorCode(new Error('raw backend detail')), '');
+assert.equal(errorCode({ code: 'Not A Code' }), '');
+assert.equal(errorCode(null), '');
+assert.equal(errorCode(42), '');
+assert.equal(errorCode(':leading-separator'), '');
+assert.equal(connectorErrorCodeForStep('runtime'), 'runtime_prepare_failed');
+assert.equal(connectorErrorCodeForStep('cli'), 'cli_install_failed');
+assert.equal(connectorErrorCodeForStep('register'), 'registration_failed');
+assert.equal(connectorErrorCodeForStep('qr'), 'auth_failed');
+assert.equal(connectorErrorCodeForStep('bogus'), 'unknown');
+assert.deepEqual(connectorFailure({ code: 'auth_failed', message: 'raw backend diagnostic' }, 'qr'), { errorCode: 'auth_failed' });
+assert.deepEqual(connectorFailure(new Error('raw install diagnostic'), 'cli'), { errorCode: 'cli_install_failed' });
+assert.equal(connectorUiStep({ active: 'cli' }, 'authorize'), 'qr');
+assert.equal(connectorUiStep({ active: 'connect' }, 'register'), 'connect');
+assert.equal(connectorUiStep({ active: 'qr' }, 'register'), 'qr');
+assert.equal(connectorUiStep(null, 'register'), 'connect');
+assert.equal(connectorUiStep({ active: 'cli' }), 'cli');
+{
+  const failed = applyConnectorFailure(
+    { active: 'cli', steps: { runtime: 'done', cli: 'done' } },
+    { code: 'auth_failed', message: 'raw backend diagnostic' },
+    'authorize',
+  );
+  assert.equal(failed.phase, 'error');
+  assert.equal(failed.errorCode, 'auth_failed');
+  assert.equal(failed.steps.cli, 'done');
+  assert.equal(failed.steps.qr, 'error');
+  assert.equal(Object.hasOwn(failed.steps, 'authorize'), false);
+  // The raw diagnostic must not be carried on the flow state at all.
+  assert.equal(Object.hasOwn(failed, 'err'), false);
+  assert.equal(Object.hasOwn(failed, 'detail'), false);
+  assert.equal(Object.hasOwn(failed, 'errStep'), false);
+}
+{
+  const toolStore = source('features/tools/ToolStoreView.jsx');
+  // All four flow cards must receive the localized-code dictionary — one card
+  // losing the prop would silently degrade that connector's failures to the
+  // generic connectionIncomplete fallback.
+  assert.ok(
+    (toolStore.match(/errors=\{storeCopy\.connectorErrors\}/g) || []).length >= 4,
+    'all four flow cards must receive the connectorErrors dictionary',
+  );
+  assert.match(toolStore, /connectorErrorCopy\(errors, flow\.errorCode\) \|\| errors\.unknown \|\| copy\.connectionIncomplete/);
+  // The connected toast must read its copy through the latest ref at event
+  // time, so a mid-flow language switch shows the toast in the new language
+  // (the ref effect has no dep array and is declared before the listeners).
+  assert.match(toolStore, /const toastCopyRef = useRef\(null\);/);
+  assert.match(toolStore, /toastCopyRef\.current = \{ doneTitle, enabledSubtitle: detailCopy\.actions\.enabled \};/);
+  assert.match(toolStore, /toastCopyRef\.current && toastCopyRef\.current\.doneTitle/);
+  // The auto-collapse timer must only close a card that already reached
+  // 'done': a stale timer from a previous round would destroy a freshly
+  // re-opened card and strand the busy slot with it.
+  assert.ok(
+    (toolStore.match(/setTimeout\(\(\) => conn\.setFlow\(f => \(f && f\.phase === 'done' \? null : f\)\), 1800\)/g) || []).length >= 2,
+    'both connected listeners must guard the auto-collapse against a re-opened card',
+  );
+  assert.match(toolStore, /applyConnectorFailure\(f, p, p\.phase\)/);
+  assert.doesNotMatch(toolStore, /\berr:\s*String\(/);
+  assert.doesNotMatch(toolStore, /flow\.err\b/);
+  assert.doesNotMatch(toolStore, /flow\.detail\b/);
+  assert.doesNotMatch(toolStore, /console\.error\([^\n]*connect failed:[^\n]*,\s*e\)/);
+  const tauriSource = relative => readFileSync(new URL(`../src-tauri/src/${relative}`, import.meta.url), 'utf8');
+  const feishu = tauriSource('features/connectors/feishu.rs');
+  assert.match(feishu, /"phase": "register", "code": "registration_failed"/);
+  assert.match(feishu, /"phase": "authorize", "code": "auth_failed"/);
+  for (const connector of ['wecom.rs', 'tmeet.rs']) {
+    assert.match(tauriSource(`features/connectors/${connector}`), /"phase": "authorize", "code": "auth_failed"/, `${connector} error events must carry an error code`);
+  }
+  // DingTalk's error code travels on its FlowError (the org-level CLI block
+  // gets its own `cli_data_access_disabled` code; everything else defaults to
+  // `auth_failed`), so pin the emit's code field plus the default category.
+  const dingtalk = tauriSource('features/connectors/dingtalk.rs');
+  assert.match(dingtalk, /"phase": "authorize", "code": e\.code/, 'dingtalk error events must carry the FlowError code');
+  assert.match(dingtalk, /code: "auth_failed"/, 'dingtalk FlowError must default to the auth_failed category');
+  assert.match(dingtalk, /code: "cli_data_access_disabled"/, 'dingtalk org CLI block must carry its own stable code');
+  // Source contract: every connector's error arm must consult BOTH the cancel
+  // flag and the generation (cancel alone is cleared by the next reset), and
+  // each file must gate at least two emit paths on the generation (the error
+  // emit plus the QR emit) — deleting either wiring must fail here, not just
+  // the mechanism unit test.
+  for (const connector of ['feishu.rs', 'wecom.rs', 'dingtalk.rs', 'tmeet.rs']) {
+    const src = tauriSource(`features/connectors/${connector}`);
+    assert.match(src, /conn\.is_cancelled\(ID\)\s*\|\|\s*conn\.flow_stale\(ID, generation\)/, `${connector} error arm must guard on cancel OR a superseded generation`);
+    assert.ok(
+      (src.match(/flow_stale\(ID, generation\)/g) || []).length >= 2,
+      `${connector} must consult the generation on both the error and the QR emit path`,
+    );
+  }
+  // The wrapped QR emits (feishu register + authorize / dingtalk / tmeet) gate
+  // on the same pair. Feishu has two QR phases, so require two wraps there:
+  // the authorize emit once shipped with only a pre-parse guard, and a cancel
+  // landing inside parse + QR rendering could still paint a dead device code
+  // onto a newer round's card.
+  assert.match(tauriSource('features/connectors/dingtalk.rs'), /!\(conn\.is_cancelled\(ID\) \|\| conn\.flow_stale\(ID, generation\)\)/);
+  assert.match(tauriSource('features/connectors/tmeet.rs'), /!\(conn\.is_cancelled\(ID\) \|\| conn\.flow_stale\(ID, generation\)\)/);
+  assert.ok(
+    (feishu.match(/!\(conn\.is_cancelled\(ID\) \|\| conn\.flow_stale\(ID, generation\)\)/g) || []).length >= 2,
+    'both feishu QR emits (register and authorize) must be wrapped in the cancel-or-stale guard at the emit site',
+  );
+  // Frontend: a late error event must not fabricate a flow card from null.
+  assert.match(toolStore, /f \? applyConnectorFailure\(f, p, p\.phase\) : f\)/);
+  // Frontend: the same guard family on the remaining fabrication points — a
+  // late QR event, a connect-catch rejection after the card was closed, and
+  // the connected listeners' done write (the smoke only exercises the error
+  // path end-to-end, so these three are pinned at source level).
+  assert.match(toolStore, /if \(!f\) return f;/, 'the qr listener must drop events onto a closed flow instead of fabricating a card');
+  assert.match(toolStore, /f \? applyConnectorFailure\(f, e, stage\) : f\)/, 'the connect catch must not fabricate a card from a closed flow');
+  assert.ok(
+    (toolStore.match(/f \? \{ \.\.\.f, phase: 'done'/g) || []).length >= 2,
+    'both connected listeners must guard the done write against a closed flow',
+  );
+  // Source contract: every pid-slot cleanup must be the compare-and-set. A
+  // superseded round's plain set_pid(ID, None) would clear the pid a newer
+  // round registered, making its cancel tree-kill a no-op (connector_cli.rs
+  // unit-tests the CAS mechanism; this pins that every flow uses it).
+  for (const connector of ['feishu.rs', 'wecom.rs', 'dingtalk.rs', 'tmeet.rs']) {
+    const src = tauriSource(`features/connectors/${connector}`);
+    assert.doesNotMatch(src, /set_pid\(ID, None\)/, `${connector} pid cleanup must use the clear_pid_if compare-and-set`);
+    assert.match(src, /let pid = child\.id\(\);/, `${connector} must capture its child pid for the CAS clear`);
+    assert.match(src, /clear_pid_if\(ID, pid\)/, `${connector} must clear the pid slot via clear_pid_if`);
+  }
+  // Source contract: a reconnect without an intervening cancel must not orphan
+  // the previous round's registered child — begin's reset overwrites the pid
+  // slot, which would make that child invisible to cancel's tree-kill and to
+  // kill_all_pids at exit. Every begin therefore tree-kills the registered pid
+  // before resetting (the smoke cannot exercise real child processes, so this
+  // is pinned at source level like the other begin-time wiring).
+  for (const connector of ['feishu.rs', 'wecom.rs', 'dingtalk.rs', 'tmeet.rs']) {
+    const src = tauriSource(`features/connectors/${connector}`);
+    assert.match(src, /if let Some\(pid\) = conn\.cancel\(ID\)/, `${connector} connect_begin must take the previous round's registered pid before reset`);
+    assert.match(src, /kill_pid_tree\(pid\)/, `${connector} connect_begin must tree-kill the stale child`);
+  }
+  assert.match(source('features/settings/SettingsView.jsx'), /item\.title \|\| presetProviderLabel\(p, t\)/);
 }
 
 console.log('UI language coverage tests passed');

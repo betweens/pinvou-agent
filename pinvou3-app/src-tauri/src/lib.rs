@@ -16,10 +16,43 @@ pub mod platform;
 )]
 unsafe extern "C" {}
 
+use std::io::Write as _;
+
 use tauri::Manager;
 
 #[cfg(feature = "benchmark-hooks")]
 pub use features::assistant::product_runtime::{agentic_task, headless_bridge};
+
+/// Facade for the automation scheduler foundation, consumed only by the
+/// `scheduled` family of pinvou-cli: definitions and run records live behind
+/// the public API of CodeWhale `codewhale-tui`'s (this crate's
+/// `deepseek-tui` alias) `automation_manager`, while the architecture guard
+/// `rust_cli_reaches_past_pinvou3_lib` requires pinvou-cli to reach the
+/// foundation through pinvou3_lib surfaces only — the same precedent as the
+/// `pub mod` opened on `features::projects` for the CLI. Only the entries
+/// the CLI `scheduled` family actually consumes are re-exported; the GUI
+/// itself keeps using `deepseek_tui::...` directly, not through this facade.
+pub mod automation_foundation {
+    pub use deepseek_tui::automation_manager::{
+        AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedule,
+        AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest,
+    };
+}
+
+/// Facade for the OpenCode gateway session-affinity helpers, consumed by the
+/// `models` family of pinvou-cli: `models test` mirrors the GUI's
+/// `probe_model_connection`, which must attach `x-opencode-session` itself
+/// when the base URL is an OpenCode gateway endpoint (the Go gateway
+/// rejects hand-rolled auxiliary clients without it since 2026-09; see
+/// `core::model_endpoint`). Same precedent as the `automation_foundation`
+/// facade: only the entries the CLI actually consumes are re-exported, and
+/// the GUI keeps calling `crate::core::model_endpoint` directly.
+pub mod model_probe {
+    pub use crate::core::model_endpoint::{
+        is_anthropic_api_url, is_opencode_gateway_base_url, model_probe_http_code,
+        model_probe_transport_code, models_probe_url, opencode_session_id_for, strip_v1_suffix,
+    };
+}
 
 use crate::app::commands;
 use crate::features::{
@@ -59,6 +92,160 @@ const RELEASE_ENV_DEFAULTS: &[(&str, &str)] = &[
     ("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS", "280"),
 ];
 
+/// §6 keychain snapshot composition (review #484 round-13 M4 extracted & pinned;
+/// round-14 fixed a doc misplacement): code/ACP sessions read the session-agents
+/// record (authoritative); an empty record falls back to the pure-binding sidecar;
+/// both empty = single root (the base normalizes by cwd). Previously an inline
+/// closure — audit mutations (deleting the agents-first branch) kept all host tests
+/// green; promoting it to a free function pins the delivery priority by behavior tests.
+///
+/// Round-19 minor 6 (re-check at delivery): intake soft-keeps non-existent or
+/// non-directory extra roots — stored by lexical spelling (may be rebuilt later).
+/// If such a spelling later materializes as a symlink to `/` (or an ancestor of
+/// the primary root), per-turn canonicalization would admit the widened target.
+/// The composition point re-checks two hard invariants on **normalizable** extra
+/// roots (filesystem root / ancestor of the primary root, the same judgment as
+/// `validate_workspace_roots`); a hit is dropped from the delivery set and
+/// logged — fail-safe toward narrowing, the session continues; spellings still
+/// non-existent / non-normalizable keep the soft-keep semantics.
+///
+/// Round-21 M1 (ancestor exemption): align's §9.7 semantics swaps **all** of the
+/// project's roots into the keychain — a project may by design override a member
+/// session's cwd, so the `[cwd, ancestor]` shape is deliberately persisted (pin:
+/// `compose_delivers_a_project_backed_ancestor_root`, the persisted-shape
+/// complement of `align_persists_a_project_ancestor_root_by_design`). The
+/// "ancestor of the primary root" re-check must therefore distinguish provenance:
+/// an ancestor **matching a fold key of a root the owning project has registered
+/// right now** (the same authority align itself consults, `resolve_session_project`) is
+/// backed by the project's existence and delivered as usual; an unbacked ancestor
+/// (missed by the caller's intake, project deleted/re-rooted) is still dropped. A
+/// filesystem root is never exempt. Backing keys resolve lazily on the first
+/// ancestor hit; the delivery hot path does no project-store reads.
+pub(crate) fn compose_workspace_roots(
+    agents: &crate::features::codex_acp::SessionAgentStore,
+    bindings: &crate::features::sessions::SessionStore,
+    projects: &crate::features::projects::ProjectStore,
+    session_id: &str,
+) -> Vec<std::path::PathBuf> {
+    // Round-40 M6: both fields from ONE sidecar read per store — the old
+    // shape stat'd/opened/parsed the same file twice per session per
+    // refresh (inline on the async runtime).
+    let (agent_roots, agent_provenance) = agents.session_workspace_keychain(session_id);
+    let (mut recorded, explicit_provenance) = if !agent_roots.is_empty() {
+        (agent_roots, agent_provenance)
+    } else {
+        bindings.session_workspace_keychain(session_id)
+    };
+    // Round-32 minor 4: a degenerate primary (relative/empty — only a
+    // hand-edited artifact) can never prefix-match, so the re-check loop
+    // below would silently no-op; the foundation admits nothing for that
+    // shape, and compose mirrors it by returning empty rather than
+    // delivering unverifiable spellings.
+    if recorded
+        .first()
+        .is_some_and(|primary| primary.as_os_str().is_empty() || !primary.is_absolute())
+    {
+        return Vec::new();
+    }
+    if recorded.len() < 2 {
+        return recorded;
+    }
+    // Round-31 minor 10: a hand-edited over-cap record would display more
+    // roots than the engine delivers (the inverse of the display ==
+    // engine-effective invariant) and drive an unbounded canonicalize+stat
+    // loop per spawn/list refresh — cap at the foundation's ceiling here,
+    // matching its primary+64 normalize semantics.
+    if recorded.len() > codewhale_core::MAX_WORKSPACE_ROOTS + 1 {
+        recorded.truncate(codewhale_core::MAX_WORKSPACE_ROOTS + 1);
+    }
+    use crate::features::sessions::{is_filesystem_root, lexical_normalize};
+    let identity_key = |path: &std::path::Path| {
+        crate::platform::os::filesystem_path_identity_key(&path.to_string_lossy())
+    };
+    let primary_lexical = lexical_normalize(&recorded[0]);
+    // Round-37 M7: canonical primary for the widening judgment (same fix
+    // as the validator — the two must not drift).
+    let primary_comparison =
+        crate::features::sessions::primary_comparison_spelling(&primary_lexical);
+    // Round-21 M1: lazily-resolved fold keys of the owning project's
+    // registered roots — the ancestor-exemption authority (see the doc
+    // comment above). `None` = not yet resolved; an empty vec = resolved
+    // with no backing (every subsequent ancestor is dropped).
+    // Round-40 (zhuowp P2): the EXPLICIT provenance keys ride alongside —
+    // an ancestor align itself granted stays delivered after the backing
+    // project mutates (folder removed / project deleted / session moved
+    // out); the grant's authority is its recorded provenance, not mutable
+    // project state. Symlink widening is still rejected: a provenance key
+    // matches the canonicalized recorded spelling only.
+    let provenance_keys: Vec<String> = explicit_provenance
+        .iter()
+        .map(|root| identity_key(root))
+        .collect();
+    let mut backing_keys: Option<Vec<String>> = None;
+    let mut delivered = Vec::with_capacity(recorded.len());
+    delivered.push(recorded[0].clone());
+    for root in recorded.iter().skip(1) {
+        let Ok(canonical) = root.canonicalize() else {
+            delivered.push(root.clone());
+            continue;
+        };
+        if !canonical.is_dir() {
+            delivered.push(root.clone());
+            continue;
+        }
+        let canonical = std::path::PathBuf::from(crate::platform::os::platform_compat_path(
+            &canonical.to_string_lossy(),
+        ));
+        let canonical_lexical = lexical_normalize(&canonical);
+        if is_filesystem_root(&canonical_lexical) {
+            // Log hygiene (CodeQL cleartext-logging, same convention as the
+            // rebind lane): log only the failure category, never user paths.
+            eprintln!(
+                "[sessions] a soft-kept workspace root resolved to a widening target at delivery; dropped"
+            );
+            continue;
+        }
+        let widens_to_ancestor = primary_lexical != canonical_lexical
+            && primary_comparison.starts_with(&canonical_lexical);
+        if widens_to_ancestor {
+            let backed_by_project = {
+                let keys = backing_keys.get_or_insert_with(|| {
+                    projects
+                        .resolve_session_project(session_id, &recorded[0])
+                        .map(|project| {
+                            project
+                                .roots
+                                .iter()
+                                .map(|root| identity_key(root))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                });
+                keys.iter()
+                    .any(|key| *key == identity_key(&canonical_lexical))
+            };
+            let explicitly_granted = provenance_keys
+                .iter()
+                .any(|key| *key == identity_key(&canonical_lexical));
+            if !backed_by_project && !explicitly_granted {
+                // Same log-hygiene convention as the fs-root drop above.
+                eprintln!(
+                    "[sessions] a soft-kept workspace root resolved to a widening target at delivery; dropped"
+                );
+                continue;
+            }
+            // Round-21 M1: an ancestor root that matches the owning
+            // project's registered root is delivered — align persisted it
+            // deliberately (§9.7) and the chip/copy already promised it.
+            // Round-40 (zhuowp P2): an ancestor align itself granted is
+            // delivered on its recorded provenance for the same reason —
+            // the UI promised the snapshot keeps it.
+        }
+        delivered.push(root.clone());
+    }
+    delivered
+}
+
 /// 为 release 安装包（.deb 双击启动场景）注入 run-dev.sh 里集中处理的运行时 env。
 /// dev 启动走 run-dev.sh 已经 export 过的不会被覆盖（var_os().is_none() 守门）。
 fn ensure_release_env() {
@@ -81,15 +268,27 @@ fn ensure_release_env() {
     {
         if let Some(old) = env::var_os("PATH") {
             let mut dirs = Vec::new();
-            if let Some(connector_bin) = crate::platform::paths::managed_connector_bin_dir() {
-                // 旧布局（过渡期保留：未迁移的存量二进制还能按名解析）
-                dirs.push(connector_bin);
-            }
-            // 版本化 CLI 资产目录进 PATH（按 lock 表当前版本逐个登记）
+            // Versioned CLI asset dirs (one per lock-pinned artifact) must come
+            // BEFORE the legacy-layout dir: the pinned copy is hash-verified and
+            // is the authoritative runtime. With the legacy dir first, a stale
+            // old-version binary left there shadows the upgraded CLI for every
+            // PATH-based consumer (observed: a leftover wecom-cli 0.1.9 kept
+            // running after the upgrade to 1.2.1). The legacy dir itself stays
+            // on PATH (after the versioned dirs): binaries not yet migrated,
+            // or whose pinned version is not installed, still resolve by name
+            // (it is their only local runtime).
             for (name, pin) in crate::platform::connector_lock::all_artifact_pins() {
                 dirs.push(crate::platform::paths::assets_cli_dir(&name, &pin.version));
             }
-            if let Ok(prefix) = env::var("NPM_CONFIG_PREFIX") {
+            if let Some(connector_bin) = crate::platform::paths::managed_connector_bin_dir() {
+                dirs.push(connector_bin);
+            }
+            // npm reads both spellings (NPM_CONFIG_PREFIX and
+            // npm_config_prefix); uppercase wins when both are set — the
+            // same two-spelling read posix.rs's vendor-CLI scan uses.
+            if let Ok(prefix) =
+                env::var("NPM_CONFIG_PREFIX").or_else(|_| env::var("npm_config_prefix"))
+            {
                 dirs.push(std::path::Path::new(&prefix).join("bin"));
             }
             if let Some(home) = env::var_os("HOME") {
@@ -409,8 +608,9 @@ async fn reconcile_orphaned_session_browser_files_until_success(
 ///
 /// There is deliberately no process-lifetime deletion replay. Store boot can
 /// prune sessions before this hook is registered, but no WebView from a prior
-/// process survives; `spawn_orphaned_session_browser_reconciliation` scans and
-/// retries removal of their durable browser artifacts immediately afterwards.
+/// process survives; `reconcile_orphaned_session_browser_files_until_success`
+/// scans and retries removal of their durable browser artifacts immediately
+/// afterwards.
 fn spawn_deleted_session_browser_cleanup(app: tauri::AppHandle, store: SessionStore) {
     let deletion_queue = std::sync::Arc::new(SessionBrowserCleanupQueue::default());
     let app_for_hook = app.clone();
@@ -472,12 +672,6 @@ fn spawn_deleted_session_browser_cleanup(app: tauri::AppHandle, store: SessionSt
     });
 }
 
-fn spawn_orphaned_session_browser_reconciliation(app: tauri::AppHandle, store: SessionStore) {
-    tauri::async_runtime::spawn(reconcile_orphaned_session_browser_files_until_success(
-        app, store,
-    ));
-}
-
 /// Funnel for process env writes inside the single-threaded startup window
 /// (besides the release defaults of `ensure_release_env`).
 ///
@@ -512,20 +706,56 @@ pub(crate) fn startup_process_env() {
     crate::platform::os::startup_platform_env();
 }
 
-/// `iframe[srcdoc]` 在 WebKitGTK 中会作为宿主 WebView 的 `about:srcdoc` 导航
-/// 进入 Wry 的 navigation handler。这里只放行浏览器内部的两个空文档地址；
-/// 主窗口和 iframe 的任意外部来源仍走初始 origin 限制。
-#[cfg(any(target_os = "linux", test))]
-fn allow_embedded_document_navigation(url: &tauri::Url, main_origin_initialized: bool) -> bool {
-    main_origin_initialized && matches!(url.as_str(), "about:blank" | "about:srcdoc")
+/// Verdict for one navigation candidate on the main webview.
+enum MainNavigationVerdict {
+    /// Allow the navigation. `initial_origin` carries the origin to record as
+    /// the baseline when the baseline has not been established yet.
+    Allow { initial_origin: Option<String> },
+    /// Deny the navigation. `detail` carries the startup diagnostic to log
+    /// (`None` for the silent case: an embedded-document URL arriving before
+    /// any main origin exists must not claim the baseline slot).
+    Block { detail: Option<String> },
 }
 
-/// Non-blocking synchronous fallback for `RunEvent::Exit`. Explicit `app.restart()`
-/// bypasses this event and uses `prepare_app_restart()` to await the complete
-/// `shutdown_before_restart()` barrier.
-fn shutdown_browser_before_process_end(app: &tauri::AppHandle) {
-    if let Some(browser) = app.try_state::<features::browser::BrowserManager>() {
-        browser.shutdown_on_exit();
+/// Pure decision for one navigation on the main webview; side effects (baseline
+/// write, startup marks) stay with the `on_navigation` closure so this remains
+/// unit-testable on every platform.
+///
+/// `iframe[srcdoc]` — the carrier of the HTML artifact preview — surfaces as an
+/// `about:srcdoc` navigation of the host webview on WebKitGTK and macOS
+/// WKWebView (WebView2 raises main-frame navigation events only, so the guard
+/// never sees iframe loads on Windows). PR #116 allowed those two internal
+/// URLs on Linux only, leaving the artifact preview permanently black on
+/// macOS: the placeholder background rendered while the iframe navigation was
+/// denied. This decision keeps the guard's original intent — only the two
+/// browser-internal empty-document URLs are exempt after the main origin is
+/// established; any external origin (main frame or iframe) still goes through
+/// the initial-origin baseline — and applies it platform-wide.
+fn decide_main_navigation(url: &tauri::Url, initial_origin: Option<&str>) -> MainNavigationVerdict {
+    if matches!(url.as_str(), "about:blank" | "about:srcdoc") {
+        return match initial_origin {
+            Some(_) => MainNavigationVerdict::Allow {
+                initial_origin: None,
+            },
+            None => MainNavigationVerdict::Block { detail: None },
+        };
+    }
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or_default();
+    let port = url
+        .port_or_known_default()
+        .map_or_else(|| "-".to_string(), |port| port.to_string());
+    let origin = format!("{scheme}://{host}:{port}");
+    match initial_origin {
+        None => MainNavigationVerdict::Allow {
+            initial_origin: Some(origin),
+        },
+        Some(allowed) if allowed == &origin => MainNavigationVerdict::Allow {
+            initial_origin: None,
+        },
+        Some(_) => MainNavigationVerdict::Block {
+            detail: Some(format!("scheme={scheme} host={host} port={port}")),
+        },
     }
 }
 
@@ -584,6 +814,45 @@ fn startup_probe_plugin(name: &'static str) -> tauri::plugin::TauriPlugin<tauri:
             Ok(())
         })
         .build()
+}
+
+/// The startup-timeline signature of a failed knowledge init. The state is
+/// never managed on failure and nothing retries it in-process (whether the
+/// store was refused as too-new or the open failed transiently), so the
+/// `:error` line carrying the cause is the failure's only durable mark —
+/// stderr alone is lost on windowed Windows builds, and
+/// `knowledge_service:done` is reserved for a successful init so the
+/// timeline cannot read a dead service as "finished fine".
+fn mark_knowledge_service_failed(error: impl std::fmt::Display) {
+    let detail = format!("{error:#}");
+    crate::platform::startup::mark_with_detail("rust", "knowledge_service:error", &detail);
+    eprintln!("[pinvou3-app] knowledge service init failed: {detail}");
+}
+
+/// Best-effort removal of a purged session's entry from the codex_acp agents
+/// index (`session-agents.json`). Retention evictions and scheduled cleanups
+/// delete the saved-session record and its directory, but that index is owned
+/// by `features::codex_acp` (the sessions purge cannot touch it), so a stale
+/// entry used to outlive its owner and feed the boot-time sidecar backfill —
+/// resurrecting ghost `sessions/<id>/` directories on every startup. The
+/// user-delete path already removes the entry in the `delete_session` command;
+/// this leg covers the GUI purge paths that have no app handle at hook time
+/// (runtime retention evictions, scheduled-run cleanups) via the
+/// `SessionPurgedHook` (same dependency inversion as the other hook legs —
+/// sessions must not depend on codex_acp in reverse). The windowless host
+/// registers no purge hooks; dead code-mode entries its evictions leave
+/// behind are converged by the boot scan's prune at the next GUI start
+/// (dead ACP-mode entries are inert and intentionally left in place).
+/// Failure tolerance matches the other purge legs: a missing entry is fine,
+/// and any error is logged without aborting or rolling back the eviction
+/// itself.
+pub(crate) fn remove_agents_index_entry(
+    agents: &crate::features::codex_acp::SessionAgentStore,
+    session_id: &str,
+) {
+    if let Err(error) = agents.remove(session_id) {
+        eprintln!("[pinvou3-app] remove session-agents.json entry after purge failed: {error:#}");
+    }
 }
 
 pub fn run() {
@@ -651,49 +920,33 @@ pub fn run() {
                     if webview.label() != "main" {
                         return true;
                     }
-                    #[cfg(target_os = "linux")]
-                    if matches!(url.as_str(), "about:blank" | "about:srcdoc") {
-                        let main_origin_initialized = main_navigation_origin
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .is_some();
-                        return allow_embedded_document_navigation(url, main_origin_initialized);
-                    }
-                    let origin = format!(
-                        "{}://{}:{}",
-                        url.scheme(),
-                        url.host_str().unwrap_or_default(),
-                        url.port_or_known_default()
-                            .map_or_else(|| "-".to_string(), |port| port.to_string())
-                    );
-                    if !initial_navigation_reported.swap(true, Ordering::Relaxed) {
-                        startup::mark_with_detail(
-                            "rust",
-                            "tauri:main_navigation",
-                            &format!("scheme={}", url.scheme()),
-                        );
-                    }
                     let mut initial_origin = main_navigation_origin
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match initial_origin.as_ref() {
-                        None => {
-                            *initial_origin = Some(origin);
+                    match decide_main_navigation(url, initial_origin.as_deref()) {
+                        MainNavigationVerdict::Allow {
+                            initial_origin: baseline,
+                        } => {
+                            if let Some(baseline) = baseline {
+                                if !initial_navigation_reported.swap(true, Ordering::Relaxed) {
+                                    startup::mark_with_detail(
+                                        "rust",
+                                        "tauri:main_navigation",
+                                        &format!("scheme={}", url.scheme()),
+                                    );
+                                }
+                                *initial_origin = Some(baseline);
+                            }
                             true
                         }
-                        Some(allowed) if allowed == &origin => true,
-                        Some(_) => {
-                            startup::mark_with_detail(
-                                "rust",
-                                "tauri:main_navigation_blocked",
-                                &format!(
-                                    "scheme={} host={} port={}",
-                                    url.scheme(),
-                                    url.host_str().unwrap_or_default(),
-                                    url.port_or_known_default()
-                                        .map_or_else(|| "-".to_string(), |port| port.to_string())
-                                ),
-                            );
+                        MainNavigationVerdict::Block { detail } => {
+                            if let Some(detail) = detail {
+                                startup::mark_with_detail(
+                                    "rust",
+                                    "tauri:main_navigation_blocked",
+                                    &detail,
+                                );
+                            }
                             false
                         }
                     }
@@ -702,14 +955,39 @@ pub fn run() {
         })
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
-                crate::platform::window_startup::activate_main_window(window);
+                crate::platform::window_startup::activate_main_window(window, "single_instance");
             }
         }))
         .plugin(startup_probe_plugin("startup-probe-single-instance"))
         .plugin(tauri_plugin_notification::init())
         .plugin(startup_probe_plugin("startup-probe-notification"))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(startup_probe_plugin("startup-probe-dialog"))
+        .plugin(startup_probe_plugin("startup-probe-dialog"));
+    // System-wide bring-to-front shortcut (off by default, opt-in like the
+    // voice shortcut; default accelerator Ctrl/Cmd+Alt+P when enabled —
+    // configurable in settings). Registered ONLY on sessions where it can
+    // actually work: on Wayland the X11 grabs behind the plugin would be
+    // silently dead (XWayland's X server receives no system-wide keys), and
+    // with no X server to connect to at all the plugin's manager thread
+    // cannot attach (its connection failure is swallowed on that thread, so
+    // every later register would silently no-op rather than error — on Linux
+    // manager creation itself is infallible, which is exactly why a dead
+    // registration would go unnoticed). The same availability flag gates
+    // every later apply (`features::global_shortcut`), so plugin presence and
+    // the feature gate can never disagree.
+    // No plugin-level handler here: it would fire for ANY shortcut registered
+    // on this shared plugin. Scoping is bound per shortcut at registration
+    // time — `features::global_shortcut` registers through `on_shortcut`,
+    // whose handler triggers strictly on Pressed (Released stays a no-op) and
+    // only for the combo that registration created.
+    let builder = if crate::platform::capabilities::current().global_shortcuts_available {
+        builder
+            .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+            .plugin(startup_probe_plugin("startup-probe-global-shortcut"))
+    } else {
+        builder
+    };
+    let builder = builder
         .on_page_load(|webview, payload| {
             startup::mark_with_detail(
                 "rust",
@@ -719,6 +997,19 @@ pub fn run() {
         })
         .setup(|app| {
             startup::mark("setup:start");
+            // The disabled_bundles migration verdict must be frozen here: the
+            // broad upgrade signal (settings.json/session dirs exist ⇒ upgrade
+            // install) gets polluted by bridge boot's first-startup behavior
+            // (ensure_dirs writes sessions/default/artifacts/ itself and
+            // backfills a default settings.json); if a fresh install's first
+            // read happens after those writes, it is misjudged as an upgrade
+            // and flips back to the old AllowAll-everything posture (review
+            // #455 blocking item). This read triggers the migration and
+            // persists the frozen fresh-vs-upgrade verdict, ahead of every
+            // first-startup write.
+            startup::mark("disabled_bundles_migration:start");
+            crate::features::marketplace::scope::load_disabled_bundles_startup_mirrored();
+            startup::mark("disabled_bundles_migration:done");
             if let Ok(resource_dir) = app.path().resource_dir() {
                 crate::platform::paths::set_runtime_resource_dir(resource_dir);
             }
@@ -730,14 +1021,48 @@ pub fn run() {
             features::browser::install_automation_context(app);
             #[cfg(target_os = "macos")]
             features::updater::cleanup_stale_backup();
+            // Attach the logging backend in ALL builds, not just debug: without
+            // it every log:: line — connector and updater failure causes among
+            // them — is a no-op in release and the raw cause of a failure is
+            // lost. LogDir is the OS-standard per-app log directory and the
+            // plugin's default rotation keeps the file bounded (KeepOne, 40KB).
+            // The Stdout target is debug-only: packaged Windows runs without a
+            // console (`windows_subsystem = "windows"`), where stdout writes
+            // fail and fern's error fallback then panics the logging thread
+            // and starves the file target chained after it — release runs
+            // everywhere read the file instead, terminal dev runs keep stdout.
+            // An unusable log directory must not take boot down, so an attach
+            // failure only leaves a best-effort stderr note and startup
+            // continues without the backend.
+            let mut log_targets = vec![tauri_plugin_log::Target::new(
+                tauri_plugin_log::TargetKind::LogDir { file_name: None },
+            )];
             if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ));
+            }
+            if let Err(e) = app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .targets(log_targets)
+                    .build(),
+            ) {
+                // Best-effort only: `eprintln!` panics when the stderr write
+                // fails (no console on packaged Windows), and a panic inside
+                // setup takes boot down — the exact scenario this arm exists
+                // to survive.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[pinvou3] failed to attach the logging plugin: {e}"
+                );
             }
             startup::mark("setup:plugins_ready");
+            // Log-attached; only now can a log::warn! reach the log file. The
+            // degraded-XWayland-session diagnostic is emitted here instead of
+            // inside capabilities::current(), whose first call (builder
+            // construction) runs before any logger exists.
+            crate::platform::capabilities::warn_if_global_shortcut_session_is_ambiguous();
             crate::platform::window_startup::arm_hidden_main_window_fallback(app.handle());
 
             // Linux webview(webkit2gtk)默认拒绝 getUserMedia,语音输入点麦克风会被拒。
@@ -825,7 +1150,11 @@ pub fn run() {
                     }
                 }));
             }
-            app.handle().manage(projects_store);
+            app.handle().manage(projects_store.clone());
+            // Round-21 M1: the workspace-roots delivery resolver exempts
+            // ancestors backed by the owning project's registered roots, so
+            // it needs the projects store alongside the two binding stores.
+            let projects_for_roots_resolver = projects_store.clone();
             let remote_control_manager = RemoteControlManager::new(app.handle().clone());
             let remote_event_transport = remote_control_manager.clone();
             let remote_event_endpoint = remote_control_manager.clone();
@@ -834,8 +1163,6 @@ pub fn run() {
                 move || remote_event_endpoint.has_active_web_transport(),
             ));
             app.handle().manage(remote_control_manager.clone());
-            app.handle()
-                .manage(features::behavior_telemetry::BehaviorTelemetry::new());
             // 多 session 并发:存 EnginePool(lazy spawn,首条消息才为该 session 起 engine)。
             // boot bridge 在 pool::new 里做一次(写盘 / 设 env 只能一次)。
             let handle = app.handle().clone();
@@ -871,10 +1198,10 @@ pub fn run() {
                     app.handle().clone(),
                     store_for_engine.clone(),
                 );
-                spawn_orphaned_session_browser_reconciliation(
+                tauri::async_runtime::spawn(reconcile_orphaned_session_browser_files_until_success(
                     app.handle().clone(),
                     store_for_engine.clone(),
-                );
+                ));
             }
             // 原生代码会话的执行根解析需要共享 AcpPool 持有的 SessionAgentStore
             // （多实例各自读盘，只有这份 clone 与 AcpPool 同一份 Arc）。
@@ -984,6 +1311,16 @@ pub fn run() {
                     // marketplace / knowledge changes) recompute against the
                     // same current flag state.
                     computer_use_shared.add_to_disallow_list_when_disabled(&mut tools);
+                    // Base automation tools are dead in app sessions: the
+                    // foundation `automation`/`send_later` tools are registered
+                    // in the engine's tool catalog but their AutomationManager
+                    // is never attached here, so every call fails with
+                    // "AutomationManager is not attached". Leaving them visible
+                    // only invites the model to retry the dead path instead of
+                    // the working app-automations MCP tool. (`tasks`/`github`
+                    // stay untouched — out of scope.)
+                    tools.push("automation".to_string());
+                    tools.push("send_later".to_string());
                     tools
                 })
             };
@@ -1018,9 +1355,23 @@ pub fn run() {
                     pool.bridge
                         .set_execution_root_resolver(execution_root_resolver.clone());
                     store_for_engine.set_execution_root_resolver(execution_root_resolver);
-                    pool.bridge.set_code_session_predicate(std::sync::Arc::new({
+                    let code_session_predicate: crate::features::sessions::CodeSessionPredicate =
+                        std::sync::Arc::new({
+                            let agents = code_session_agents.clone();
+                            move |session_id: &str| agents.is_code_session(session_id)
+                        });
+                    pool.bridge
+                        .set_code_session_predicate(code_session_predicate.clone());
+                    // Keychain snapshot (§6) resolution: code/ACP sessions read the session-agents
+                    // record, purely bound sessions read the workspace-binding sidecar; neither
+                    // side = single root (the base normalizes by cwd).
+                    pool.bridge.set_workspace_roots_resolver(std::sync::Arc::new({
                         let agents = code_session_agents.clone();
-                        move |session_id: &str| agents.is_code_session(session_id)
+                        let store = store_for_engine.clone();
+                        let projects = projects_for_roots_resolver.clone();
+                        move |session_id: &str| {
+                            compose_workspace_roots(&agents, &store, &projects, session_id)
+                        }
                     }));
                     pool.bridge
                         .set_external_acp_session_predicate(std::sync::Arc::new({
@@ -1029,10 +1380,7 @@ pub fn run() {
                         }));
                     // sessions feature 自己的 code 判定（mode 默认值解析 + 仅 code
                     // 持久化），与 bridge 共用同一份 SessionAgentStore 闭包。
-                    store_for_engine.set_code_session_predicate(std::sync::Arc::new({
-                        let agents = code_session_agents.clone();
-                        move |session_id: &str| agents.is_code_session(session_id)
-                    }));
+                    store_for_engine.set_code_session_predicate(code_session_predicate.clone());
                     // SessionStore::delete and deep deletion paths without
                     // an app handle (retention policy/scheduled cleanup)
                     // clear process-level per-session keys uniformly via
@@ -1044,17 +1392,30 @@ pub fn run() {
                     // place; if unmanaged (very early deletions) the item is
                     // skipped.
                     let app_for_purge_hook = handle.clone();
+                    let agents_index_for_purge_hook = code_session_agents.clone();
                     store_for_engine
                         .register_session_purged_hook(std::sync::Arc::new(move |session_id: &str| {
+                            // Drop the codex_acp agents-index entry as well —
+                            // see `remove_agents_index_entry`.
+                            crate::remove_agents_index_entry(
+                                &agents_index_for_purge_hook,
+                                session_id,
+                            );
                             crate::features::assistant::timing::clear_session(session_id);
                             crate::features::assistant::pending_user_input::clear_session(
                                 session_id,
                             );
                             crate::features::memory::discard_turn_capture(session_id);
+                            // The computer-use audit trail is per-session
+                            // metadata about what the agent did on the user's
+                            // screen. Nothing else ever removed it, so a
+                            // deleted session kept its behavioural record on
+                            // disk indefinitely.
+                            crate::features::computer_use::remove_session_audit(session_id);
                             // Self-metrics accumulate per session key
-                            // (warmed_sessions inserts on every TurnComplete
-                            // and is never reclaimed); clear the keys on
-                            // deletion.
+                            // (inflight entries are inserted on TurnStarted
+                            // and only cleared on TurnComplete/abort); clear
+                            // the key on deletion.
                             if let Some(metrics) = app_for_purge_hook
                                 .try_state::<crate::features::monitor::MonitorState>()
                                 .map(|state| state.self_metrics())
@@ -1064,15 +1425,13 @@ pub fn run() {
                         }));
                     // 远程端正式支持代码会话之前，先过滤原生代码会话事件（与 Engine
                     // bridge 共用同一份 SessionAgentStore 判定）。
-                    remote_control_manager.set_code_session_predicate(std::sync::Arc::new({
-                        let agents = code_session_agents.clone();
-                        move |session_id: &str| agents.is_code_session(session_id)
-                    }));
+                    remote_control_manager.set_code_session_predicate(code_session_predicate);
                     let scheduled_state = tauri::async_runtime::block_on(
                         scheduled_tasks::ScheduledTaskState::boot_runtime(
                             &pool.bridge,
                             pool.clone(),
                             store_for_engine.clone(),
+                            &handle,
                         ),
                     );
                     match scheduled_state {
@@ -1089,6 +1448,19 @@ pub fn run() {
                     // （回到 lazy spawn 语义，下次发消息重建 + 注水历史）。
                     pool.start_idle_reaper();
                     eprintln!("[pinvou3-app] engine pool ready (lazy spawn per session)");
+                    // Cross-session messaging delivery watcher
+                    // (features::messaging): drains the spool backlog written
+                    // by the session-reader MCP server
+                    // (send_message_to_session), then polls. The watcher
+                    // consults the session-messaging feature switch every
+                    // poll (switch off pauses delivery) and gates
+                    // ACP/code-session targets through the shared AcpPool.
+                    // The app lifetime is the watcher lifetime.
+                    features::messaging::spawn_delivery_watcher(
+                        pool.clone(),
+                        acp_pool_for_capabilities.clone(),
+                        store_for_engine.clone(),
+                    );
                     match remote_control_manager.resume() {
                         Ok(true) => eprintln!("[pinvou3-app] persistent Web access resumed"),
                         Ok(false) => {}
@@ -1104,14 +1476,28 @@ pub fn run() {
             startup::mark("engine_pool:done");
 
             // 技能/工具开关 scope 治理(已收敛为 disabled_bundles.json):启动时
-            //   1. 读一次 disabled_bundles.json——触发旧双文件迁移(disabled_connectors
-            //      .json / disabled_skills.json → 包 id × SessionMode 单一禁用集);
-            //   2. 退役进程级全局 DISABLED_SKILLS(过滤职责移交组合目录,组合目录
-            //      空 → 整个 `## Skills` 块不渲染,路径泄露面随之封闭)。
+            //   1. Read disabled_bundles.json once — the legacy two-file
+            //      migration (disabled_connectors.json / disabled_skills.json →
+            //      a single disabled set keyed by package id × SessionMode) and
+            //      the fresh-vs-upgrade verdict freeze already happened at the
+            //      top of the setup hook (must precede bridge boot's
+            //      first-startup writes; see the disabled_bundles_migration
+            //      marks); this is an idempotent re-read.
+            // (Retiring the process-global DISABLED_SKILLS already landed on
+            // main; an empty composite dir → the whole `## Skills` block is
+            // not rendered, closing the path-leak surface.)
             // 组合目录的物化在 engine spawn 时按会话进行(build_engine_config 注入
             // skills_dir 指向 ~/.pinvou3/sessions/<sid>/skills/)。
             startup::mark("disabled_skills:start");
-            let _ = crate::features::marketplace::scope::load_disabled_bundles();
+            // Fully locked on purpose: a try-locked hot read cannot persist the
+            // freeze/recovery verdicts, so this re-read is the second chance to
+            // persist them if the hoisted read degraded under peer contention
+            // (the unbounded flock wait is the documented fail-stop boot
+            // tradeoff). A persist failure on this read is mirrored by the
+            // shared helper onto the timeline: the hoisted read's success does
+            // not cover a failure developing in between, and this mirror is
+            // the only durable channel that can name it.
+            crate::features::marketplace::scope::load_disabled_bundles_startup_mirrored();
             startup::mark("disabled_skills:done");
 
             // Monitor 按需采样：state 只持有 session_uptime，sample 由前端调
@@ -1158,10 +1544,10 @@ pub fn run() {
                 Ok(svc) => {
                     app.handle().manage(svc);
                     eprintln!("[pinvou3-app] knowledge service ready");
+                    startup::mark("knowledge_service:done");
                 }
-                Err(e) => eprintln!("[pinvou3-app] knowledge service init failed: {e:#}"),
+                Err(e) => mark_knowledge_service_failed(&e),
             }
-            startup::mark("knowledge_service:done");
 
             match RemoteKnowledgeService::load(RemoteKnowledgeService::default_path()) {
                 Ok(service) => {
@@ -1183,9 +1569,18 @@ pub fn run() {
             // Startup replay: settings.json's voice_shortcut_enabled is the
             // authoritative persistence of the switch (frontend localStorage is
             // only a mirror); sync it into the native-layer AtomicBool right
-            // after the hook is installed.
-            crate::features::voice_shortcut::set_enabled(
-                crate::platform::prefs::UserPrefs::load().voice_shortcut_enabled,
+            // after the hook is installed. One shared load serves both this
+            // and the global-shortcut replay below.
+            let prefs = crate::platform::prefs::UserPrefs::load();
+            crate::features::voice_shortcut::set_enabled(prefs.voice_shortcut_enabled);
+
+            // System-wide bring-to-front shortcut: same replay shape. A parse
+            // failure or register conflict (another app owns the combination)
+            // logs and continues — startup must never fail over the shortcut.
+            crate::features::global_shortcut::install(app.handle().clone());
+            crate::features::global_shortcut::apply_saved_settings(
+                prefs.global_shortcut_enabled,
+                &prefs.global_shortcut_accelerator,
             );
 
             startup::mark("setup:done");
@@ -1214,7 +1609,6 @@ pub fn run() {
             commands::checkpoints::rewind_to_turn,
             commands::checkpoints::rewind_undo_state,
             commands::checkpoints::undo_last_rewind,
-            commands::behavior_telemetry::track_behavior_event,
             commands::assistant_response::export_assistant_response,
             commands::assistant_response::open_assistant_share_target,
             commands::browser::browser_stop,
@@ -1243,6 +1637,7 @@ pub fn run() {
             commands::computer_use::computer_use_confirm,
             commands::computer_use::computer_use_set_enabled,
             commands::computer_use::computer_use_request_permissions,
+            commands::computer_use::computer_use_permission_status,
             commands::connectors::refresh_connector_auth_gates,
             commands::connectors::feishu_ensure_cli,
             commands::connectors::feishu_connect_begin,
@@ -1276,14 +1671,10 @@ pub fn run() {
             commands::settings::get_effective_model_config,
             commands::settings::update_settings,
             commands::settings::update_search_settings,
-            commands::settings::save_settings_and_restart,
             commands::settings::save_search_settings_and_restart,
             commands::monitor::get_monitor_snapshot,
             commands::monitor::get_backend_status,
             commands::monitor::discover_local_vllm,
-            commands::local_llm::detect_local_vllm_setup,
-            commands::local_llm::bootstrap_local_vllm,
-            commands::local_llm::decline_local_vllm_setup,
             commands::settings::list_models,
             commands::settings::reveal_model_api_key,
             commands::settings::probe_local_server_kind,
@@ -1348,11 +1739,15 @@ pub fn run() {
             commands::voice::cancel_voice_asr,
             commands::voice::set_voice_shortcut_enabled,
             commands::voice::set_voice_shortcut_recording,
+            commands::global_shortcut::set_global_shortcut_config,
             commands::projects::list_projects,
             commands::projects::create_project,
             commands::projects::update_project,
             commands::projects::delete_project,
             commands::projects::move_session_to_project,
+            commands::projects::ensure_folder_projects,
+            commands::projects::projects_set_never_materialize,
+            commands::projects::align_session_to_project,
             commands::projects::rebind_workspace_root,
             commands::sessions::list_sessions,
             commands::sessions::create_session,
@@ -1364,6 +1759,8 @@ pub fn run() {
             commands::sessions::set_session_pinned,
             commands::sessions::list_archived_sessions,
             commands::sessions::set_session_archived,
+            commands::sessions::get_or_create_aux_session,
+            commands::sessions::reset_aux_session,
             commands::timeline::get_session_timeline,
             commands::scheduled::list_scheduled_tasks,
             commands::scheduled::read_scheduled_task,
@@ -1392,7 +1789,6 @@ pub fn run() {
             commands::remote_control::web_access_status,
             commands::remote_control::web_access_rotate,
             commands::remote_control::web_access_relay_settings,
-            commands::remote_control::web_access_set_relay,
             commands::remote_control::web_access_bridge_ready,
             commands::remote_control::web_access_rpc_begin,
             commands::remote_control::web_access_rpc_respond,
@@ -1439,6 +1835,7 @@ pub fn run() {
             commands::remote_control::web_access_read_artifact_image_b64,
             commands::remote_control::web_access_read_artifact_thumbnail,
             commands::remote_control::web_access_render_artifact_visual,
+            commands::connectors::enable_marketplace_packages,
             commands::connectors::set_disabled_connectors,
             commands::connectors::get_disabled_connectors,
             commands::connectors::set_bundle_visibility,
@@ -1462,6 +1859,7 @@ pub fn run() {
             commands::artifacts::read_artifact_text,
             commands::artifacts::write_artifact_text,
             commands::artifacts::list_deliverable_index,
+            commands::artifacts::list_deliverable_index_v2,
             commands::artifacts::artifact_info,
             commands::artifacts::render_artifact_visual,
             commands::artifacts::read_artifact_image_b64,
@@ -1473,7 +1871,6 @@ pub fn run() {
             commands::artifacts::open_artifact_window,
             commands::pet::begin_detach_drag,
             commands::pet::set_pet_enabled,
-            commands::pet::get_pet_scale,
             commands::pet::set_pet_scale,
             commands::pet::set_pet_activity_visible,
             commands::pet::save_pet_position,
@@ -1495,6 +1892,7 @@ pub fn run() {
             commands::files::open_conversation_attachment,
             commands::files::reveal_conversation_attachment,
             commands::files::save_paste_image,
+            commands::files::paste_clipboard_image,
             commands::interaction::compact_now,
             commands::interaction::get_mode_state,
             commands::interaction::get_code_permission_prefs,
@@ -1542,6 +1940,8 @@ pub fn run() {
             commands::marketplace::start_marketplace_tool_oauth_login,
             commands::marketplace::cancel_marketplace_tool_oauth_login,
             commands::marketplace::uninstall_marketplace_tool,
+            commands::builtin::list_builtin_features,
+            commands::builtin::set_builtin_feature_enabled,
             commands::artifacts::detect_obsidian,
             commands::knowledge::kb_start_scan,
             commands::knowledge::kb_scan_status,
@@ -1662,7 +2062,9 @@ pub fn run() {
             // On main-process exit, refresh browser URL restore manifests, destroy
             // in-app native WebViews, and clean runtime targets/endpoints. Preserve
             // restore manifests; there is no external Chrome process.
-            shutdown_browser_before_process_end(app);
+            if let Some(browser) = app.try_state::<features::browser::BrowserManager>() {
+                browser.shutdown_on_exit();
+            }
             // Exit semantics preserve the latest restore manifest. Do not asynchronously
             // call ordinary stop() here: if shutdown_on_exit skips explicit close because
             // of lock contention, a late stop could acquire the lock and delete restore
@@ -1681,6 +2083,180 @@ pub fn run() {
         _ => {}
     });
     startup::mark("process:exit");
+}
+
+#[cfg(test)]
+mod startup_order_contract {
+    /// Order pin (review #455 non-blocking item 3; three rounds in, switched
+    /// to a source-position assertion): the disabled_bundles migration read
+    /// (which freezes the fresh-vs-upgrade verdict) must run, in all three
+    /// hosts' startup hooks, ahead of the first first-startup write
+    /// (SessionStore boot creating the sessions/ dir entries; bridge boot
+    /// backfilling the default settings.json). Statement order cannot be
+    /// observed from inside the module, and assertions over a self-built mark
+    /// trace prove nothing (reordering the real setup hook would not fail
+    /// them), so this reads the three host sources directly via
+    /// `include_str!` and pins the **textual position** of the migration-read
+    /// call site ahead of the boot call site.
+    fn assert_migration_read_precedes(source: &str, earlier: &str, later: &str, file: &str) {
+        let pos_earlier = source
+            .find(earlier)
+            .unwrap_or_else(|| panic!("{file} is missing the migration-read call site: {earlier}"));
+        let pos_later = source.find(later).unwrap_or_else(|| {
+            panic!("{file} is missing the first-boot self-write call site: {later}")
+        });
+        assert!(
+            pos_earlier < pos_later,
+            "{file}: the migration read ({earlier}) must precede the first-boot self-write ({later})"
+        );
+    }
+
+    #[test]
+    fn disabled_bundles_migration_read_precedes_first_boot_writes() {
+        // GUI host: the migration read at the top of the setup hook precedes
+        // the SessionStore boot. The needle pins the hoist call itself — the
+        // shared mirrored startup read — (fragment-concatenated to prevent a
+        // self-match — this test lives in the same lib.rs as the production
+        // call site, and include_str! scans the test module too, so a full
+        // needle appearing verbatim in the test would degenerate into a
+        // self-match). The old leg pinning the startup
+        // marks on both sides only preserved the mark sandwich: deleting or
+        // moving the hoist call between the two marks still passed (review
+        // #455 R5-S1). The later needle pins the
+        // `SessionStore::boot_for_process_startup` call itself rather than
+        // the adjacent startup-mark proxy (review #455 R8 nit). `find` takes
+        // the first occurrence: the guarded regression is "hoist deleted or
+        // reordered" (the needle's first occurrence lands after the boot;
+        // deletion fails the test outright, and it is not a self-match);
+        // deleting the boot call itself is **not** guarded — the same-named
+        // call in the panic fallback branch still hits the needle (round-10
+        // nit wording made accurate).
+        assert_migration_read_precedes(
+            include_str!("lib.rs"),
+            &[
+                "crate::features::marketplace::scope::load_disabled_bundles_startup_",
+                "mirrored()",
+            ]
+            .concat(),
+            &["SessionStore::", "boot_for_process_startup()"].concat(),
+            "lib.rs",
+        );
+        // Windowless hosts (agentic/headless): same-order freeze ahead of the
+        // SessionStore boot.
+        assert_migration_read_precedes(
+            include_str!("features/assistant/product_runtime/headless_bridge.rs"),
+            &[
+                "marketplace::scope::load_disabled_bundles_startup_",
+                "mirrored()",
+            ]
+            .concat(),
+            "SessionStore::boot()",
+            "headless_bridge.rs",
+        );
+        // dump_system_prompt tool: same-order freeze ahead of bridge.boot()
+        // (ensure_dirs / default settings.json first-startup writes).
+        assert_migration_read_precedes(
+            include_str!("bin/dump_system_prompt.rs"),
+            "load_disabled_bundles_startup()",
+            "Pinvou3Bridge::boot()",
+            "dump_system_prompt.rs",
+        );
+    }
+
+    /// The freeze-persist failure mirror is the only durable channel naming
+    /// the failure before the log plugin attaches (the windowless host
+    /// attaches none at all). lib.rs must keep the mirrored startup read at
+    /// BOTH startup sites (the hoisted freeze and the second-chance
+    /// re-read); headless keeps one. Needle assembled from fragments so this
+    /// test module's own source (scanned together with lib.rs) cannot
+    /// self-match.
+    #[test]
+    fn freeze_persist_failures_mirror_onto_the_startup_timeline_in_every_host() {
+        let mirrored_read = ["load_disabled_bundles_startup_", "mirrored()"].concat();
+        let gui_mirrors = include_str!("lib.rs").matches(&mirrored_read).count();
+        assert!(
+            gui_mirrors >= 2,
+            "lib.rs must keep the mirrored startup read at BOTH startup sites (the hoisted freeze and the second-chance re-read): found {gui_mirrors}"
+        );
+        let headless_mirrors =
+            include_str!("features/assistant/product_runtime/headless_bridge.rs")
+                .matches(&mirrored_read)
+                .count();
+        assert_eq!(
+            headless_mirrors, 1,
+            "headless_bridge.rs must keep its mirrored startup read (this host attaches no log plugin)"
+        );
+        // The console bin mirrors via eprintln (the
+        // startup timeline is pub(crate) and this host has no window at all);
+        // deleting that mirror passed every leg — pin it. The wording lives
+        // once in scope's FREEZE_PERSIST_FAILURE_NOTICE (every host mirror
+        // shares it), so pin both halves: the const keeps the message text,
+        // and the bin still references the const from its eprintln.
+        let mirror_needle = [
+            "CRITICAL: the fresh-vs-",
+            "upgraded verdict could not be persisted",
+        ]
+        .concat();
+        let const_carries_text = include_str!("features/marketplace/scope.rs")
+            .matches(&mirror_needle)
+            .count();
+        assert!(
+            const_carries_text >= 1,
+            "scope.rs must keep the freeze-persist failure notice wording (every host mirror shares it)"
+        );
+        let bin_mirrors = include_str!("bin/dump_system_prompt.rs")
+            .matches("FREEZE_PERSIST_FAILURE_NOTICE")
+            .count();
+        assert!(
+            bin_mirrors >= 1,
+            "dump_system_prompt.rs must keep its freeze-persist failure eprintln mirror (this host has neither window nor log plugin)"
+        );
+    }
+
+    /// Wiring pin for the ghost-session fix's root-cause leg: the purge
+    /// hook's agents-index leg must capture the store derived from
+    /// `AcpPool::new` (`pool.agents().clone()`), never a second
+    /// `SessionAgentStore` instance over the same file — a second instance
+    /// would rewrite `session-agents.json` from its own memory on every
+    /// purge, clobbering concurrent binds. Textual pin like the legs above
+    /// (needles fragment-concatenated against self-match, `find` takes the
+    /// first = production occurrence): deleting the capture, swapping it
+    /// for an independent `SessionAgentStore::load_or_empty`, or swapping
+    /// the `pool.agents()` binding itself for an independent instance all
+    /// fail here.
+    #[test]
+    fn purge_hook_captures_the_pool_agents_store() {
+        let source = include_str!("lib.rs");
+        let capture = source
+            .find(
+                &[
+                    "let agents_index_for_purge_hook = code_session_",
+                    "agents.clone();",
+                ]
+                .concat(),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "lib.rs is missing the purge-hook agents-index capture from code_session_agents"
+                )
+            });
+        let agents_binding = source
+            .find(&["let agents = pool.", "agents().clone();"].concat())
+            .unwrap_or_else(|| {
+                panic!("lib.rs is missing the pool agents binding for the purge hook")
+            });
+        let pool_binding = source
+            .find(&["let (code_session_", "agents, acp_pool_for_capabilities)"].concat())
+            .unwrap_or_else(|| panic!("lib.rs is missing the AcpPool agents binding"));
+        assert!(
+            agents_binding < capture,
+            "the purge hook's store must be cloned from the AcpPool's agents store, not an independent instance"
+        );
+        assert!(
+            pool_binding < capture,
+            "the purge hook must capture the store derived from AcpPool::new (pool.agents()), not an independent instance"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1817,6 +2393,10 @@ mod tool_allowlist_contract {
             "file_search",
             "registry_sync",
             "start_registry_mcp_server",
+            // The computer-use instruction section (computer_use::
+            // instruction_block, rendered while the master switch is on)
+            // names the tool directly, so it must ship non-deferred.
+            crate::features::computer_use::TOOL_NAME,
         ] {
             assert!(
                 PINVOU3_ALWAYS_LOADED_TOOLS.contains(&load_bearing),
@@ -1902,29 +2482,92 @@ mod tool_allowlist_contract {
 
 #[cfg(test)]
 mod navigation_policy_tests {
+    use super::{MainNavigationVerdict, decide_main_navigation};
+
+    fn allow_origin(verdict: MainNavigationVerdict) -> Option<String> {
+        match verdict {
+            MainNavigationVerdict::Allow { initial_origin } => initial_origin,
+            MainNavigationVerdict::Block { .. } => panic!("expected Allow, got Block"),
+        }
+    }
+
+    fn block_detail(verdict: MainNavigationVerdict) -> Option<String> {
+        match verdict {
+            MainNavigationVerdict::Block { detail } => detail,
+            MainNavigationVerdict::Allow { .. } => panic!("expected Block, got Allow"),
+        }
+    }
+
+    const MAIN_ORIGIN: &str = "tauri://localhost:-";
+
     #[test]
-    fn embedded_srcdoc_navigation_is_allowed_without_broadening_schemes() {
+    fn embedded_srcdoc_navigation_is_allowed_after_main_origin() {
+        // Regression: `iframe[srcdoc]` (the HTML artifact preview carrier)
+        // surfaces as an about:srcdoc navigation of the host webview on
+        // engines that forward subframe navigations (WKWebView, WebKitGTK).
+        // PR #116 unblocked it on Linux only; on macOS the guard denied it
+        // and the preview stayed a black placeholder forever.
         for allowed in ["about:blank", "about:srcdoc"] {
             let url = tauri::Url::parse(allowed).unwrap();
-            assert!(super::allow_embedded_document_navigation(&url, true));
+            let verdict = decide_main_navigation(&url, Some(MAIN_ORIGIN));
             assert!(
-                !super::allow_embedded_document_navigation(&url, false),
-                "embedded documents must not become the initial main origin"
+                allow_origin(verdict).is_none(),
+                "embedded documents must not overwrite the main origin: {allowed}"
             );
         }
+    }
+
+    #[test]
+    fn embedded_documents_must_not_become_the_initial_main_origin() {
+        for allowed in ["about:blank", "about:srcdoc"] {
+            let url = tauri::Url::parse(allowed).unwrap();
+            let verdict = decide_main_navigation(&url, None);
+            assert!(
+                block_detail(verdict).is_none(),
+                "pre-baseline embedded documents are denied silently: {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_main_frame_navigation_records_baseline_origin() {
+        let url = tauri::Url::parse("tauri://localhost/").unwrap();
+        let recorded = allow_origin(decide_main_navigation(&url, None))
+            .expect("first navigation must establish the baseline");
+        assert_eq!(recorded, MAIN_ORIGIN);
+    }
+
+    #[test]
+    fn same_origin_navigation_is_allowed_without_re_recording_baseline() {
+        let url = tauri::Url::parse("tauri://localhost/index.html").unwrap();
+        assert!(allow_origin(decide_main_navigation(&url, Some(MAIN_ORIGIN))).is_none());
+    }
+
+    #[test]
+    fn external_origins_still_blocked_after_baseline() {
         for blocked in [
-            "about:config",
-            "about:blank?next=https://example.com",
-            "data:text/html,hello",
             "https://example.com/",
             "file:///etc/passwd",
+            "data:text/html,hello",
         ] {
             let url = tauri::Url::parse(blocked).unwrap();
+            let detail = block_detail(decide_main_navigation(&url, Some(MAIN_ORIGIN)))
+                .unwrap_or_else(|| panic!("external origin must stay blocked: {blocked}"));
             assert!(
-                !super::allow_embedded_document_navigation(&url, true),
-                "must not classify as embedded document: {blocked}"
+                detail.contains("scheme="),
+                "block detail carries the startup diagnostic: {detail}"
             );
         }
+    }
+
+    #[test]
+    fn about_variants_do_not_match_the_embedded_allowlist() {
+        // Exact-string allowlist: query-bearing or unrelated about: URLs fall
+        // through to the origin baseline and are denied there.
+        let url = tauri::Url::parse("about:blank?next=https://example.com").unwrap();
+        assert!(block_detail(decide_main_navigation(&url, Some(MAIN_ORIGIN))).is_some());
+        let url = tauri::Url::parse("about:config").unwrap();
+        assert!(block_detail(decide_main_navigation(&url, Some(MAIN_ORIGIN))).is_some());
     }
 }
 
@@ -2213,6 +2856,104 @@ mod release_env_defaults_guard {
         // 退出时 EnvSnapshot::drop 按快照完整还原（含 PATH / UI env / 常量表变量）。
     }
 
+    /// PATH assembly order guard: lock-pinned versioned CLI asset dirs must
+    /// precede the legacy `connectors/<platform>/bin/` dir. A stale old-version
+    /// binary left in the legacy dir must not shadow the upgraded runtime
+    /// (observed: a leftover wecom-cli 0.1.9 kept running after the upgrade to
+    /// 1.2.1); the legacy dir itself must stay on PATH — connectors whose
+    /// pinned version is not installed resolve through it by name.
+    #[test]
+    fn release_env_path_orders_versioned_cli_dirs_before_legacy_bin() {
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _snapshot = EnvSnapshot::take();
+
+        // The PATH branch only runs when var_os("PATH") exists; set a sentinel
+        // first so the assertions cover exactly what ensure_release_env
+        // assembled. PINVOU3_HOME is repointed at a nonexistent test path —
+        // directory existence plays no part in PATH assembly.
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line); env writes serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", "/tmp/pinvou3-path-order-test") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+        super::ensure_release_env();
+
+        let path = std::env::var_os("PATH").expect("ensure_release_env must rewrite PATH");
+        let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+        // 软跳过仅限真正不支持的架构；受支持平台上 wrapper 回归会在此硬断言
+        // 失败（契约见 platform::test_support 同名 helper）。
+        let Some(legacy) =
+            crate::platform::test_support::managed_connector_bin_dir_or_assert_unsupported()
+        else {
+            return;
+        };
+        let legacy_idx = dirs
+            .iter()
+            .position(|d| d == &legacy)
+            .expect("legacy bin dir must stay on PATH for not-yet-migrated binaries");
+        let pins = crate::platform::connector_lock::all_artifact_pins();
+        assert!(
+            !pins.is_empty(),
+            "test platform lock must pin at least one CLI artifact"
+        );
+        for (name, pin) in &pins {
+            let versioned = crate::platform::paths::assets_cli_dir(&name, &pin.version);
+            let idx = dirs
+                .iter()
+                .position(|d| d == &versioned)
+                .unwrap_or_else(|| panic!("versioned {name} asset dir must be on PATH"));
+            assert!(
+                idx < legacy_idx,
+                "versioned {name} dir must precede the legacy bin dir (stale legacy binaries must not shadow the pinned runtime)"
+            );
+        }
+        // EnvSnapshot::drop restores the full snapshot on exit (PATH / PINVOU3_HOME included).
+    }
+
+    /// PATH assembly must honor both npm prefix spellings: npm reads
+    /// NPM_CONFIG_PREFIX and npm_config_prefix alike, and a lowercase-only
+    /// setup (the shape commit 132cd4be9 fixed for the posix vendor-CLI scan
+    /// in platform/os/posix.rs) must still get its `<prefix>/bin` onto the
+    /// child-process PATH — a shim npm lands there must stay resolvable by
+    /// name for every PATH-based consumer this env serves.
+    #[test]
+    fn release_env_path_reads_lowercase_npm_config_prefix() {
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _snapshot = EnvSnapshot::take();
+
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-npm-prefix-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create prefix bin dir");
+        // The PATH branch only runs when var_os("PATH") exists; set a sentinel
+        // and set ONLY the lowercase spelling (uppercase removed) so the
+        // assertion covers exactly the two-spelling read.
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line); env writes serialized.
+        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::remove_var("NPM_CONFIG_PREFIX") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::set_var("npm_config_prefix", &root) };
+        super::ensure_release_env();
+
+        let path = std::env::var_os("PATH").expect("ensure_release_env must rewrite PATH");
+        let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+        assert!(
+            dirs.contains(&bin_dir),
+            "lowercase-only npm_config_prefix must still put <prefix>/bin on the child PATH (dirs: {dirs:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        // EnvSnapshot::drop restores the full snapshot on exit (both npm
+        // prefix spellings included).
+    }
+
     /// `startup_process_env` is the sole injection funnel for
     /// `PINVOU3_SESSION_ARTIFACTS` (bridge boot runs in the multi-threaded
     /// phase and must not write the process env; see the dual assertion in
@@ -2249,5 +2990,705 @@ mod release_env_defaults_guard {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(test)]
+    mod workspace_roots_resolver_tests {
+        use crate::compose_workspace_roots;
+
+        #[test]
+        fn workspace_roots_resolver_prefers_the_agents_record() {
+            // Round-13 M4: the composition priority is the feature's delivery
+            // contract — an agents record (code/ACP) is authoritative, the plain
+            // binding sidecar is the fallback, both empty = single-root. As an
+            // inline closure this went unpinned (deleting the agents branch kept
+            // every test green); composed through compose_workspace_roots the
+            // conflicting fixture goes red. Hermetic under ENV_LOCK + PINVOU3_HOME.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-roots-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let w = std::env::temp_dir().join("pinvou3-compose-roots-w");
+            let _ = std::fs::remove_dir_all(&w);
+            std::fs::create_dir_all(&w).unwrap();
+
+            // Both stores populated with DIFFERENT non-empty sets: the agents
+            // record wins and the plain sidecar must not leak through. The
+            // bind requires a live session record, so create it first (the id
+            // is what both stores key on).
+            let s_both = sessions
+                .create_new("s-both".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_both,
+                    w.clone(),
+                    vec![w.clone(), w.join("plain-extra")],
+                )
+                .expect("bind plain sidecar");
+            agents
+                .set_acp_workspace(
+                    &s_both,
+                    crate::features::codex_acp::AgentBackend::CodexAcp,
+                    crate::features::codex_acp::CodexWorkspaceKind::Project,
+                    Some(w.clone()),
+                    vec![w.clone(), w.join("agents-extra")],
+                )
+                .expect("seed agents record");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s_both);
+            assert!(
+                composed.iter().any(|root| root.ends_with("agents-extra")),
+                "{composed:?}"
+            );
+            assert!(
+                !composed.iter().any(|root| root.ends_with("plain-extra")),
+                "{composed:?}"
+            );
+
+            // An agents record with an EMPTY set falls back to the plain sidecar.
+            let s_conv = sessions
+                .create_new("s-conv".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            agents
+                .set_acp_workspace(
+                    &s_conv,
+                    crate::features::codex_acp::AgentBackend::CodexAcp,
+                    crate::features::codex_acp::CodexWorkspaceKind::Project,
+                    Some(w.clone()),
+                    Vec::new(),
+                )
+                .expect("seed empty agents record");
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_conv,
+                    w.clone(),
+                    vec![w.clone(), w.join("plain-only")],
+                )
+                .expect("bind plain sidecar for the fallback leg");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s_conv);
+            assert!(
+                composed.iter().any(|root| root.ends_with("plain-only")),
+                "the empty agents record must fall back to the sidecar: {composed:?}"
+            );
+
+            // Both empty = single-root (empty vector).
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, "s-none");
+            assert!(composed.is_empty());
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&w);
+        }
+
+        #[test]
+        fn workspace_roots_delivery_rechecks_soft_kept_spellings() {
+            // Round-19 minor 6: a soft-kept (nonexistent at intake) root is
+            // stored lexically; if it later materializes as a symlink to `/`
+            // or to the primary's ancestor, the per-turn canonicalizing
+            // enforcement would grant the wide target. compose_workspace_roots
+            // re-checks the two hard invariants on the canonical form of every
+            // resolvable additional root and DROPS the widening ones
+            // (fail-safe narrowing); a benign materialized root and an
+            // still-missing spelling stay delivered. Hermetic like the
+            // sibling test: ENV_LOCK + PINVOU3_HOME + own temp dirs.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir().join(format!(
+                "pinvou3-compose-recheck-home-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base = std::env::temp_dir()
+                .join(format!("pinvou3-compose-recheck-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Pin the fixture to the canonical base (projects-tests D2
+            // convention, round-21 M5): on macOS the raw /var spelling of
+            // temp_dir never prefix-matches the /private/var canonical
+            // form the re-check compares against, so the widening links
+            // would be delivered and the drop assertions panic.
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let w = base.join("ws");
+            std::fs::create_dir_all(&w).unwrap();
+
+            let s = sessions
+                .create_new("s-recheck".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            let benign = w.join("materialized");
+            std::fs::create_dir_all(&benign).unwrap();
+            let still_missing = w.join("still-missing");
+
+            #[cfg(unix)]
+            let root_link = {
+                let link = base.join("root-link");
+                std::os::unix::fs::symlink("/", &link).expect("symlink to /");
+                link
+            };
+            #[cfg(unix)]
+            let ancestor_link = {
+                let link = base.join("ancestor-link");
+                std::os::unix::fs::symlink(&base, &link).expect("symlink to the primary's parent");
+                link
+            };
+
+            // The `mut` lives inside the unix arm only: with the extend
+            // cfg'd out on Windows a plain `let mut` would trip
+            // `-D unused-mut` on the all-targets leg (the round-19 BLOCKER
+            // class — platform-conditional code must stay clean on both
+            // targets).
+            #[cfg(unix)]
+            let roots = {
+                let mut all = vec![w.clone(), benign.clone(), still_missing.clone()];
+                all.extend([root_link.clone(), ancestor_link.clone()]);
+                all
+            };
+            #[cfg(not(unix))]
+            let roots = vec![w.clone(), benign.clone(), still_missing.clone()];
+            sessions
+                .bind_session_workspace_with_roots(&s, w.clone(), roots)
+                .expect("bind sidecar");
+
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert!(
+                composed.contains(&benign),
+                "a benign materialized root stays delivered: {composed:?}"
+            );
+            assert!(
+                composed.contains(&still_missing),
+                "an unverifiable spelling keeps the soft-keep semantics: {composed:?}"
+            );
+            #[cfg(unix)]
+            {
+                assert!(
+                    !composed.contains(&root_link),
+                    "a symlink resolving to the filesystem root must be dropped at delivery: {composed:?}"
+                );
+                assert!(
+                    !composed.contains(&ancestor_link),
+                    "a symlink resolving to the primary's ancestor must be dropped at delivery: {composed:?}"
+                );
+            }
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn compose_caps_a_hand_edited_over_limit_snapshot() {
+            // Round-32 minor 12: the compose cap (round-31 minor 10) — a
+            // hand-edited 70-root sidecar displays/delivers at most the
+            // foundation ceiling (primary + 64); deleting the truncate
+            // reds this.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-cap-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base =
+                std::env::temp_dir().join(format!("pinvou3-compose-cap-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let w = base.join("ws");
+            std::fs::create_dir_all(&w).unwrap();
+            let s = sessions
+                .create_new("s-cap".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            let mut roots = vec![w.clone()];
+            for index in 0..69 {
+                roots.push(w.join(format!("extra-{index}")));
+            }
+            sessions
+                .bind_session_workspace_with_roots(&s, w.clone(), roots)
+                .expect("bind sidecar");
+
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed.len(),
+                codewhale_core::MAX_WORKSPACE_ROOTS + 1,
+                "primary + 64 = the foundation ceiling: {composed:?}"
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[test]
+        fn compose_delivers_a_project_backed_ancestor_root() {
+            // Round-21 M1: align persists `[cwd, ancestor]` when the owning
+            // project registers an ancestor of the session's cwd (§9.7, pin
+            // `align_persists_a_project_ancestor_root_by_design`; the
+            // delivery-side pin is
+            // `compose_delivers_a_project_backed_ancestor_root` below). The
+            // delivery re-check must exempt an ancestor whose canonical form
+            // matches one of the owning project's registered roots (tier-②
+            // covers the nested cwd); an unbacked ancestor — no project, or
+            // the project no longer registers the root — still drops
+            // (fail-safe narrowing, the pre-M1 behavior). Hermetic like the
+            // sibling tests: ENV_LOCK + PINVOU3_HOME + own temp dirs.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir().join(format!(
+                "pinvou3-compose-backed-home-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base = std::env::temp_dir()
+                .join(format!("pinvou3-compose-backed-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Canonical fixture base (projects-tests D2 convention): the
+            // tier-② fold-key prefix match and the exemption comparison both
+            // run on canonical spellings.
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let nested = base.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+
+            projects
+                .create_project("backed".to_string(), vec![base.clone()])
+                .expect("create backing project");
+
+            let s = sessions
+                .create_new("s-backed".to_string(), None, nested.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "a project-backed ancestor root stays delivered (align shape, §9.7): {composed:?}"
+            );
+
+            // The same keychain against a store with no project keeps the
+            // fail-safe drop — the exemption needs the backing authority.
+            let projects_empty = crate::features::projects::ProjectStore::from_paths(
+                home.join("projects-empty.json"),
+            );
+            let s_unbacked = sessions
+                .create_new("s-unbacked".to_string(), None, nested.clone())
+                .expect("create unbacked session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_unbacked,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            let composed =
+                compose_workspace_roots(&agents, &sessions, &projects_empty, &s_unbacked);
+            assert_eq!(
+                composed,
+                vec![nested.clone()],
+                "an unbacked ancestor root is still dropped at delivery: {composed:?}"
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[test]
+        fn compose_keeps_an_explicitly_granted_ancestor_across_project_mutations() {
+            // Round-40 (zhuowp P2): align persists [cwd A/sub, ancestor A]
+            // with the ancestor's provenance recorded. Removing A from the
+            // project, deleting the project, or moving the session out
+            // makes resolve_session_project return no backing root — the
+            // delivery used to drop A although the snapshot and the
+            // directories were unchanged, contradicting blueprint §6/§9.5
+            // and the remove-folder UI promise. The grant's authority is
+            // its recorded provenance, not mutable project state.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-prov-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base =
+                std::env::temp_dir().join(format!("pinvou3-compose-prov-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let nested = base.join("sub");
+            std::fs::create_dir_all(&nested).unwrap();
+
+            let project = projects
+                .create_project("granted".to_string(), vec![base.clone()])
+                .expect("create backing project");
+
+            // The align shape: keychain [nested, base] with the ancestor's
+            // provenance recorded (what
+            // set_session_workspace_roots_with_explicit_ancestors persists).
+            let s = sessions
+                .create_new("s-granted".to_string(), None, nested.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s,
+                    vec![nested.clone(), base.clone()],
+                    vec![base.clone()],
+                )
+                .expect("record provenance");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "the granted ancestor delivers while the project backs it: {composed:?}"
+            );
+
+            // Mutation 1: the project no longer registers the root.
+            projects
+                .update_project(&project.id, Some("granted".to_string()), Some(vec![]))
+                .expect("remove the root from the project");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "removing the folder from the project keeps the granted ancestor delivered                  (the snapshot promised it; the directories are unchanged): {composed:?}"
+            );
+
+            // Mutation 2: the project is gone entirely.
+            let projects_after_delete = crate::features::projects::ProjectStore::from_paths(
+                home.join("projects-after-delete.json"),
+            );
+            let composed = compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "deleting the project keeps the granted ancestor delivered: {composed:?}"
+            );
+
+            // Mutation 3 (the control): WITHOUT provenance the same
+            // mutation still drops — the exemption is the recorded grant,
+            // not the spelling's shape.
+            let s_plain = sessions
+                .create_new("s-plain".to_string(), None, nested.clone())
+                .expect("create control session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_plain,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind control sidecar");
+            let composed =
+                compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s_plain);
+            assert_eq!(
+                composed,
+                vec![nested.clone()],
+                "an ancestor with NO recorded provenance still drops without backing: {composed:?}"
+            );
+
+            // Symlink widening is still rejected (Unix leg — the fixture
+            // needs a symlink): see the cfg(unix) helper below.
+            #[cfg(unix)]
+            symlink_widened_provenance_still_drops(
+                &sessions,
+                &agents,
+                &projects_after_delete,
+                &base,
+                &nested,
+                &home,
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// Round-40 (zhuowp P2) control, Unix leg: a provenance spelling
+        /// whose CANONICAL form becomes an ancestor of the primary (the
+        /// link target contains the workspace) matches neither the
+        /// recorded provenance key nor a project backing, and drops.
+        #[cfg(unix)]
+        fn symlink_widened_provenance_still_drops(
+            sessions: &crate::features::sessions::SessionStore,
+            agents: &crate::features::codex_acp::SessionAgentStore,
+            projects: &crate::features::projects::ProjectStore,
+            base: &std::path::Path,
+            nested: &std::path::Path,
+            home: &std::path::Path,
+        ) {
+            let ancestor_target = base.parent().expect("fixture base parent");
+            let redirect = home.join("redirect");
+            std::os::unix::fs::symlink(ancestor_target, &redirect).expect("widening symlink");
+            let s_widened = sessions
+                .create_new("s-widened".to_string(), None, nested.to_path_buf())
+                .expect("create widened session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_widened,
+                    nested.to_path_buf(),
+                    vec![nested.to_path_buf(), redirect.clone()],
+                )
+                .expect("bind widened sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s_widened,
+                    vec![nested.to_path_buf(), redirect.clone()],
+                    vec![redirect.clone()],
+                )
+                .expect("record widened provenance");
+            let composed = compose_workspace_roots(agents, sessions, projects, &s_widened);
+            assert_eq!(
+                composed,
+                vec![nested.to_path_buf()],
+                "a provenance spelling that canonicalizes to a widening target still drops: {composed:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod knowledge_service_failure_tests {
+    /// A failed knowledge init must leave an `:error` line carrying the cause
+    /// on the real `startup.log` — the failure previously reached stderr only
+    /// (lost on windowed Windows builds) — and must not be bookkept as
+    /// `knowledge_service:done`, which is reserved for a successful init.
+    /// Swapping the stage name back to a success-looking or retry-promising
+    /// one, dropping the cause, or re-sharing `:done` across both arms turns
+    /// this red.
+    #[test]
+    fn failed_knowledge_init_marks_the_timeline_with_the_cause() {
+        use crate::platform::paths::tests::{ENV_LOCK, EnvVarGuard, unique_suffix};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Restores the host's PINVOU3_HOME (present or absent) on drop, panic paths included.
+        let _env = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-kb-fail-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create isolated PINVOU3_HOME");
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line of this test); env writes serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &root) };
+        // Re-init re-points the sink at this test's own log (see `init` docs).
+        crate::platform::startup::init();
+
+        super::mark_knowledge_service_failed(&anyhow::anyhow!("store too new: schema 9 > 4"));
+
+        let log = std::fs::read_to_string(root.join("logs").join("startup.log"))
+            .expect("the failure mark must be persisted");
+        assert!(log.contains("knowledge_service:error"), "{log}");
+        assert!(log.contains("store too new: schema 9 > 4"), "{log}");
+        assert!(
+            !log.contains("knowledge_service:done"),
+            "a failed init must not be bookkept as finished: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod session_purge_agents_index_tests {
+    use crate::features::codex_acp::{CodexWorkspaceKind, SessionAgentStore};
+
+    /// The composition root's purge hook must remove the purged session's
+    /// entry from the codex_acp agents index: retention evictions and
+    /// scheduled cleanups cannot reach that codex_acp-owned index, and a
+    /// stale entry outlives its owner and feeds the boot-time sidecar
+    /// backfill — resurrecting ghost `sessions/<id>/` directories on every
+    /// startup. The removal must be id-scoped (unrelated entries survive)
+    /// and must drop the authoritative sidecar with the index record.
+    #[test]
+    fn purge_removes_index_entry_and_keeps_others() {
+        crate::platform::test_support::with_temp_home("pinvou3-purge-agents-index", || {
+            // Index inside the hermetic home; the sidecar root derives as
+            // <home>/sessions, matching the production layout.
+            let home = crate::platform::paths::pinvou3_home();
+            let store = SessionAgentStore::for_test(home.join("session-agents.json"));
+            store
+                .bind_code_native_session(
+                    "sess-purged",
+                    CodexWorkspaceKind::Project,
+                    Some(home.clone()),
+                    Vec::new(),
+                )
+                .expect("bind purged");
+            store
+                .bind_code_native_session(
+                    "sess-survivor",
+                    CodexWorkspaceKind::Project,
+                    Some(home.clone()),
+                    Vec::new(),
+                )
+                .expect("bind survivor");
+
+            super::remove_agents_index_entry(&store, "sess-purged");
+
+            assert!(
+                !store.is_code_session("sess-purged"),
+                "the purged id's in-memory entry must be gone"
+            );
+            assert!(
+                store.is_code_session("sess-survivor"),
+                "unrelated entries must survive the purge leg"
+            );
+            let on_disk = std::fs::read_to_string(home.join("session-agents.json"))
+                .expect("the index must persist after the purge leg");
+            assert!(
+                !on_disk.contains("sess-purged"),
+                "the purged id must not survive on disk: {on_disk}"
+            );
+            assert!(
+                on_disk.contains("sess-survivor"),
+                "the survivor must remain on disk: {on_disk}"
+            );
+            assert!(
+                !home.join("sessions").join("sess-purged").exists(),
+                "the authoritative sidecar (and its directory) must be removed with the index entry",
+            );
+        });
+    }
+
+    /// The purge leg is best-effort like its siblings: an id without an index
+    /// entry (user deletes already removed it, or the session never had one)
+    /// must be a no-op, never an error that could abort an eviction.
+    #[test]
+    fn purge_tolerates_missing_index_entry() {
+        crate::platform::test_support::with_temp_home("pinvou3-purge-agents-index-missing", || {
+            let home = crate::platform::paths::pinvou3_home();
+            let store = SessionAgentStore::for_test(home.join("session-agents.json"));
+            super::remove_agents_index_entry(&store, "never-bound");
+            assert!(
+                !store.is_code_session("never-bound"),
+                "nothing to remove, nothing to resurrect"
+            );
+        });
     }
 }

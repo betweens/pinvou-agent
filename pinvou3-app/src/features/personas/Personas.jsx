@@ -7,7 +7,7 @@ import { getSyntaxHighlightVersion, subscribeSyntaxHighlight } from '../../share
 
 // 共享小件(部门配色/头像块/多语言取名)抽到 persona-shared.jsx:ChatView 等
 // 主 chunk 消费方直接从那里 import,卡池视图才可能独立懒加载 chunk。
-import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColor, AppIcon } from './persona-shared.jsx';
+import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColor, AppIcon, IOS_FONT_STACK } from './persona-shared.jsx';
 
     // 三处弹层(Persona 详情/编辑器/造卡选择)的遮罩通用样式:半透明黑底 + 轻
     // 模糊;字体栈按层各自补,造卡选择层不设(沿用文档默认,保持原渲染)。
@@ -47,7 +47,7 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
       return (
         // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop click-to-close layer; the keyboard path is handled by the dialog's top-right close button
         // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer, a non-interactive container
-        <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center md:p-6" style={{ ...BACKDROP_STYLE, fontFamily:'-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif' }} onClick={onClose}>
+        <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center md:p-6" style={{ ...BACKDROP_STYLE, fontFamily: IOS_FONT_STACK }} onClick={onClose}>
           {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling handling */}
           {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer, a non-interactive container */}
           <div ref={panelRef} onClick={(e)=>e.stopPropagation()}
@@ -104,7 +104,7 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
         if (!name.trim()) { setErr(t.cpErrName); return; }
         if (!body.trim()) { setErr(t.cpErrBody); return; }
         setSaving(true); setErr('');
-        const input = { name: name.trim(), dept, emoji: emoji || '🃏', color: init.color || deptColor(dept), description: description.trim(), body };
+        const input = { name: name.trim(), dept, emoji, color: init.color || deptColor(dept), description: description.trim(), body };
         try {
           const sum = isEdit ? await bridge.personas.updatePersona(init.id, input) : await bridge.personas.createPersona(input);
           if (onSaved) onSaved(sum);
@@ -115,7 +115,7 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
         // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop click-to-close layer; the keyboard path is handled by the nav-bar cancel button
         // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer, a non-interactive container
         <div className="fixed inset-0 z-[60] flex items-end md:items-center justify-center md:p-4"
-          style={{ ...BACKDROP_STYLE, fontFamily:'-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif' }} onClick={onClose}>
+          style={{ ...BACKDROP_STYLE, fontFamily: IOS_FONT_STACK }} onClick={onClose}>
           {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling handling */}
           {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer, a non-interactive container */}
           <div onClick={(e)=>e.stopPropagation()} className="w-full h-[90vh] md:h-auto md:max-h-[85vh] md:max-w-md flex flex-col rounded-t-[14px] md:rounded-[14px] overflow-hidden bg-[#F2F2F7] dark:bg-[#1C1C1E] text-[#000] dark:text-[#fff]">
@@ -131,11 +131,11 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
               {/* 名称 + 部门 */}
               <div className="rounded-[10px] overflow-hidden bg-[#fff] dark:bg-[#000]">
                 <div className="flex items-center px-4 py-3 border-b border-[rgba(198,198,200,.5)] dark:border-[#38383A]">
-                  <span className="w-20 text-[17px] shrink-0">{t.cpFieldName}</span>
+                  <span className="min-w-20 text-[17px] shrink-0">{t.cpFieldName}</span>
                   <input value={name} onChange={e=>setName(e.target.value)} placeholder={t.cpReqPh} className="flex-1 text-[17px] bg-transparent outline-none text-[#000] dark:text-[#fff]" />
                 </div>
                 <div className="flex items-center px-4 py-3">
-                  <span className="w-20 text-[17px] shrink-0">{t.cpDept}</span>
+                  <span className="min-w-20 text-[17px] shrink-0">{t.cpDept}</span>
                   <select value={dept} onChange={e=>setDept(e.target.value)} className="flex-1 text-[17px] bg-transparent outline-none text-[#000] dark:text-[#fff]">
                     {DEPT_OPTIONS.map(function(d){ return <option key={d} value={d} style={{ color:'#000' }}>{deptLabelFor(t, d)}</option>; })}
                   </select>
@@ -170,7 +170,9 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
     };
 
     // AI 造卡推广 banner(卡池顶部 hero):彩色渐变 + 标题 + 开始造卡 + 三步条 + 右侧浮动本地头像。
-    // 整条/按钮点击 → onStart(=startAICard)。深浅模式同一条彩色卡。窄屏由 .bnr-avatars 媒体查询隐藏头像。
+    // 整条/按钮点击 → onStart(=startAICard)。深浅模式同一条彩色卡。头像行 xl(1280px) 以下隐藏:
+    // 五张 108px 卡 + 430px 文案列在 overflow-hidden 的 banner 里需要 ≥986px，折叠侧栏(68px)时对应 ≥~1138px 窗口
+    // (280px 默认侧栏 ≈1350px，480px 最大侧栏最多 ≈1550px；窗口在 1280–1290px 且侧栏收到最窄 220px 时仍可能有 ~10px 裁切)。
     const AICardBanner = ({ onStart, isDark, t }) => {
       const F = (t && t.bnrFaces) || [];
       const face = (i) => ({ name: (F[i] && F[i][0]) || '', role: (F[i] && F[i][1]) || '' });
@@ -190,6 +192,9 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
               ? '0 2px 8px rgba(0,0,0,.45), 0 24px 60px rgba(0,0,0,.65)'
               : '0 8px 28px rgba(83,74,183,.16)',
             border: isDark ? '1px solid rgba(255,255,255,.18)' : '1px solid rgba(83,74,183,.14)', // isDark dynamic-value: 保留 (rgba border + banner 整体 isDark 同深浅)
+            // Promo banner keeps its shorter 4-font stack from main on purpose
+            // (adding "SF Pro Text"/"Microsoft YaHei" here changes Windows
+            // rendering); do not unify onto IOS_FONT_STACK.
             fontFamily:'-apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif' }}>
           <div className="absolute rounded-full" style={{ width:240, height:240, background:'#AFA9EC', opacity:.16, top:-80, right:-40 }} />
           <div className="absolute rounded-full" style={{ width:150, height:150, background:'#9FE1CB', opacity:.15, bottom:-50, right:120 }} />
@@ -207,7 +212,7 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
             </div>
           </div>
           {/* 右侧:头像横向一排,垂直居中,各自浮动 */}
-          <div className="bnr-avatars relative z-0 flex-1 flex items-center justify-evenly" style={{ paddingRight:16 }}>
+          <div className="relative z-0 flex-1 hidden xl:flex items-center justify-evenly" style={{ paddingRight:16 }}>
             {avs.map((a,i) => (
               <div key={i} className="flex flex-col items-center shrink-0" style={{ background:'#fff', borderRadius:18, padding:'14px 14px 11px', boxShadow:'0 10px 26px rgba(83,74,183,.22)', animation:`bnrFloat${(i%3)+1} ${(3.2+i*0.25).toFixed(2)}s ease-in-out infinite ${(i*0.3).toFixed(1)}s` }}>
                 <img src={a.src} width={80} height={80} alt="" loading="lazy" decoding="async" style={{ borderRadius:14, display:'block' }} />
@@ -283,7 +288,7 @@ import { deptLabelFor, personaText, DEPT_ORDER, ALL_DEPT, DEPT_OPTIONS, deptColo
 
       return (
         <div className="flex-1 flex flex-col w-full h-full relative z-10 overflow-hidden animate-in fade-in duration-300 bg-[#fff] dark:bg-[#131314]"
-          style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif' }}>
+          style={{ fontFamily: IOS_FONT_STACK }}>
           <div className="relative z-10 flex-1 min-h-0 overflow-y-auto p-4 custom-scrollbar sm:p-6 lg:p-10">
             <div className="max-w-[1400px] mx-auto">
 

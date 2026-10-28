@@ -1,4 +1,28 @@
 use super::prelude::*;
+use crate::platform::credential_store::{
+    CREDENTIAL_STORE_UNAVAILABLE_ERROR, CredentialReference, CredentialStore,
+};
+use crate::platform::prefs::MODEL_API_KEY_ENV_OVERRIDE;
+
+/// Round-51 review: the settings transaction holds the cross-process
+/// settings.json.lock across keychain I/O (the CLI's models family writes
+/// the same transaction from a second process), and the sibling blocking
+/// calls (the ACP section-lock passes, `SessionAgentStore::remove`) poll a
+/// cross-process lock for up to its timeout — so the async command layer
+/// joins each blocking body on a `spawn_blocking` worker instead of parking
+/// a runtime worker that also drives the engine session pumps (the same
+/// rationale as round-50's codex.rs conversion). One helper for the join
+/// scaffolding shared by every converted command: run `body` on a blocking
+/// worker and map a failed join to `<label> 任务失败: {error}`.
+pub(super) async fn join_blocking<T, F>(label: &str, body: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(body)
+        .await
+        .map_err(|error| format!("{label} 任务失败: {error}"))?
+}
 
 /// 从 disk 读最新 UserPrefs。
 /// 注意走 disk 而非 engine.bridge.prefs——如果用户手改 settings.json，
@@ -8,16 +32,50 @@ pub async fn get_settings() -> Result<UserPrefs, String> {
     Ok(refresh_safe_prefs(UserPrefs::load()))
 }
 
-fn prepare_prefs_for_save(mut prefs: UserPrefs) -> Result<UserPrefs, String> {
-    let store = SystemCredentialStore::new();
+fn prepare_prefs_for_save(
+    mut prefs: UserPrefs,
+    store: &dyn CredentialStore,
+) -> Result<(UserPrefs, Vec<CredentialReference>), String> {
     prefs.normalize_saved_model_metadata();
-    let migration = prefs.migrate_plaintext_api_keys_with_store(&store);
-    if !migration.failed_model_ids.is_empty() || !migration.failed_search_providers.is_empty() {
-        return Err("credential store unavailable; please reconfigure API Key".to_string());
+    let migration = prefs.migrate_plaintext_api_keys_with_store(store);
+    if migration.has_failures() {
+        return Err(CREDENTIAL_STORE_UNAVAILABLE_ERROR.to_string());
     }
+    // The migration DEFERS destructive keyring deletes (see the search
+    // Delete arm in `migrate_plaintext_api_keys_with_store`): surface them so
+    // the caller runs them only after its prefs save committed.
+    let deferred_deletes = migration.deferred_search_deletes;
     prefs.sanitize_plaintext_api_keys();
-    prefs.refresh_credential_states_with_store(&store);
-    Ok(prefs)
+    prefs.refresh_credential_states_with_store(store);
+    Ok((prefs, deferred_deletes))
+}
+
+/// Runs the search-provider keyring deletes the prefs migration deferred —
+/// only ever call this AFTER the prefs save committed and while the prefs
+/// lock is still held (via `update_transaction_with_post_commit`). Before the
+/// commit a delete would leave a configured-but-secretless provider when the
+/// save then aborted; outside the lock, a concurrent replacement of the same
+/// deterministic provider reference could commit a fresh secret between this
+/// save's commit and this cleanup, and the stale delete would destroy it
+/// while both saves reported success. Under the lock the two saves are
+/// totally ordered, so the delete can only remove the credential this
+/// command's own Delete edit removed from prefs. A failed delete is
+/// downgraded to a warning: the disk commit already succeeded and the orphan
+/// is overwritten on re-set.
+fn delete_deferred_search_credentials(
+    context: &str,
+    store: &dyn CredentialStore,
+    references: Vec<CredentialReference>,
+) {
+    for reference in references {
+        if let Err(error) = store.delete(&reference) {
+            log::warn!(
+                "{context}: prefs saved, but the removed search credential could not be \
+                 deleted from the keyring (the orphan is overwritten on re-set): {}",
+                error.user_message()
+            );
+        }
+    }
 }
 
 fn refresh_safe_prefs(mut prefs: UserPrefs) -> UserPrefs {
@@ -27,11 +85,11 @@ fn refresh_safe_prefs(mut prefs: UserPrefs) -> UserPrefs {
     prefs
 }
 
-fn apply_model_credential(
+pub(super) fn apply_model_credential(
     mut model: SavedModel,
     old: Option<&SavedModel>,
-) -> Result<SavedModel, String> {
-    let store = SystemCredentialStore::new();
+    store: &dyn CredentialStore,
+) -> Result<(SavedModel, Option<CredentialReference>), String> {
     let action = model.credential_action.unwrap_or_else(|| {
         if model.api_key.trim().is_empty() {
             CredentialEditAction::KeepExisting
@@ -40,6 +98,11 @@ fn apply_model_credential(
         }
     });
 
+    // The returned reference, when set, is a DEFERRED keyring delete: the
+    // caller must run it only after the prefs save has committed. Deleting
+    // inside the transaction would leave the model configured-but-secretless
+    // when the save then fails — the same defect class `delete_model` fixed.
+    let mut deferred_delete: Option<CredentialReference> = None;
     match action {
         CredentialEditAction::KeepExisting => {
             if let Some(old) = old {
@@ -72,12 +135,12 @@ fn apply_model_credential(
                 .clone()
                 .or_else(|| old.and_then(|m| m.credential_ref.clone()))
                 .unwrap_or_else(|| model.credential_reference());
-            store.delete(&reference).map_err(|e| e.user_message())?;
             model.mark_missing();
+            deferred_delete = Some(reference);
         }
     }
     model.clear_plaintext_key();
-    Ok(model)
+    Ok((model, deferred_delete))
 }
 
 /// 探测用凭据解析的模型选择规则:指定了 id 却查不到(如前端即时生成、
@@ -92,6 +155,19 @@ fn saved_model_for_probe<'a>(
         Some(id) => prefs.model_by_id(id),
         None => prefs.active_model(),
     }
+}
+
+/// Shared probe-key ladder (the three probe commands): a trimmed non-empty
+/// form `api_key` wins; otherwise the saved credential for `model_id` is
+/// read. Each caller maps the read failure to its own result shape (the
+/// local-kind probe swallows it and continues credential-less; the
+/// connection/image probes surface a typed error).
+fn resolve_probe_key(api_key: &str, model_id: Option<&str>) -> Result<Option<String>, String> {
+    let provided = api_key.trim();
+    if !provided.is_empty() {
+        return Ok(Some(provided.to_string()));
+    }
+    resolve_saved_model_key(model_id)
 }
 
 fn resolve_saved_model_key(model_id: Option<&str>) -> Result<Option<String>, String> {
@@ -136,13 +212,6 @@ pub struct EffectiveModelConfig {
     pub env_overrides: Vec<String>,
 }
 
-fn session_model_from_prefs(
-    prefs: &UserPrefs,
-    session_model_id: Option<&str>,
-) -> Option<SavedModel> {
-    session_model_id.and_then(|id| prefs.model_by_id(id).cloned())
-}
-
 #[tauri::command]
 pub async fn get_effective_model_config(
     session_id: Option<String>,
@@ -155,7 +224,9 @@ pub async fn get_effective_model_config(
     let session_model_id = session_id
         .as_deref()
         .and_then(|id| store.session_model_id(id));
-    bridge.session_model = session_model_from_prefs(&bridge.prefs, session_model_id.as_deref());
+    bridge.session_model = session_model_id
+        .as_deref()
+        .and_then(|id| bridge.prefs.model_by_id(id).cloned());
     let mut env_overrides = Vec::new();
     if std::env::var("DEEPSEEK_MODEL").is_ok() {
         env_overrides.push("model".to_string());
@@ -163,7 +234,7 @@ pub async fn get_effective_model_config(
     if std::env::var("DEEPSEEK_BASE_URL").is_ok() {
         env_overrides.push("base_url".to_string());
     }
-    let env_api_key = std::env::var("DEEPSEEK_API_KEY")
+    let env_api_key = std::env::var(MODEL_API_KEY_ENV_OVERRIDE)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
     if env_api_key {
@@ -287,18 +358,17 @@ pub async fn probe_local_server_kind(
     // not block the probe (continue as credential-less) — with credentials
     // missing the probe still identifies auth-free endpoints; authenticated
     // endpoints 401 into generic, the same semantics as an unreachable probe.
-    let bearer = match api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-        Some(key) => Some(key.to_string()),
-        None => resolve_saved_model_key(model_id.as_deref())
-            .ok()
-            .flatten()
-            .map(|key| key.trim().to_string())
-            .filter(|k| !k.is_empty()),
+    let bearer = match resolve_probe_key(api_key.as_deref().unwrap_or(""), model_id.as_deref()) {
+        Ok(Some(key)) => Some(key.trim().to_string()).filter(|k| !k.is_empty()),
+        // Includes the swallowed credential-read failure: continue
+        // credential-less rather than blocking the probe.
+        _ => None,
     };
     let kind =
         crate::core::model_endpoint::probe_local_server_kind(&base_url, bearer.as_deref()).await;
     Ok(match kind {
         crate::core::model_endpoint::LocalServerKind::Vllm => "vllm".to_string(),
+        crate::core::model_endpoint::LocalServerKind::Tachyon => "tachyon".to_string(),
         crate::core::model_endpoint::LocalServerKind::Ollama => "ollama".to_string(),
         crate::core::model_endpoint::LocalServerKind::Sglang => "sglang".to_string(),
         crate::core::model_endpoint::LocalServerKind::LlamaCpp => "llamacpp".to_string(),
@@ -338,53 +408,122 @@ pub async fn reveal_model_api_key(id: String) -> Result<Option<String>, String> 
 #[tauri::command]
 pub async fn save_model(model: SavedModel, pool: State<'_, EnginePool>) -> Result<(), String> {
     let model_id = model.id.clone();
-    UserPrefs::update_transaction(|prefs| {
-        let old = prefs.model_by_id(&model.id).cloned();
-        let model = apply_model_credential(model, old.as_ref())
-            .map_err(|e| sanitize_command_error("save_model", e))?;
-        prefs.upsert_model(model);
-        Ok(())
-    })
-    .map_err(|e| sanitize_command_error("save_model", e))?;
+    // Round-51 review: the settings transaction holds the cross-process
+    // settings.json.lock across keychain I/O (the CLI's models family writes
+    // the same transaction from a second process), so the blocking body
+    // joins a spawn_blocking worker — the same rationale as round-50's
+    // codex.rs conversion: these runtime workers also drive the engine
+    // session pumps.
+    let store = SystemCredentialStore::new();
+    join_blocking("save_model", move || save_model_inner(model, &store)).await?;
     pool.mark_model_updated(&model_id);
+    Ok(())
+}
+
+/// Testable core of [`save_model`]: the engine-pool notification stays with
+/// the command, mirroring [`delete_model_inner`].
+pub(super) fn save_model_inner(
+    model: SavedModel,
+    store: &dyn CredentialStore,
+) -> Result<(), String> {
+    let model_id = model.id.clone();
+    // Same ordering contract as `delete_model`: the destructive keyring
+    // delete returned by `apply_model_credential` runs in the post-commit
+    // hook, still inside the prefs-lock critical section — after the prefs
+    // save has committed (a failed delete then only leaves an orphaned
+    // credential, the benign direction) and serialized against a concurrent
+    // replacement of the same model credential, whose keyring write also
+    // runs under the prefs lock.
+    let deferred_delete = std::cell::RefCell::new(None);
+    UserPrefs::update_transaction_with_post_commit(
+        |prefs| {
+            let old = prefs.model_by_id(&model.id).cloned();
+            let (model, deferred) = apply_model_credential(model, old.as_ref(), store)
+                .map_err(|e| sanitize_command_error("save_model", e))?;
+            *deferred_delete.borrow_mut() = deferred;
+            prefs.upsert_model(model);
+            Ok(())
+        },
+        || {
+            if let Some(reference) = deferred_delete.borrow_mut().take() {
+                if let Err(error) = store.delete(&reference) {
+                    log::warn!(
+                        "save_model: model {model_id} saved without its keyring secret (the \
+                         delete failed): {}",
+                        error.user_message()
+                    );
+                }
+            }
+        },
+    )
+    .map_err(|e| sanitize_command_error("save_model", e))?;
     Ok(())
 }
 
 /// 删一条模型。至少保留一条;删到当前 active 会自动回退列表首条。
 #[tauri::command]
 pub async fn delete_model(id: String) -> Result<(), String> {
-    UserPrefs::update_transaction(|prefs| {
-        if prefs.advanced.saved_models.len() <= 1 {
-            return Err("至少保留一个模型".to_string());
-        }
-        if let Some(reference) = prefs
-            .model_by_id(&id)
-            .and_then(|m| m.credential_ref.clone())
-        {
-            SystemCredentialStore::new()
-                .delete(&reference)
-                .map_err(|e| sanitize_command_error("delete_model", e.user_message()))?;
-        }
-        prefs.remove_model(&id);
-        Ok(())
-    })
+    // Round-51 review: same cross-process settings-lock rationale as
+    // [`save_model`] — join the blocking transaction on a worker.
+    let store = SystemCredentialStore::new();
+    join_blocking("delete_model", move || delete_model_inner(&id, &store)).await
+}
+
+pub(super) fn delete_model_inner(id: &str, store: &dyn CredentialStore) -> Result<(), String> {
+    // The keyring delete runs in the post-commit hook, still inside the
+    // prefs-lock critical section: deleting first would leave a
+    // configured-but-secretless model when the save then fails, and deleting
+    // after the lock was released would let a concurrent replacement of the
+    // same model credential commit a fresh secret that the stale delete then
+    // destroys. After a successful save, a failed delete only leaves an
+    // orphaned credential (the benign direction).
+    let reference_to_delete = std::cell::RefCell::new(None);
+    UserPrefs::update_transaction_with_post_commit(
+        |prefs| {
+            if prefs.advanced.saved_models.len() <= 1 {
+                return Err("至少保留一个模型".to_string());
+            }
+            if let Some(reference) = prefs.model_by_id(id).and_then(|m| m.credential_ref.clone()) {
+                *reference_to_delete.borrow_mut() = Some(reference);
+            }
+            prefs.remove_model(id);
+            Ok(())
+        },
+        || {
+            if let Some(reference) = reference_to_delete.borrow_mut().take() {
+                if let Err(error) = store.delete(&reference) {
+                    log::warn!(
+                        "delete_model: model {id} removed, but its keyring secret could not \
+                         be deleted: {}",
+                        error.user_message()
+                    );
+                }
+            }
+        },
+    )
     .map(|_| ())
-    .map_err(|e| sanitize_command_error("delete_model", e))
+    .map_err(|e| sanitize_command_error("delete_model", e))?;
+    Ok(())
 }
 
 /// 设全局默认模型(新建会话继承它)。不打断已在用的会话——它们各自保持 spawn
 /// 时的模型,想换在该会话的 chip 里切。
 #[tauri::command]
 pub async fn set_active_model(id: String) -> Result<(), String> {
-    UserPrefs::update_transaction(|prefs| {
-        if prefs.model_by_id(&id).is_none() {
-            return Err(format!("model not found: {id}"));
-        }
-        prefs.advanced.active_model_id = Some(id);
-        Ok(())
+    // Round-51 review: same cross-process settings-lock rationale as
+    // [`save_model`] — join the blocking transaction on a worker.
+    join_blocking("set_active_model", move || {
+        UserPrefs::update_transaction(|prefs| {
+            if prefs.model_by_id(&id).is_none() {
+                return Err(format!("model not found: {id}"));
+            }
+            prefs.advanced.active_model_id = Some(id);
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|e| sanitize_command_error("set_active_model", e))
     })
-    .map(|_| ())
-    .map_err(|e| sanitize_command_error("set_active_model", e))
+    .await
 }
 
 /// 切某会话当前模型(聊天 chip 热切):写 per-session 绑定 + evict 该会话 engine,
@@ -397,6 +536,15 @@ pub async fn set_session_model(
     app: AppHandle,
     pool: State<'_, EnginePool>,
 ) -> Result<(), String> {
+    // Aux sessions inherit their parent's binding at creation and a
+    // reset drops any per-aux binding silently (round-34 minor 6) — the
+    // sibling metadata commands reject aux ids, and this one does too.
+    if crate::features::sessions::is_aux_session_id(&session_id) {
+        return Err(
+            "set_session_model: auxiliary conversations inherit the main session's model"
+                .to_string(),
+        );
+    }
     if let Some(mid) = &model_id {
         if UserPrefs::load().model_by_id(mid).is_none() {
             return Err(format!("model not found: {mid}"));
@@ -495,179 +643,50 @@ fn model_connection_result(
 fn model_connection_http_result(status: reqwest::StatusCode) -> ModelConnectionTestResult {
     let status_code = status.as_u16();
     let detail = Some(format!("HTTP {status_code}"));
-    if status.is_success() {
-        return model_connection_result(
-            true,
-            "ok",
-            "连接成功，服务可用",
-            detail,
-            Some(status_code),
-        );
-    }
-    if status.is_redirection() {
-        return model_connection_result(
-            false,
-            "redirect",
-            "服务地址发生跳转，当前测试无法确认可用性",
-            detail,
-            Some(status_code),
-        );
-    }
-    match status_code {
-        400 | 422 => model_connection_result(
-            false,
-            "request_invalid",
-            "请求格式不被服务接受，请检查模型配置",
-            detail,
-            Some(status_code),
-        ),
-        401 => model_connection_result(
-            false,
-            "auth_invalid",
-            "API Key 无效，请检查后重新填写",
-            detail,
-            Some(status_code),
-        ),
-        403 => model_connection_result(
-            false,
-            "auth_forbidden",
-            "当前 API Key 没有访问权限",
-            detail,
-            Some(status_code),
-        ),
-        404 => model_connection_result(
-            false,
-            "endpoint_not_found",
-            "服务地址不正确，或该服务不支持模型列表接口",
-            detail,
-            Some(status_code),
-        ),
-        405 => model_connection_result(
-            false,
-            "method_not_allowed",
-            "服务可以访问，但不支持当前测试方式",
-            detail,
-            Some(status_code),
-        ),
-        402 => model_connection_result(
-            false,
-            "billing",
-            "账户余额不足，请充值后重试，或切换到其他模型",
-            detail,
-            Some(status_code),
-        ),
-        408 => model_connection_result(
-            false,
-            "timeout",
-            "连接超时，请检查网络或本地服务是否启动",
-            detail,
-            Some(status_code),
-        ),
-        429 => model_connection_result(
-            false,
-            "rate_limited",
-            "请求过于频繁或额度不足，请稍后再试",
-            detail,
-            Some(status_code),
-        ),
-        500..=599 => model_connection_result(
-            false,
-            "server_unavailable",
-            "服务暂时不可用，请稍后再试",
-            detail,
-            Some(status_code),
-        ),
-        _ => model_connection_result(
-            false,
-            "http_error",
-            "连接失败，请检查配置后重试",
-            detail,
-            Some(status_code),
-        ),
-    }
-}
-
-/// Shared transport-error classification (decision ladder: redact → timeout → tls → dns → refused),
-/// shared by the connection test and the image-input probe. `detail` is the redacted underlying
-/// error string; each caller generates its zh summary from the code — no single-language hardcoding in Rust.
-enum TransportClass {
-    Timeout,
-    Tls,
-    Dns,
-    Refused,
-    Network,
-}
-
-fn classify_transport_error(err: &reqwest::Error) -> (TransportClass, String) {
-    let raw = crate::platform::credential_store::redact_secret(&err.to_string());
-    let raw_lower = raw.to_lowercase();
-    let class = if err.is_timeout() {
-        TransportClass::Timeout
-    } else if raw_lower.contains("certificate")
-        || raw_lower.contains("tls")
-        || raw_lower.contains("ssl")
-    {
-        TransportClass::Tls
-    } else if raw_lower.contains("dns")
-        || raw_lower.contains("lookup")
-        || raw_lower.contains("name or service not known")
-    {
-        TransportClass::Dns
-    } else if raw_lower.contains("connection refused")
-        || raw_lower.contains("os error 10061")
-        || raw_lower.contains("actively refused")
-    {
-        TransportClass::Refused
-    } else {
-        TransportClass::Network
+    // The status ladder itself is shared with the CLI
+    // (`model_probe::model_probe_http_code`); this side only attaches the
+    // zh summary, resolved by the frontend from the code.
+    let code = crate::core::model_endpoint::model_probe_http_code(status);
+    let message = match code {
+        "ok" => "连接成功，服务可用",
+        "redirect" => "服务地址发生跳转，当前测试无法确认可用性",
+        "request_invalid" => "请求格式不被服务接受，请检查模型配置",
+        "auth_invalid" => "API Key 无效，请检查后重新填写",
+        "auth_forbidden" => "当前 API Key 没有访问权限",
+        "endpoint_not_found" => "服务地址不正确，或该服务不支持模型列表接口",
+        "method_not_allowed" => "服务可以访问，但不支持当前测试方式",
+        "billing" => "账户余额不足，请充值后重试，或切换到其他模型",
+        "timeout" => "连接超时，请检查网络或本地服务是否启动",
+        "rate_limited" => "请求过于频繁或额度不足，请稍后再试",
+        "server_unavailable" => "服务暂时不可用，请稍后再试",
+        _ => "连接失败，请检查配置后重试",
     };
-    (class, raw)
+    model_connection_result(code == "ok", code, message, detail, Some(status_code))
+}
+
+/// Shared transport-error classification: the ladder itself lives in
+/// `core::model_endpoint::model_probe_transport_code` (shared with the
+/// CLI); the connection test and the image-input probe map the returned
+/// code to their own zh summaries — no single-language hardcoding in Rust.
+fn classify_transport_error(err: &reqwest::Error) -> (&'static str, String) {
+    crate::core::model_endpoint::model_probe_transport_code(err)
 }
 
 fn model_connection_error_result(err: &reqwest::Error) -> ModelConnectionTestResult {
-    let (class, raw) = classify_transport_error(err);
+    let (code, raw) = classify_transport_error(err);
     // The detail passes the redacted underlying error through untouched;
-    // the zh summary above is resolved by the frontend from the code via
+    // the zh summary is resolved by the frontend from the code via
     // connectionMessages (a hardcoded Chinese detail prefix would mix
     // scripts in en/ja interfaces).
     let detail = Some(raw);
-    match class {
-        TransportClass::Timeout => model_connection_result(
-            false,
-            "timeout",
-            "连接超时，请检查网络或本地服务是否启动",
-            detail,
-            None,
-        ),
-        TransportClass::Tls => model_connection_result(
-            false,
-            "tls_error",
-            "安全证书校验失败，请检查代理或网络环境",
-            detail,
-            None,
-        ),
-        TransportClass::Dns => model_connection_result(
-            false,
-            "dns_failed",
-            "无法解析服务地址，请检查网络",
-            detail,
-            None,
-        ),
-        TransportClass::Refused => model_connection_result(
-            false,
-            "connection_refused",
-            "无法连接到服务，请确认本地模型服务已启动",
-            detail,
-            None,
-        ),
-        TransportClass::Network => model_connection_result(
-            false,
-            "network_error",
-            "网络连接失败，请检查网络后重试",
-            detail,
-            None,
-        ),
-    }
+    let message = match code {
+        "timeout" => "连接超时，请检查网络或本地服务是否启动",
+        "tls_error" => "安全证书校验失败，请检查代理或网络环境",
+        "dns_failed" => "无法解析服务地址，请检查网络",
+        "connection_refused" => "无法连接到服务，请确认本地模型服务已启动",
+        _ => "网络连接失败，请检查网络后重试",
+    };
+    model_connection_result(false, code, message, detail, None)
 }
 
 /// 测试连接:GET {base_url}/models(OpenAI 兼容标准端点),验 base_url + key 可达。
@@ -718,32 +737,28 @@ pub async fn probe_model_connection(
     // Anthropic 官方端点用 x-api-key + anthropic-version,不接受 Bearer。
     let is_anthropic = crate::core::model_endpoint::is_anthropic_api_url(&parsed_url);
     let mut req = client.get(parsed_url);
-    let provided_key = api_key.trim().to_string();
-    let key = if provided_key.is_empty() {
-        match resolve_saved_model_key(model_id) {
-            Ok(key) => key.unwrap_or_default(),
-            Err(e) => {
-                return model_connection_result(
-                    false,
-                    "credential_unavailable",
-                    "无法读取已保存的 API Key，请重新填写",
-                    Some(e),
-                    None,
-                );
-            }
+    let key = match resolve_probe_key(api_key, model_id) {
+        Ok(Some(key)) => key,
+        Ok(None) => String::new(),
+        Err(e) => {
+            return model_connection_result(
+                false,
+                "credential_unavailable",
+                "无法读取已保存的 API Key，请重新填写",
+                Some(e),
+                None,
+            );
         }
-    } else {
-        provided_key
     };
     if !key.trim().is_empty() {
         if is_anthropic {
-            req = req
-                .header("x-api-key", key.trim())
-                .header("anthropic-version", "2023-06-01");
+            req = crate::core::model_endpoint::apply_anthropic_auth_headers(req, &key);
         } else {
             req = req.bearer_auth(key.trim());
         }
     }
+    let req =
+        crate::core::model_endpoint::with_opencode_session_header(req, base_url, "connection-test");
     match req.send().await {
         Ok(resp) => model_connection_http_result(resp.status()),
         Err(e) => model_connection_error_result(&e),
@@ -1070,23 +1085,15 @@ fn classify_image_capability_http(
 }
 
 fn image_capability_transport_error(err: &reqwest::Error) -> ImageCapabilityTestResult {
-    let (class, raw) = classify_transport_error(err);
-    let summary = match class {
-        TransportClass::Timeout => format!("连接超时，请检查网络或服务是否启动: {raw}"),
-        TransportClass::Tls => format!("安全证书校验失败，请检查代理或网络环境: {raw}"),
-        TransportClass::Dns => format!("无法解析服务地址，请检查网络: {raw}"),
-        TransportClass::Refused => format!("无法连接到服务，请确认服务已启动: {raw}"),
-        TransportClass::Network => format!("网络连接失败，请检查网络后重试: {raw}"),
+    let (code, raw) = classify_transport_error(err);
+    let summary = match code {
+        "timeout" => format!("连接超时，请检查网络或服务是否启动: {raw}"),
+        "tls_error" => format!("安全证书校验失败，请检查代理或网络环境: {raw}"),
+        "dns_failed" => format!("无法解析服务地址，请检查网络: {raw}"),
+        "connection_refused" => format!("无法连接到服务，请确认服务已启动: {raw}"),
+        _ => format!("网络连接失败，请检查网络后重试: {raw}"),
     };
     image_capability_result("error", false, summary, None)
-}
-
-/// 识图探测的 URL 基准:剥掉用户 base_url 末尾的 `/chat/completions` 后缀,
-/// 后续拼接(OpenAI chat/completions、Anthropic /v1/messages)共用同一基准
-/// ——否则含后缀的 base_url 在 Anthropic 分支会拼出
-/// `.../chat/completions/v1/messages` 这类 404 路径。
-fn image_probe_base_url(base_url: &str) -> String {
-    crate::platform::prefs::model::strip_chat_completions_suffix(base_url)
 }
 
 /// 识图探测核心(设计 §7.3):POST {base_url}/chat/completions 携带内置纯色 PNG,
@@ -1112,7 +1119,7 @@ pub async fn run_image_capability_probe(
     // 不再拼出重复路径(prefs/model.rs 同一口径)。strip 后的基准同时用于
     // 协议判定与 Anthropic Messages URL 拼接(原始 base_url 若保留
     // /chat/completions 后缀,anthropic_messages_url 会拼出 404 路径)。
-    let base_url_stripped = image_probe_base_url(base_url);
+    let base_url_stripped = crate::platform::prefs::model::strip_chat_completions_suffix(base_url);
     let url = format!("{base_url_stripped}/chat/completions");
     let parsed_url = match reqwest::Url::parse(&url) {
         Ok(url) => url,
@@ -1137,32 +1144,26 @@ pub async fn run_image_capability_probe(
             return image_capability_result("error", false, format!("测试初始化失败: {e}"), None);
         }
     };
-    let provided_key = api_key.trim().to_string();
-    let key = if provided_key.is_empty() {
-        match resolve_saved_model_key(model_id) {
-            Ok(key) => key.unwrap_or_default(),
-            Err(e) => {
-                return image_capability_result(
-                    "error",
-                    false,
-                    format!("无法读取已保存的 API Key，请重新填写: {e}"),
-                    None,
-                );
-            }
+    let key = match resolve_probe_key(api_key, model_id) {
+        Ok(Some(key)) => key,
+        Ok(None) => String::new(),
+        Err(e) => {
+            return image_capability_result(
+                "error",
+                false,
+                format!("无法读取已保存的 API Key，请重新填写: {e}"),
+                None,
+            );
         }
-    } else {
-        provided_key
     };
     if is_anthropic {
         let messages_url = crate::core::model_endpoint::anthropic_messages_url(&base_url_stripped);
-        let mut req = client
-            .post(messages_url)
-            .json(&image_capability_test_payload_anthropic(&model));
-        if !key.trim().is_empty() {
-            req = req
-                .header("x-api-key", key.trim())
-                .header("anthropic-version", "2023-06-01");
-        }
+        let req = crate::core::model_endpoint::apply_anthropic_auth_headers(
+            client
+                .post(messages_url)
+                .json(&image_capability_test_payload_anthropic(&model)),
+            &key,
+        );
         return match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -1198,6 +1199,11 @@ pub async fn run_image_capability_probe(
     if !key.trim().is_empty() {
         req = req.bearer_auth(key.trim());
     }
+    let req = crate::core::model_endpoint::with_opencode_session_header(
+        req,
+        &base_url_stripped,
+        "image-probe",
+    );
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -1219,8 +1225,9 @@ pub async fn test_image_input_capability(
     Ok(run_image_capability_probe(&model, &base_url, &api_key, model_id.as_deref()).await)
 }
 
-/// 通用设置字段补丁。搜索、桌宠、模型列表和本地模型初始化状态由专用命令管理，
-/// 不进入这个协议，避免调用方携带旧的完整快照覆盖其他操作刚写入的值。
+/// General settings field patch. Search, pet, the model list and the active model are managed by dedicated
+/// commands and stay out of this protocol, so a caller holding an old full snapshot cannot overwrite values
+/// another operation just wrote.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralSettingsPatch {
@@ -1230,6 +1237,7 @@ pub struct GeneralSettingsPatch {
     pub memory_enabled: Option<bool>,
     pub notifications: Option<NotificationPrefs>,
     pub sidebar: Option<SidebarPrefs>,
+    pub chat: Option<ChatPrefs>,
     pub advanced: Option<AdvancedPrefs>,
 }
 
@@ -1251,7 +1259,10 @@ pub struct WebSettingsPatch {
 /// Phase C 会做 in-place engine restart（处理 in-flight turn）。
 #[tauri::command]
 pub async fn update_settings(patch: GeneralSettingsPatch) -> Result<UserPrefs, String> {
-    persist_general_settings(patch)
+    // Round-51 review: the settings transaction holds the cross-process
+    // settings.json.lock across keychain I/O — join the blocking body on a
+    // spawn_blocking worker like the sibling model commands.
+    join_blocking("update_settings", move || persist_general_settings(patch)).await
 }
 
 fn apply_general_settings_patch(current: &mut UserPrefs, patch: GeneralSettingsPatch) {
@@ -1273,46 +1284,117 @@ fn apply_general_settings_patch(current: &mut UserPrefs, patch: GeneralSettingsP
     if let Some(sidebar) = patch.sidebar {
         current.sidebar = sidebar;
     }
+    if let Some(chat) = patch.chat {
+        current.chat = chat;
+    }
     if let Some(mut advanced) = patch.advanced {
-        // 这些字段有各自的专用写命令。即使高级设置来自旧快照，也无权覆盖它们。
+        // The model list and active model have dedicated write commands; an advanced-settings patch built from a
+        // stale snapshot must not overwrite them.
         advanced.saved_models = current.advanced.saved_models.clone();
         advanced.active_model_id = current.advanced.active_model_id.clone();
-        advanced.local_vllm_bootstrapped = current.advanced.local_vllm_bootstrapped;
-        advanced.local_vllm_setup_declined = current.advanced.local_vllm_setup_declined;
         current.advanced = advanced;
     }
 }
 
 fn persist_general_settings(patch: GeneralSettingsPatch) -> Result<UserPrefs, String> {
-    UserPrefs::update_transaction(|current| {
-        apply_general_settings_patch(current, patch);
-        *current = prepare_prefs_for_save(current.clone())?;
-        Ok(())
-    })
+    let store = SystemCredentialStore::new();
+    // The deferred deletes are handed to the post-commit hook through a
+    // RefCell because both closures need access to them while the mutate
+    // closure alone cannot return them; the hook runs inside the same
+    // prefs-lock critical section as the commit, so a concurrent credential
+    // replacement cannot slip a fresh secret between the commit and the
+    // delete (an aborted transaction never reaches the hook at all).
+    let deferred_deletes = std::cell::RefCell::new(Vec::new());
+    UserPrefs::update_transaction_with_post_commit(
+        |current| {
+            apply_general_settings_patch(current, patch);
+            let (prepared, deferred) = prepare_prefs_for_save(current.clone(), &store)?;
+            *current = prepared;
+            *deferred_deletes.borrow_mut() = deferred;
+            Ok(())
+        },
+        || {
+            delete_deferred_search_credentials("update_settings", &store, deferred_deletes.take());
+        },
+    )
     .map(refresh_safe_prefs)
 }
 
 fn persist_search_settings(search: SearchPrefs) -> Result<UserPrefs, String> {
-    UserPrefs::update_transaction(|prefs| {
-        prefs.search = search;
-        *prefs = prepare_prefs_for_save(prefs.clone())?;
-        Ok(())
-    })
+    persist_search_settings_inner(search, &SystemCredentialStore::new())
+}
+
+/// Testable core of [`persist_search_settings`]: the credential store is
+/// injected so tests can pin the deferred-delete ordering, mirroring
+/// [`save_model_inner`] / [`delete_model_inner`].
+pub(super) fn persist_search_settings_inner(
+    search: SearchPrefs,
+    store: &dyn CredentialStore,
+) -> Result<UserPrefs, String> {
+    // Same ordering contract as `save_model`/`delete_model`: the keyring
+    // deletes deferred by the migration run in the post-commit hook, still
+    // inside the prefs-lock critical section — after the prefs save has
+    // committed (an aborted transaction leaves them unrun) and serialized
+    // against a concurrent replacement of the same credential, whose keyring
+    // write also runs under the prefs lock. A failed post-commit delete is
+    // downgraded to a warning.
+    let deferred_deletes = std::cell::RefCell::new(Vec::new());
+    UserPrefs::update_transaction_with_post_commit(
+        |prefs| {
+            prefs.search = search;
+            let (prepared, deferred) = prepare_prefs_for_save(prefs.clone(), store)?;
+            *prefs = prepared;
+            *deferred_deletes.borrow_mut() = deferred;
+            Ok(())
+        },
+        || {
+            delete_deferred_search_credentials(
+                "save_search_settings",
+                store,
+                deferred_deletes.take(),
+            );
+        },
+    )
     .map(refresh_safe_prefs)
     .map_err(|e| sanitize_command_error("save search settings", e))
 }
 
 pub(crate) fn persist_web_settings(patch: WebSettingsPatch) -> Result<UserPrefs, String> {
-    UserPrefs::update_transaction(|prefs| {
-        if let Some(memory_enabled) = patch.memory_enabled {
-            prefs.memory_enabled = memory_enabled;
-        }
-        if let Some(search) = patch.search {
-            prefs.search = search;
-        }
-        *prefs = prepare_prefs_for_save(prefs.clone())?;
-        Ok(())
-    })
+    persist_web_settings_inner(patch, &SystemCredentialStore::new())
+}
+
+/// Testable core of [`persist_web_settings`]: the credential store is
+/// injected so tests can pin the deferred-delete ordering, mirroring
+/// [`persist_search_settings_inner`].
+pub(super) fn persist_web_settings_inner(
+    patch: WebSettingsPatch,
+    store: &dyn CredentialStore,
+) -> Result<UserPrefs, String> {
+    // Same ordering contract as `save_model`/`delete_model`: the keyring
+    // deletes deferred by the migration run in the post-commit hook, still
+    // inside the prefs-lock critical section — after the prefs save has
+    // committed (an aborted transaction leaves them unrun) and serialized
+    // against a concurrent replacement of the same credential, whose keyring
+    // write also runs under the prefs lock. A failed post-commit delete is
+    // downgraded to a warning.
+    let deferred_deletes = std::cell::RefCell::new(Vec::new());
+    UserPrefs::update_transaction_with_post_commit(
+        |prefs| {
+            if let Some(memory_enabled) = patch.memory_enabled {
+                prefs.memory_enabled = memory_enabled;
+            }
+            if let Some(search) = patch.search {
+                prefs.search = search;
+            }
+            let (prepared, deferred) = prepare_prefs_for_save(prefs.clone(), store)?;
+            *prefs = prepared;
+            *deferred_deletes.borrow_mut() = deferred;
+            Ok(())
+        },
+        || {
+            delete_deferred_search_credentials("save_web_settings", store, deferred_deletes.take());
+        },
+    )
     .map(refresh_safe_prefs)
     .map_err(|e| sanitize_command_error("save web settings", e))
 }
@@ -1320,31 +1402,21 @@ pub(crate) fn persist_web_settings(patch: WebSettingsPatch) -> Result<UserPrefs,
 /// 仅更新搜索配置。模型等其他偏好始终以磁盘最新值为准，避免前端旧快照整份回写。
 #[tauri::command]
 pub async fn update_search_settings(search: SearchPrefs) -> Result<UserPrefs, String> {
-    persist_search_settings(search)
+    // Round-51 review: same cross-process settings-lock rationale as
+    // [`save_model`] — join the blocking transaction on a worker.
+    join_blocking("update_search_settings", move || {
+        persist_search_settings(search)
+    })
+    .await
 }
 
-/// Unified post-save restart finalization. Restart bypasses RunEvent::Exit, so persist and close
-/// the browser host and reap child processes first; `saved_label` only keeps each command's own log wording.
-async fn persist_and_restart<S>(
-    app: tauri::AppHandle,
-    saved_label: &str,
-    persister: impl FnOnce() -> Result<S, String>,
-) -> Result<(), String> {
-    persister()?;
+/// Post-save restart finalization — call only after the save has committed: a failed persist must
+/// never restart. Restart bypasses RunEvent::Exit, so close the browser host and reap child
+/// processes before exiting; `saved_label` only keeps each command's own log wording.
+async fn restart_after_save(app: tauri::AppHandle, saved_label: &str) -> Result<(), String> {
     eprintln!("[pinvou3-app] {saved_label} saved, restarting app...");
-    // Restart bypasses RunEvent::Exit, so persist and close the browser host and reap child
-    // processes first.
     crate::prepare_app_restart(&app).await;
     app.restart();
-}
-
-/// Restart the app immediately after saving settings (model/backend switches need a restart to take effect).
-#[tauri::command]
-pub async fn save_settings_and_restart(
-    patch: GeneralSettingsPatch,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    persist_and_restart(app, "settings", move || persist_general_settings(patch)).await
 }
 
 /// 仅保存搜索配置后重启，避免搜索设置覆盖同时发生变化的模型列表。
@@ -1353,10 +1425,15 @@ pub async fn save_search_settings_and_restart(
     search: SearchPrefs,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    persist_and_restart(app, "search settings", move || {
+    // The settings transaction holds the cross-process settings.json.lock
+    // across keychain I/O — join it on a spawn_blocking worker like the
+    // sibling commands ([`update_search_settings`]); the restart below only
+    // runs once the persist has succeeded.
+    join_blocking("save_search_settings", move || {
         persist_search_settings(search)
     })
-    .await
+    .await?;
+    restart_after_save(app, "search settings").await
 }
 // 凭据状态迁移(`mark_*` / `clear_plaintext_key`)自 prefs 的密封 trait 提供。
 use crate::platform::prefs::CredentialStateOps;
@@ -1397,6 +1474,36 @@ mod tests {
     }
 
     #[test]
+    fn transport_error_scrubs_url_userinfo_before_the_report() {
+        // End-to-end contract pin for `http://user:pass@host` transport
+        // failures: the detail must carry neither the URL username nor the
+        // password. `classify_transport_error` applies the CLI's two-pass
+        // `redact_error_text` composition explicitly, so the guarantee does
+        // not depend on reqwest's own Display redaction staying complete
+        // (reqwest 0.12+ redacts its top-level Display, but the scrub is the
+        // defense-in-depth both lanes share). Port 1 is refused locally, so
+        // the test stays hermetic; the timeout bounds any platform whose
+        // refusal is slower.
+        let error = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client")
+            .get("http://user:pass@127.0.0.1:1/v1")
+            .send()
+            .expect_err("connecting to port 1 must fail");
+        let (class, detail) = classify_transport_error(&error);
+        let _ = class; // class is platform-dependent (refused vs timeout); only the scrub is pinned here
+        assert!(
+            !detail.contains("user"),
+            "the transport detail must not carry the URL username: {detail}"
+        );
+        assert!(
+            !detail.contains("pass"),
+            "the transport detail must not carry the URL password: {detail}"
+        );
+    }
+
+    #[test]
     fn image_capability_http_result_402_keeps_status_and_raw_summary() {
         // The image capability probe's 402 matches the connection test's
         // semantics, but top-up guidance is UI copy: the Rust side never
@@ -1420,14 +1527,18 @@ mod tests {
     fn image_probe_base_url_feeds_anthropic_messages_url_without_suffix() {
         // 含 /chat/completions 后缀的 Anthropic base_url:协议判定与 Messages
         // URL 拼接都必须基于 strip 后的基准,否则拼出 404 路径误判 error。
-        let stripped = image_probe_base_url("https://api.anthropic.com/v1/chat/completions");
+        let stripped = crate::platform::prefs::model::strip_chat_completions_suffix(
+            "https://api.anthropic.com/v1/chat/completions",
+        );
         assert_eq!(stripped, "https://api.anthropic.com/v1");
         assert_eq!(
             crate::core::model_endpoint::anthropic_messages_url(&stripped),
             "https://api.anthropic.com/v1/messages"
         );
         // 官方 preset 形态(无后缀)不受影响。
-        let plain = image_probe_base_url("https://api.anthropic.com/v1");
+        let plain = crate::platform::prefs::model::strip_chat_completions_suffix(
+            "https://api.anthropic.com/v1",
+        );
         assert_eq!(
             crate::core::model_endpoint::anthropic_messages_url(&plain),
             "https://api.anthropic.com/v1/messages"
@@ -1873,9 +1984,11 @@ mod tests {
         // SAFETY: holding the crate-level ENV_LOCK (acquired on this test's first line); env writes are serialized.
         unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
 
-        let mut initial = UserPrefs::default();
-        initial.migrate_models();
-        initial.save().expect("initial settings should save");
+        UserPrefs::update_transaction(|initial| {
+            initial.migrate_models();
+            Ok(())
+        })
+        .expect("initial settings should save");
 
         let barrier = Arc::new(Barrier::new(3));
         let theme_barrier = Arc::clone(&barrier);
@@ -1915,5 +2028,90 @@ mod tests {
             // SAFETY: same as above; restore-side removal serialized under ENV_LOCK.
             None => unsafe { std::env::remove_var("PINVOU3_HOME") },
         }
+    }
+
+    #[test]
+    fn chat_streaming_animation_patch_round_trips_and_survives_unrelated_patches() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_home = std::env::var_os("PINVOU3_HOME");
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-chat-animation-round-trip-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        // SAFETY: holding the crate-level ENV_LOCK (acquired on this test's first line); env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        // Seed disk through the production write path (the test-only
+        // UserPrefs::save was removed; mirrors the sibling concurrency
+        // tests' seeding).
+        UserPrefs::update_transaction(|initial| {
+            initial.migrate_models();
+            Ok(())
+        })
+        .expect("initial settings should save");
+
+        // Explicit opt-out persists and reads back as false.
+        persist_general_settings(GeneralSettingsPatch {
+            chat: Some(ChatPrefs {
+                streaming_animation: false,
+            }),
+            ..Default::default()
+        })
+        .expect("chat patch should save");
+        let disabled = UserPrefs::load();
+        assert!(
+            !disabled.chat.streaming_animation,
+            "an explicit chat opt-out must round-trip through settings.json"
+        );
+
+        // A later patch that does not mention `chat` (whole-sub-struct replace
+        // per field) must not resurrect the user's opt-out.
+        persist_general_settings(GeneralSettingsPatch {
+            sidebar: Some(SidebarPrefs {
+                date_grouping: false,
+            }),
+            ..Default::default()
+        })
+        .expect("sidebar patch should save");
+        let reloaded = UserPrefs::load();
+        assert!(
+            !reloaded.chat.streaming_animation,
+            "an unrelated sidebar patch must preserve the chat opt-out"
+        );
+        assert!(!reloaded.sidebar.date_grouping);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        match old_home {
+            // SAFETY: holding the crate-level ENV_LOCK (acquired on this test's first line); env writes are serialized.
+            Some(value) => unsafe { std::env::set_var("PINVOU3_HOME", value) },
+            // SAFETY: same as above; restore-side removal serialized under ENV_LOCK.
+            None => unsafe { std::env::remove_var("PINVOU3_HOME") },
+        }
+    }
+
+    /// The chat preference is desktop-only: `WebSettingsPatch` (the only
+    /// settings surface the web UI can drive) has no `chat` field and
+    /// `deny_unknown_fields` must hard-reject a patch that carries it,
+    /// instead of silently ignoring it. The transport boundary matters more
+    /// than the field itself — a web client must never be able to flip the
+    /// key even if a future field rename leaves the UI row gated wrong.
+    #[test]
+    fn web_settings_patch_rejects_the_chat_key() {
+        let rejected = serde_json::from_value::<WebSettingsPatch>(serde_json::json!({
+            "chat": { "streaming_animation": false },
+        }));
+        assert!(
+            rejected.is_err(),
+            "WebSettingsPatch must hard-reject the desktop-only chat key"
+        );
+        // Positive control: the authorized web fields still deserialize.
+        let accepted = serde_json::from_value::<WebSettingsPatch>(serde_json::json!({
+            "memory_enabled": true,
+        }));
+        assert!(
+            accepted.is_ok(),
+            "web-authorized settings fields must keep deserializing"
+        );
     }
 }

@@ -73,7 +73,6 @@ function injectSource() {
       check_for_update:function(){return {available:false};},
       get_mode_state:function(){return {mode:'yolo',plan_phase:'none'};},
       get_super_permission_status:function(){return false;},
-      detect_local_vllm_setup:function(){return {eligible:false};},
       list_marketplace_tools:function(){return tools.slice();},
       // 卸载后工具从后端列表消失(真实后端语义:自定义 MCP 卸载删登记,不再列出)。
       uninstall_marketplace_tool:function(args){
@@ -368,8 +367,8 @@ async function dismiss(page) {
       window.__PINVOU_MOCK_CALLS__.some(c => c.cmd === 'restore_recycled_plugin' && c.args.id === 'my-mcp')));
     rec('恢复后提示重新填写凭据', await page.evaluate(() =>
       document.body.innerText.includes('已恢复「my-mcp.zip」') && document.body.innerText.includes('请重新填写')));
-    rec('恢复成功副标题为「新会话生效」而非「已移除」', await page.evaluate(() =>
-      document.body.innerText.includes('新工具需要在新会话中生效')
+    rec('restore-success subtitle shows the switch-off guidance, not removal', await page.evaluate(() =>
+      document.body.innerText.includes('新工具开关默认关闭，请在输入框工具列表中开启后使用')
       && !document.body.innerText.includes('已移除，新会话将不再加载该工具')));
     await dismiss(page);
     rec('恢复后回收站列表移除该条目', await page.evaluate(() => {

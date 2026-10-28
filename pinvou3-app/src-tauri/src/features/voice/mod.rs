@@ -1,12 +1,13 @@
+pub mod contract;
 mod platform;
 mod temp_wav;
-mod transcript;
+pub mod transcript;
 pub(crate) mod voice_asr;
 
 pub(crate) use platform::reset_microphone_permission;
 pub(crate) use platform::{
     asr_dependency_packages, asr_missing_message, asr_tool_exists, asr_tool_path,
-    engine_binary_name, native_recognition_source, recognize_native,
+    engine_binary_name, has_asr_cli_override, native_recognition_source, recognize_native,
 };
 pub(crate) use temp_wav::VoiceTempWav;
 pub(crate) use transcript::parse_asr_transcript;

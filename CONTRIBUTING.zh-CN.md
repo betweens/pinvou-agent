@@ -38,7 +38,7 @@ git submodule update --init --recursive
 git commit -s
 ```
 
-修改或 rebase 已有提交时使用 `--signoff`。详情见 [DCO.md](DCO.md)。未签署的人工提交会被 CI 拦截；受信任的 Dependabot 和 GitHub Actions bot 提交，以及合并提交（多于一个父提交）除外。
+修改或 rebase 已有提交时使用 `--signoff`。详情见 [DCO.md](DCO.md)。`DCO` workflow 在 pull request 上校验每个人工提交的 `Signed-off-by` 尾部；受信任的 Dependabot 和 GitHub Actions bot 提交，以及合并提交（多于一个父提交）除外。该 workflow 只在 pull request 上运行，直推 `main` 不经过 DCO 校验，请坚持本地 `git commit -s`。另一条 commit-message 检查（`scripts/validate-commit-msg.py`）只校验提交信息格式，不检查签署。
 
 ## 改动应放在哪里
 
@@ -104,7 +104,10 @@ Merge Queue 在入队 PR 与最新 `main` 的实际组合树上运行适用门�
 merge group 的真实 base/head diff 选择浏览器 smoke，共享、未知或测试设施路径
 fail-closed 回退全套。每个保留下来的 `main` push 都执行 Linux 累计编译验证
 （全量测试由 Merge Queue 在同一组合树上完成，push 不重复执行）与 Windows
-原生检查，并持续写暖缓存；main 回归变红后应停止继续入队，直至修复或回滚。
+原生检查，并持续写暖缓存。Windows 必需 job 以两个并行 matrix leg 分别执行全目标
+元数据检查与链接后的原生回归，两者使用相同的高风险/main 路由且都必须通过，覆盖、
+缓存、耗时与回滚说明见 [`docs/windows-rust-ci.md`](docs/windows-rust-ci.md)。
+main 回归变红后应停止继续入队，直至修复或回滚。
 评审阶段只查看 required checks：
 
 ```bash

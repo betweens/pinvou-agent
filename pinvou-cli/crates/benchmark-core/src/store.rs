@@ -4,11 +4,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use fs2::FileExt;
+use fs4::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::private_prediction::PrivatePredictionStore;
+use crate::private_prediction::{PrivatePredictionStore, validate_handle};
 use crate::security::{ensure_explicit_base, validate_component};
 use crate::{
     ArtifactReference, CompletedRun, Prediction, PredictionOrigin, PrivatePredictionContentType,
@@ -428,12 +428,12 @@ impl RunStore {
 
     pub(crate) fn claim_execution(&self) -> Result<RunExecutionGuard> {
         let lock = open_execution_lock(&self.run_dir.join(EXECUTION_LOCK_FILE))?;
-        match FileExt::try_lock_exclusive(&lock) {
+        match FileExt::try_lock(&lock) {
             Ok(()) => {}
-            Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            Err(fs4::TryLockError::WouldBlock) => {
                 return Err(BenchmarkError::coded("run_in_progress"));
             }
-            Err(error) => return Err(error.into()),
+            Err(fs4::TryLockError::Error(error)) => return Err(error.into()),
         }
         let guard = RunExecutionGuard(lock);
         self.repair_torn_jsonl_tail::<RunEvent>(EVENT_FILE)?;
@@ -784,17 +784,10 @@ fn open_execution_lock(path: &Path) -> Result<File> {
         .map_err(Into::into)
 }
 
-fn valid_core_prediction_handle(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 fn validate_public_prediction(prediction: &Prediction) -> Result<()> {
     if prediction.origin() != PredictionOrigin::DurablePrivateStore
         || !matches!(prediction.type_tag(), "utf8-text/v1" | "canonical-json/v1")
-        || !valid_core_prediction_handle(prediction.payload_handle().expose_to_adapter())
+        || validate_handle(prediction.payload_handle().expose_to_adapter()).is_err()
     {
         return Err(BenchmarkError::coded("unsafe_public_prediction"));
     }

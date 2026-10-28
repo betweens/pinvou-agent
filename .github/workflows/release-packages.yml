@@ -4,18 +4,23 @@ name: release-packages
 #
 # 触发条件:
 # - push main 且 VERSION 被修改;
-# - workflow_dispatch 手动触发:无条件全量构建(用于补打/重打或显式验证)。
+# - workflow_dispatch 手动触发:全量构建(用于补打/重打或显式验证)。例外:
+#   build-windows-x64 仅在 main ref 上运行(仅由其 if 条件强制;windows-release
+#   Environment 只是发布边界,不含分支保护规则),非 main ref 手动触发时产出 4/5 平台。
 # 普通 PR 不进入本工作流；版本/打包脚本的轻量契约由 pr-check.yml 验证。
 #
 # 版本号单一事实来源 = 根目录 VERSION 文件。gate job 先跑
-# scripts/sync-version.mjs --check 校验 VERSION 引用的版本文件(tauri.conf.json /
-# pinvou3-app/src-tauri 的 Cargo.toml / pinvou-knowledge 的 Cargo.toml+Cargo.lock /
-# package.json / package-lock.json;除 package-lock.json 存在才纳入外,其余均为必需)与 VERSION 一致;构建 job 构建前再跑 sync-version.mjs 同步,
-# 保证打进包里的任何版本号都来自 VERSION。
+# scripts/sync-version.mjs --check,把该脚本登记的每个版本文件逐一与 VERSION 比对
+# (打进安装包的是 pinvou3-app 的 tauri.conf.json / Cargo.toml / Cargo.lock /
+# package.json / package-lock.json,以及 pinvou-knowledge 的 Cargo.toml+Cargo.lock;
+# 完整清单以脚本 repoPaths() 为准,其中少数文件存在才纳入,不在此重复枚举以免漂移)。
+# 构建 job 只消费已校验的版本文件,保证打进包里的任何版本号都来自 VERSION。
 #
 # 与其他 workflow 的分工:
-# - pr-check:PR 快速门禁与发布契约验证(不产出安装包)。
-# - mac-build:相关改动进入 main 后跑 macOS 原生回归。
+# - pr-check: fast PR gating and release-contract verification (produces no
+#   installers); macOS native regression is also folded into its
+#   macos-rust-check push leg (2026-10; the former standalone mac-build was
+#   deleted).
 # - release-packages(本 workflow):VERSION bump 或人工触发时产出全平台安装包 artifact。
 # - 本 workflow 只上传 CI artifact,绝不创建/推送 GitHub Release,release 由人工填写。
 #
@@ -50,14 +55,18 @@ jobs:
       build_required: ${{ steps.release.outputs.build_required }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      # fetch-depth:0 确保 push 事件的 before commit 可用于整段 push 范围比较。
+      # 本 job 只做文件级版本比对(sync-version --check 与其测试),不读 git
+      # 历史(此前 fetch-depth:0 注释声称的 push 范围比较并不存在),浅克隆即可。
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          # 同 header 凭据策略:纯文件级版本比对,不初始化子模块、无 git
+          # 网络操作,不保留 job token。
+          persist-credentials: false
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: Node.js
         uses: actions/setup-node@v7
@@ -101,24 +110,60 @@ jobs:
       # 指向 sh 版(wrapper 只作用于编译期 rustc 进程,产物运行时语义不变)。
       # 必须用 ${{ github.workspace }} 绝对路径:Cargo 按自身进程 cwd 解析相对路径,
       # 构建步骤 working-directory 为 pinvou3-app,相对路径会被双拼成不存在的路径。
+      # lld: BFD ld is memory-inefficient on large Rust binaries and is the
+      # standalone link-OOM cause (same as arm64). The linker receives only
+      # post-LTO plain objects: thin LTO's cross-crate merging completes
+      # in-process in the final crate's rustc (cargo compiles dependency crates
+      # with -C linker-plugin-lto), so lld is picked for object-linking time
+      # and memory, not bitcode support.
+      # Mechanism note (2026-10 calibration): since rustc >= 1.90,
+      # x86_64-linux-gnu self-links with its bundled rust-lld by default (rustc
+      # injects -B<sysroot>/.../gcc-ld into cc itself), so this flag is in
+      # practice a redundant fallback under jammy gcc 11 (when gcc resolves
+      # ld.lld by name, the -B directory precedes PATH). It is kept as a
+      # fallback for older toolchains and local environments; do not conclude
+      # from this comment that the linker is apt's ld.lld.
+      # The ThinLTO backends run inside rustc's process, so no cap is needed:
+      # release O3 + codegen-units=1 stays stable on 4 cores (recent releases
+      # 11/11 green).
       # lld:BFD ld 处理大型 Rust binary 内存效率差,是 link OOM 独立主因(同 arm64);
-      # release profile 的 thin LTO 让 rustc 给依赖 crate 传 -C linker-plugin-lto
-      # (生成 LLVM bitcode),link 阶段必须用支持 bitcode 的链接器。
-      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      # BFD also has no --icf, so it cannot perform the identical-code folding
+      # on the next line. Thin LTO itself is executed by rustc (the final unit
+      # gets -C lto=thin) and is independent of the linker identity; see the
+      # Cargo.toml [profile.release] comments for the mechanism.
+      # --icf=safe: lld identical-code folding (merges identical code sections,
+      # a size optimization). The safe tier only folds functions whose address
+      # is provably never taken. The boundary between ICF and Rust function
+      # address identity is a known issue (rust#160267 is one example: a
+      # miscompilation occurred even under the safe tier, LLVM-side root
+      # cause, still unfixed), so the conservative tier is chosen over all.
+      # RUSTFLAGS is an env-level injection covering both the tauri main build
+      # and the standalone knowledge-host build in this job (the latter's
+      # profile lives in pinvou-knowledge/Cargo.toml).
+      # --remap-path-prefix: normalizes build-machine absolute paths embedded
+      # in the artifact (panic locations etc.) to /. Top-level rustc flag —
+      # NOT a -C codegen option; rustc rejects `-C remap-path-prefix`.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--icf=safe --remap-path-prefix=${{ github.workspace }}=/"
       RUSTC_WRAPPER: ${{ github.workspace }}/pinvou3-app/src-tauri/scripts/rustc-stack-wrapper
     steps:
       - name: Checkout (含 submodule)
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          # header 凭据策略:运行时仓库公开,按锁定 gitlink 匿名拉取,不保留 job token(同 build-windows-x64)。
+          persist-credentials: false
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
-      # Hosted runners are single-disk (/ and /mnt share one ext4; the x64 image boots
-      # with only ~13-14G free); a cold release build (700+ crates, dep-level O2) once
-      # filled the disk (ENOSPC). Remove unused preinstalled SDKs before any toolchain, cache, or dependency lands.
+      # Hosted runners are single-disk (/ and /mnt share one ext4). The ENOSPC
+      # record (2026-09-13): with the then-16G /mnt swapfile in place, x64
+      # builds had only ~13-14G free and a cold release build (700+ crates,
+      # dep-level O2) filled the disk. The 2026-10-01 image probe measured
+      # 79-102G free at job start on x64/arm (see ci-memory-setup.sh); the
+      # 24G floor below is the fail-loud guard if the image regresses.
+      # Remove unused preinstalled SDKs before any toolchain, cache, or dependency lands.
       - name: Prepare disk space for the release build
         run: |
           sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
@@ -127,20 +172,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          # The pinvou-knowledge:knowledge-host server builds cold in an isolated
-          # target dir; without a cache every release recompiles it from scratch
-          # (one of the three ELFs in the deb).
-          workspaces: |
-            pinvou3-app/src-tauri
-            pinvou-knowledge
-          # jammy 后缀:runner 从 24.04 降到 22.04 时必须换 key,防止 24.04
-          # glibc 环境编译的 target 产物被复用进 22.04 构建混入新符号引用。
-          shared-key: release-linux-x64-jammy
-          # 手动分支验证只读，main 正式发布保存。
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No rust-cache here: releases are strictly read-only against the cache
+      # (2026-10 quota policy, pinned by test_release_cache_policy). The
+      # restore-only steps that used to live here were removed on 2026-10-15 —
+      # zero release-* entries existed live (nothing has written them since the
+      # save side was disabled), so every restore was a guaranteed miss and the
+      # steps were dead weight. Re-adding caching to a release job needs a
+      # fresh look at the quota policy first.
 
       # pinvou3 编译链接的系统库(gtk/webkit/soup/rsvg/openssl/X11×3/appindicator),
       # ubuntu runner 默认没装;cmake:reqwest 的 rustls 用 aws-lc-rs,其 build script
@@ -177,17 +215,22 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: pinvou3-app/package-lock.json
+          # No npm cache. setup-node cannot be told not to save, so keeping
+          # cache: 'npm' re-mints a main-scope single-lockfile entry
+          # whenever the previous one is gone — evicted, or displaced by a
+          # lockfile hash change (scopes are refs: release jobs run in main
+          # scope alongside pr-check's push legs; an exact hit in scope
+          # skips the re-save, and the 0.10.11 macOS release leg genuinely
+          # restored 294MB from exactly such an entry). What the
+          # removal costs is seconds of npm ci on a rare job (cold npm ci
+          # measured 10-25s in the release runs); what it saves is ~0.2-0.3GB
+          # of per-release churn against the 10GB quota. Pinned by
+          # test_release_cache_policy; the other three release setup-node
+          # steps below carry the same policy via a pointer comment.
 
       - name: 安装前端依赖
         working-directory: pinvou3-app
         run: npm ci --prefer-offline --no-audit
-
-      # 版本号同步:把 VERSION 写入 tauri.conf.json / Cargo.toml / package.json /
-      # package-lock.json,保证打进 deb 的版本号来自单一事实来源。
-      - name: 同步版本号
-        run: node scripts/sync-version.mjs
 
       # build.js 自动注入 config/platforms/linux overlay,并自动准备 codex bridge。
       # 只打 deb(config overlay 的 targets 也只列了 deb)。
@@ -195,14 +238,23 @@ jobs:
         working-directory: pinvou3-app
         run: node scripts/tauri/build.js build --bundles deb
 
+      # The tauri bundler hardcodes data.tar to gzip-6 (tauri.conf exposes no
+      # compression knob); repack as xz -9 to shrink the package. The content
+      # is untouched and the sha256 is computed afterwards, so it covers the
+      # final artifact.
+      - name: Repack deb (data.tar gzip-6 → xz -9)
+        working-directory: pinvou3-app/src-tauri/target/release/bundle/deb
+        run: bash "$GITHUB_WORKSPACE/scripts/repack-deb-xz.sh" "pinvou3_${VERSION}_amd64.deb"
+
       # tauri deb 产物默认名 pinvou3_<version>_amd64.deb,重命名为统一全平台命名
       # pinvou-agent_<version>-linux-x64.deb(与制品 zip 名对齐)。
       - name: 校验产物 + 统一命名 + sha256
         working-directory: pinvou3-app/src-tauri/target/release/bundle/deb
         run: |
           set -euo pipefail
-          SRC=$(ls pinvou3_*_amd64.deb)
+          SRC="pinvou3_${VERSION}_amd64.deb"
           DST="pinvou-agent_${VERSION}-linux-x64.deb"
+          test -f "$SRC" || { echo "❌ deb 产物不存在: $SRC"; ls -la; exit 1; }
           mv "$SRC" "$DST"
           SHA=$(sha256sum "$DST" | awk '{print $1}')
           echo "deb sha256: $SHA"
@@ -235,14 +287,36 @@ jobs:
     # 与 build-linux-x64 同理:Linux 发布基线是 Ubuntu 22.04 (glibc 2.35),
     # runner 钉在 ubuntu-22.04-arm,升级前先确认新基线决策。
     runs-on: ubuntu-22.04-arm
-    timeout-minutes: 90
+    # 2026-10 实测:近 19 次完全成功的 release 构建 37m12s–46m22s
+    # (历史观测峰值 48m14s 出自一次被取消 run 中的 arm64 job),
+    # 旧上限 90 本有约 2x 余量。放宽到 120 为工具链滚动、缓存冷启动等
+    # 长尾留余量,代价只是真挂死时多 30min 才被取消(成功时长不受影响)。
+    # 本次仅放宽有实测样本的 arm64(与按 1.5x 联动的 loong64);
+    # windows 150 与 macos 360 的余量比例更紧,见各自 job 注释观察。
+    timeout-minutes: 120
     env:
       VERSION: ${{ needs.check-version-bump.outputs.version }}
       # release profile 已在 Cargo.toml 设为 thin LTO(原 fat 在 ubuntu 16GB 上
       # link 内存越线被 SIGTERM),ARM 不再用 env 覆盖 profile。
-      # lld 是必需的:thin LTO 让 rustc 给依赖 crate 传 -C linker-plugin-lto
-      # (生成 LLVM bitcode,link 阶段做跨 crate 合并),BFD ld 无法处理 LLVM bitcode。
-      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      # lld kept: BFD ld is slow and memory-hungry object-linking large Rust
+      # binaries (same as x64); the linker receives only post-LTO plain
+      # objects, and cross-crate merging completes inside the final crate's
+      # rustc process.
+      # Mechanism note (2026-10 calibration): rustc 1.90's default rust-lld
+      # self-linking covers x86_64-unknown-linux-gnu only; on aarch64 rustc
+      # still goes through cc to BFD, so this flag is the lld selection that
+      # actually takes effect (apt's ld.lld), not a fallback. The ThinLTO
+      # backends run inside rustc's process, so no cap is needed (same reason
+      # as x64).
+      # lld is required: BFD links large binaries with poor memory efficiency
+      # (proven OOM) and has no --icf, so it cannot do --icf=safe. Thin LTO
+      # itself is executed by rustc and is independent of the linker identity
+      # (see the Cargo.toml [profile.release] comments for the mechanism).
+      # --icf=safe / remap-path-prefix: same as build-linux-x64 (see that
+      # job's comments for the conservative-tier trade-off and the known
+      # fn-address identity boundary rust#160267; the RUSTFLAGS env covers
+      # both the tauri main build and knowledge-host).
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--icf=safe --remap-path-prefix=${{ github.workspace }}=/"
       # release 编译 codewhale-tui 的 SIGBUS 同源风险防护(同 build-linux-x64,
       # 正式入口按平台注入 RUSTC_WRAPPER,见 config.toml 注释)。
       RUSTC_WRAPPER: ${{ github.workspace }}/pinvou3-app/src-tauri/scripts/rustc-stack-wrapper
@@ -251,14 +325,17 @@ jobs:
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          # header 凭据策略:运行时仓库公开,按锁定 gitlink 匿名拉取,不保留 job token(同 build-windows-x64)。
+          persist-credentials: false
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
-      # The ARM64 image has ample headroom (~34G free), so the base tier
-      # already clears the 24G floor; deleting the tool cache would buy
-      # little and only force setup-node to re-download Node afterwards.
+      # The ARM64 image has ample headroom (72G-era ~34G; the 2026-10-01
+      # probe measured 79-102G free at job start on x64/arm), so the base
+      # tier already clears the 24G floor; deleting the tool cache would
+      # buy little and only force setup-node to re-download Node afterwards.
       - name: Prepare disk space for the release build
         run: |
           sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
@@ -267,17 +344,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Same as x64: also cache the pinvou-knowledge isolated target dir.
-          workspaces: |
-            pinvou3-app/src-tauri
-            pinvou-knowledge
-          # jammy 后缀:同 x64,换 runner 基座后必须换 key 防止旧 glibc 产物混链。
-          shared-key: release-linux-arm64-jammy
-          # 只在 main 保存(对齐 pr-check 的配额保护策略);PR 侧只读,不写 1.2GB+ 缓存。
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No rust-cache here — same read-only quota policy as build-linux-x64
+      # (see that job's comment; pinned by test_release_cache_policy).
 
       - name: 装 Tauri + pinvou3 Linux 系统依赖
         run: |
@@ -311,15 +379,14 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: pinvou3-app/package-lock.json
+          # No npm cache — same policy and rationale as the first
+          # setup-node above (dropping it stops the per-release main-scope
+          # re-mint; the lost warmth is seconds of npm ci), pinned by
+          # test_release_cache_policy.
 
       - name: 安装前端依赖
         working-directory: pinvou3-app
         run: npm ci --prefer-offline --no-audit
-
-      - name: 同步版本号
-        run: node scripts/sync-version.mjs
 
       # 连接器 CLI 不在构建期下载或打入安装包；用户首次连接时，应用按
       # connectors.lock.json 在线下载、校验并安装到用户目录。
@@ -327,6 +394,11 @@ jobs:
       - name: 构建 deb
         working-directory: pinvou3-app
         run: node scripts/tauri/build.js build --bundles deb
+
+      # Repack deb (data.tar gzip-6 → xz -9), same as build-linux-x64.
+      - name: Repack deb (data.tar gzip-6 → xz -9)
+        working-directory: pinvou3-app/src-tauri/target/release/bundle/deb
+        run: bash "$GITHUB_WORKSPACE/scripts/repack-deb-xz.sh" "pinvou3_${VERSION}_arm64.deb"
 
       # tauri deb 产物默认名 pinvou3_<version>_arm64.deb,重命名为统一全平台命名
       # pinvou-agent_<version>-linux-arm64.deb(与制品 zip 名对齐)。
@@ -357,13 +429,215 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # ── Job 4: Windows x86_64 nsis(仅受保护的 main 上下文) ─────────────
+  # ── Job 4: Linux loongarch64 deb(x86_64 runner 全程交叉,GitHub 无 loong64 runner) ──
+  build-linux-loongarch64:
+    name: 构建 Linux loongarch64 deb
+    needs: check-version-bump
+    # 触发合同:只有手动触发或 push 到 main 才进入这个重交叉构建。
+    # gate 无条件置 build_required=true;一旦本 workflow 的触发面扩大
+    # (如引入 pull_request 做发布链路轻量契约验证),缺这层守卫就会让每个
+    # 触碰发布链路的 PR 都发起 loong64 交叉构建。
+    if: >-
+      needs.check-version-bump.outputs.build_required == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    # GitHub 托管 runner 没有 loong64,job 跑在 x86_64 ubuntu-22.04 上,由
+    # scripts/ci-build-linux-loongarch64.sh 全程交叉:sha256 钉死的
+    # loong64/cross-tools 20260912(stable, gcc 14.4/glibc 2.38;只有 bfd,
+    # 没有 lld)+ deepin beige (glibc 2.38) sysroot。目标基线 = deepin
+    # 23/25 + UOS V25 的 glibc 2.38,由工具链/sysroot 决定而非 runner 发行版
+    # (与 x64/arm64 的"链接构建机 glibc"模型不同,详见 floor 守护注释)。
+    # 首次成功 release 实测 2026-10-22(0.10.14 run):54m56s,仅为 arm64
+    # 实测上界(46m22s)的 ~1.2x——"交叉构建显著慢于原生"的旧假设偏悲观。
+    # timeout 仍按 arm64 上限的 ~1.5x 放大(120 → 180,policy test 按联动
+    # 公式钉住),对实测 ~3.3x 余量;样本尚少(n=1),先保持策略比率。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.check-version-bump.outputs.version }}
+      # 与 x64/arm64 同源风险:release(thin-LTO O3) 编译 codewhale-tui 的
+      # rustc/LLVM 栈溢出(SIGBUS)。交叉构建的 rustc 仍是 x86_64 宿主进程,
+      # 同一 sh 版 wrapper 原样生效;编排脚本原样继承本 job 的环境。
+      RUSTC_WRAPPER: ${{ github.workspace }}/pinvou3-app/src-tauri/scripts/rustc-stack-wrapper
+      # 交叉工具链与 sysroot 放在 cargo target 目录之外(target 归 cargo 域,
+      # 钉死版本的工具链树走下面的独立 actions/cache 键)。语义注意:
+      # ci-loongarch64-toolchain.sh 的 --prefix 是"接收目录"(树落在
+      # <prefix>/<triple>),而本变量与 ci-loongarch64-sysroot.sh /
+      # ci-build-linux-loongarch64.sh 约定的是"工具链根"(含 bin/)。
+      # 缓存路径/键与 pr-check.yml 的 rust-loongarch64-check leg 逐字一致。
+      PINVOU_LOONG64_CACHE_ROOT: ${{ github.workspace }}/.pinvou-loong64-cache
+      PINVOU_LOONG64_TOOLCHAIN_PREFIX: ${{ github.workspace }}/.pinvou-loong64-cache/cross-tools/loongarch64-unknown-linux-gnu
+      PINVOU_LOONG64_SYSROOT: ${{ github.workspace }}/.pinvou-loong64-cache/sysroot
+      # RUSTFLAGS 只带 --remap-path-prefix(与 x64/arm64/macos 产物一致地把
+      # 构建机绝对路径从 panic Location 里洗掉;该旗标是 rustc 侧的,不依赖
+      # lld)。其余 arm64 的链接旗标刻意不复制:钉死的交叉工具链没有 lld
+      # (只有 bfd ld),-C link-arg=-fuse-ld=lld 在这里必然失败;cargo 的
+      # 链接改走工具链脚本物化的 rust-lld wrapper(bfd 2.41 解不了 rustc
+      # LLVM 的 R_LARCH_CALL36,见 ci-loongarch64-toolchain.sh);--icf=safe
+      # 同样是 lld 专属,loong64 deb 不做 identical-code folding,体积代价
+      # 已知并接受。LTO 也不在此覆盖:Cargo.toml 的 thin LTO 由 rustc 进程内
+      # 执行,与链接器无关(env 覆盖反而偏离已审计的 profile)。
+      RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/"
+    steps:
+      - name: Checkout (含 submodule)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          # header 凭据策略:运行时仓库公开,按锁定 gitlink 匿名拉取,不保留 job token(同 build-windows-x64)。
+          persist-credentials: false
+
+      - name: Set up zram and swap
+        # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+
+      # 同 build-linux-x64:ENOSPC 事故(2026-09-13)时旧 16G swapfile 下仅
+      # ~13-14G 空闲(2026-10-01 探针:启动空闲 79-102G,见 ci-memory-setup.sh);
+      # 交叉构建的工具链 + sysroot + 两个 cargo target 目录全部落在工作区内,先腾空间。
+      - name: Prepare disk space for the release build
+        run: |
+          sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            python3 scripts/ci-rust-disk.py --aggressive --min-free-gib 24
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add the loongarch64 Rust target
+        # 编排脚本内部会再跑一次(幂等);显式一步让 target 缺失在该步骤
+        # 即红,而不是埋在十几分钟后的编排脚本里。
+        run: rustup target add loongarch64-unknown-linux-gnu
+
+      # 工具链/sysroot 缓存:restore-only。发布 job 永不写缓存(同
+      # x64/arm64 rust-cache 的 save-if: false 配额策略);写入方是
+      # pr-check.yml 的 rust-loongarch64-check leg(main push 保存,同
+      # "main 写、其余读"约定)。发布按冷构建规划,命中只是加速;键把
+      # setup 脚本内容 hash 进去,脚本(钉的 sha256/包清单)一变即换代,
+      # 旧代由 scripts/cache-janitor.sh 规则 E 去重。
+      - name: Restore loong64 cross toolchain cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.PINVOU_LOONG64_CACHE_ROOT }}/cross-tools
+          key: release-linux-loong64-jammy-toolchain-${{ hashFiles('scripts/ci-loongarch64-toolchain.sh') }}
+          restore-keys: |
+            release-linux-loong64-jammy-toolchain-
+
+      - name: Restore loong64 sysroot cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.PINVOU_LOONG64_CACHE_ROOT }}/sysroot
+          key: release-linux-loong64-jammy-sysroot-${{ hashFiles('scripts/ci-loongarch64-sysroot.sh') }}
+          restore-keys: |
+            release-linux-loong64-jammy-sysroot-
+
+      # 宿主只需要构建脚本工具(cc/cmake/pkg-config):目标侧的
+      # webkit/gtk/soup/openssl/pipewire 头与库全部来自 glibc 2.38 sysroot,
+      # 由 ci-loongarch64-sysroot.sh 对逐个 .pc 模块校验。lld 不装(工具链
+      # 只有 bfd);pipewire 不需要宿主 1.0.7 前缀(beige 已带 libpipewire
+      # 1.2.5,sysroot 头部齐全,见 ci-libpipewire-build.sh 的适用范围)。
+      # libclang: libspa/pipewire 的 bindgen 构建脚本在交叉构建时会给
+      # libclang 传 --target=loongarch64-...,而 LoongArch 要 LLVM >= 16
+      # 才是主 target(jammy 档案里的 libclang 14/15 没有该 target,bindgen
+      # 直接 panic "unknown target triple")。因此钉 apt.llvm.org 的
+      # llvm-toolchain-jammy-18 套件装 libclang-18-dev,并用 LIBCLANG_PATH
+      # 短路 clang-sys 的多目录探测;目标头文件由 BINDGEN_EXTRA_CLANG_ARGS
+      # (编排脚本导出)指向 deepin sysroot。此 run 块与 pr-check.yml 的
+      # rust-loongarch64-check leg 在注释剥离后逐字一致
+      # (test_release_loongarch64_policy 按剥注释文本钉等价)。
+      - name: 装 Tauri + pinvou3 Linux 系统依赖 (host 侧)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/apt/keyrings
+          curl --proto '=https' --tlsv1.2 --location --silent --show-error --fail \
+            --retry 3 --retry-delay 2 https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/pinvou-llvm.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/pinvou-llvm.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+            | sudo tee /etc/apt/sources.list.d/pinvou-llvm-18.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake libclang-18-dev file
+          # Reduce footprint at the source: orphan dependencies, apt cache packages, and index lists do not stay on the build disk.
+          sudo apt-get autoremove -y --purge
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          # clang-sys probes several default locations; pin the discovery to
+          # the LoongArch-capable libclang this step just installed.
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+
+      # 两步均幂等:restore 命中时脚本自检(marker 含 tag/variant/host/sha;
+      # manifest 含 glibc-floor/包清单)直接复用,未命中时下载 + sha256 校验
+      # (工具链)或 deepin beige 索引解析 + 逐包 sha256(sysroot)。sysroot
+      # 的 docker 方法需要 loong64 binfmt(本 job 未注册),脚本 auto 探测
+      # 失败后自动回退 deepin 索引直连方法。dpkg arch: loong64。
+      - name: Set up the pinned loong64 cross toolchain (sha256-pinned asset)
+        run: bash scripts/ci-loongarch64-toolchain.sh --prefix "$PINVOU_LOONG64_CACHE_ROOT/cross-tools"
+
+      - name: Set up the deepin glibc-2.38 loong64 sysroot
+        run: bash scripts/ci-loongarch64-sysroot.sh --output "$PINVOU_LOONG64_SYSROOT" --toolchain-prefix "$PINVOU_LOONG64_TOOLCHAIN_PREFIX"
+
+      - name: Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          # No npm cache — same policy and rationale as the first
+          # setup-node above (dropping it stops the per-release main-scope
+          # re-mint; the lost warmth is seconds of npm ci), pinned by
+          # test_release_cache_policy.
+
+      - name: 安装前端依赖
+        working-directory: pinvou3-app
+        run: npm ci --prefer-offline --no-audit
+
+      # 全流程编排(scripts/ci-build-linux-loongarch64.sh,每步失败即停):
+      # knowledge server 交叉 cargo build → SenseVoice 引擎交叉 cmake →
+      # build.js build --target loongarch64-unknown-linux-gnu(--bundles none:
+      # tauri-bundler 无 LoongArch 分支会 panic,build.js 把该请求翻译成
+      # CLI 的 --no-bundle;deb 由 package-deb-loongarch64.sh 手工组装)→
+      # repack xz -9 → glibc 2.38 下限守护(内部对解包树逐 ELF 跑
+      # check-linux-elf-policy.sh)。工具链/sysroot 已在 job env 导出,
+      # 编排脚本检测到后跳过内部安装。
+      - name: Cross build + package the loong64 deb
+        run: bash scripts/ci-build-linux-loongarch64.sh
+
+      # 编排脚本产出 pinvou3_<version>_loong64.deb,重命名为统一全平台命名
+      # pinvou-agent_<version>-linux-loong64.deb(与制品 zip 名对齐)。repack
+      # (xz -9)已在编排脚本内完成,重命名后的 sha256 覆盖最终字节。
+      - name: 校验产物 + 统一命名 + sha256
+        working-directory: pinvou3-app/src-tauri/target/release/bundle/deb
+        run: |
+          set -euo pipefail
+          SRC="pinvou3_${VERSION}_loong64.deb"
+          DEB="pinvou-agent_${VERSION}-linux-loong64.deb"
+          test -f "$SRC" || { echo "❌ deb 产物不存在: $SRC"; ls -la; exit 1; }
+          mv "$SRC" "$DEB"
+          SHA=$(sha256sum "$DEB" | awk '{print $1}')
+          echo "deb sha256: $SHA"
+          echo "$SHA  $DEB" > "$DEB.sha256"
+          ls -lh "$DEB"
+
+      # glibc 下限守护(同 build-linux-x64/arm64 的 重命名→守护→上传 序列;
+      # 断言全部 ELF 的 GLIBC_ 符号 ≤ 2.38 = deepin 23/25 + UOS V25 基线,
+      # 架构参数 loongarch64 同时校验包内没有异架构 ELF)。编排脚本在重命名
+      # 前对同一字节跑过一次;此处对最终命名产物再跑,失败即阻断发布。
+      - name: glibc 下限守护 (deepin 23/25 + UOS V25 = glibc 2.38)
+        run: ./scripts/check-linux-glibc-floor.sh "pinvou3-app/src-tauri/target/release/bundle/deb/pinvou-agent_${VERSION}-linux-loong64.deb" loongarch64
+
+      - name: 上传 deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pinvou-agent-${{ needs.check-version-bump.outputs.version }}-linux-loong64
+          path: |
+            pinvou3-app/src-tauri/target/release/bundle/deb/pinvou-agent_${{ needs.check-version-bump.outputs.version }}-linux-loong64.deb
+            pinvou3-app/src-tauri/target/release/bundle/deb/pinvou-agent_${{ needs.check-version-bump.outputs.version }}-linux-loong64.deb.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+  # ── Job 5: Windows x86_64 nsis(仅受保护的 main 上下文) ─────────────
   build-windows-x64:
     name: 构建 Windows x86_64 nsis
     needs: check-version-bump
     if: github.ref == 'refs/heads/main' && needs.check-version-bump.outputs.build_required == 'true'
     runs-on: windows-latest
-    timeout-minutes: 90
+    # 0.10.5 的 nsis 构建耗时 ~86min,90min 上限在 post cache save 阶段被撞掉。
+    timeout-minutes: 150
     environment:
       name: windows-release
     defaults:
@@ -391,26 +665,73 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # [linker consistency, 2026-10-02] Select the bundled lld (lld-link) for
+      # the shipped binary too, matching the windows-rust-test leg (#642).
+      # rustc hands the linker only plain objects (see the Cargo.toml lto
+      # note), so this swaps the object-linking step only. #642 moved the test
+      # leg because link.exe thrashed the hosted runner's pagefile there
+      # (silent 3-4 h runs killed at their 180/240-minute caps; runs
+      # 36919362322/36940184038) while the lld-link recipe runs green; this
+      # release job has itself built every completed release with link.exe
+      # (0.10.6: 94m42s of a 150 cap; a cancelled 0.10.5 attempt left no OOM
+      # evidence) — the swap is for cross-leg consistency on the same
+      # workspace, not an OOM fix here.
+      # Same probed two-step as #642: stable has no target-spanning flag to
+      # pick lld. On 1.99 `-C linker-features=+lld` is unstable on every
+      # target (it parses and then hard-errors; only the `-lld` opt-out is
+      # stable, x86_64-linux-gnu only), so arm 2 always wins today; arm 1
+      # stays so a future +lld stabilization is picked up automatically, and
+      # both arms do a real link — a pass cannot be a silent no-op.
+      # No /threads:1 cap here, unlike the test leg: the job is time-bound and
+      # has never recorded a link-memory thrash with link.exe — capping would
+      # only slow the release.
+      # NOTE for the reviewer: this changes the shipped nsis binary (different
+      # linker, same source). Revert = delete this step.
+      - name: Probe and export the Windows lld link flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          trap 'rm -rf "$probe"' EXIT
+          echo 'fn main() {}' > "$probe/probe.rs"
+          # --remap-path-prefix normalizes build-machine absolute paths
+          # embedded in the artifact (panic locations etc.), same as the
+          # job-level RUSTFLAGS of the x64/arm64/macOS jobs. It is a top-level
+          # rustc flag (NOT -C); both separator variants are exported because
+          # the embedded form follows whatever cargo passed to rustc.
+          ws="${GITHUB_WORKSPACE}"
+          ws_fwd="${ws//\\//}"
+          if rustc -C linker-features=+lld -o "$probe/probe.exe" "$probe/probe.rs" 2>"$probe/a.err"; then
+            flags="-C linker-features=+lld"
+          elif rustc -C linker=rust-lld -C linker-flavor=lld-link \
+              -o "$probe/probe.exe" "$probe/probe.rs" 2>"$probe/b.err"; then
+            flags="-C linker=rust-lld -C linker-flavor=lld-link"
+          else
+            echo "FAIL: this toolchain has no stable flag to select lld" >&2
+            cat "$probe/a.err" "$probe/b.err" >&2 || true
+            exit 1
+          fi
+          flags="$flags --remap-path-prefix=$ws=/ --remap-path-prefix=$ws_fwd=/"
+          echo "probed RUSTFLAGS=$flags"
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+
       # 编译 Windows 专用 .exe 栈 wrapper(源码 scripts/rustc-stack-wrapper.rs)。
       # 直接调 rustc 编译、不经 cargo,故不受本 job 的 RUSTC_WRAPPER 影响,无自举依赖。
       - name: 编译 Windows 栈 wrapper(.exe)
         shell: bash
         run: rustc -O pinvou3-app/src-tauri/scripts/rustc-stack-wrapper.rs -o pinvou3-app/src-tauri/scripts/rustc-stack-wrapper.exe
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: pinvou3-app/src-tauri
-          shared-key: release-windows-x64
-          # 该 job 只在 main 或受控手动构建中运行。
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No rust-cache here — same read-only quota policy as build-linux-x64
+      # (see that job's comment; pinned by test_release_cache_policy).
 
       - name: Node.js
         uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: pinvou3-app/package-lock.json
+          # No npm cache — same policy and rationale as the first
+          # setup-node above (dropping it stops the per-release main-scope
+          # re-mint; the lost warmth is seconds of npm ci), pinned by
+          # test_release_cache_policy.
 
       - name: 安装前端依赖
         working-directory: pinvou3-app
@@ -420,15 +741,26 @@ jobs:
         working-directory: pinvou3-app
         run: npm run runtime:windows:init
 
+      # init 只物化私有运行时 submodule;本步才展开运行时并写入
+      # runtime-descriptor.json(Stage 幂等:按 stageId 复用,后续
+      # build:nsis 的 staging 直接命中本次产物,不重复展开)。
+      - name: 展开 Windows 独立运行时并写入 descriptor
+        working-directory: pinvou3-app
+        run: npm run runtime:windows:stage
+
+      # descriptor 已就绪,直接调用集成测试钉住 stageWindowsInstaller
+      # 的安装器适配(须直接调用:node --test 会丢弃未知 argv 参数,
+      # --require-staged-runtime 到不了 process.argv)。
+      - name: 运行时安装器集成测试
+        working-directory: pinvou3-app
+        run: node tests/windows_runtime_installer_integration.test.js --require-staged-runtime
+
       - name: 验证 Windows ONNX Runtime 可加载
         working-directory: pinvou3-app
         run: npm run runtime:windows:onnx-smoke
 
       - name: 初始化公共底座 submodule
         run: git submodule update --init --recursive -- CodeWhale
-
-      - name: 同步版本号
-        run: node scripts/sync-version.mjs
 
       - name: 构建 nsis
         working-directory: pinvou3-app
@@ -459,7 +791,7 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # ── Job 5: macOS universal dmg(沿用原 macOS 发布流程的做法) ──────────
+  # ── Job 6: macOS universal dmg(沿用原 macOS 发布流程的做法) ──────────
   build-macos-universal:
     name: 构建 macOS universal dmg
     needs: check-version-bump
@@ -473,10 +805,23 @@ jobs:
     # 实测仍持续增长：0.10.0-0.10.2 分别 138/219/226 分钟(run 34747563852/
     # 34877996483/35308587808)，0.10.3(run 35377723253)在 241 分钟处撞线被取消，
     # macOS dmg 因此缺席发布而其余三平台完成。放宽至 360 分钟。
+    # Link-mechanism note (2026-10 calibration): thin LTO's cross-crate merging
+    # completes in-process in the final crate's rustc (Apple ld links only
+    # plain objects and never touches bitcode), and there is no cap knob —
+    # this job's duration and memory peak are dominated by the rustc side; the
+    # mitigation is splitting the universal build (needs a Tauri
+    # universal-bundler change, tracked separately) rather than swapping the
+    # linker.
     timeout-minutes: 360
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       VERSION: ${{ needs.check-version-bump.outputs.version }}
+      # Normalizes build-machine absolute paths embedded in the artifact
+      # (panic locations etc.) to /. Top-level rustc flag — NOT a -C codegen
+      # option. Apple ld/ld-prime has no ICF capability,
+      # so macOS needs no (and cannot take an) icf flag; -dead_strip is
+      # already passed by rustc by default.
+      RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/"
       # v0.9.5 升级后 release(thin-LTO O3)编译 codewhale-tui 时 rustc/LLVM 栈溢出
       # (SIGBUS,run 31558490865 实证)。.cargo/config.toml 不设置 rustc-wrapper
       # (全局键无法按平台条件化),由本 macOS 发布 job 显式注入 RUSTC_WRAPPER
@@ -487,9 +832,14 @@ jobs:
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          # header 凭据策略:运行时仓库公开,按锁定 gitlink 匿名拉取,不保留 job token(同 build-windows-x64)。
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # No rust-cache here — same read-only quota policy as build-linux-x64
+      # (see that job's comment; pinned by test_release_cache_policy).
 
       # 实际构建工具链由 src-tauri/rust-toolchain.toml 锁定；必须在该目录下把双 target
       # 安装到 pinned toolchain。只给上面的 stable 引导工具链装 target 会导致 Tauri
@@ -498,45 +848,25 @@ jobs:
         working-directory: pinvou3-app/src-tauri
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Same as the Linux release job: also cache the pinvou-knowledge
-          # isolated target dir.
-          workspaces: |
-            pinvou3-app/src-tauri
-            pinvou-knowledge
-          shared-key: release-macos-universal
-          # 只在 main 保存(对齐 pr-check 的配额保护策略);PR 侧只读,不写 2GB+ 缓存。
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # macOS 27+ 兼容:dyld 新增 LINKEDIT 字符串池 8 字节对齐校验,而 release 默认
-      # strip=debuginfo 会让 proc-macro dylib dlopen 被拒 → E0463(macOS ≤26 无此校验)。
-      # runner 目前是 macos-15(不受影响),但 GitHub 升级 runner 到 macOS 27+ 时若缺此
-      # 注入,tauri build 会硬失败。同 mac-build.yml 的 workaround。
-      - name: macOS 27+ strip workaround
-        run: |
-          if [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 27 ] 2>/dev/null; then
-            echo "CARGO_PROFILE_RELEASE_STRIP=none" >> "$GITHUB_ENV"
-            echo "RUSTFLAGS=-C strip=none" >> "$GITHUB_ENV"
-            echo "⚠️ macOS $(sw_vers -productVersion) → 注入 strip=none(绕过 dyld 对齐校验)"
-          else
-            echo "✓ macOS $(sw_vers -productVersion),保留默认 strip"
-          fi
+      # The macOS 27+ strip=none workaround is removed: every stable toolchain
+      # since 1.98 (2026-09) contains the Mach-O __LINKEDIT 8-byte alignment
+      # fix (rust#157750, LLVM backport #158410) — rust-toolchain.toml floats
+      # stable and can never roll back below it — so strip="symbols" is safe
+      # again on every macOS version and artifacts no longer keep
+      # symbol tables / debug maps. See docs/binary-size-optimization.md.
 
       - name: Node.js
         uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: pinvou3-app/package-lock.json
+          # No npm cache — same policy and rationale as the first
+          # setup-node above (dropping it stops the per-release main-scope
+          # re-mint; the lost warmth is seconds of npm ci), pinned by
+          # test_release_cache_policy.
 
       - name: 安装前端依赖
         working-directory: pinvou3-app
         run: npm ci --prefer-offline --no-audit
-
-      - name: 同步版本号
-        run: node scripts/sync-version.mjs
 
       - name: 构建 dmg
         working-directory: pinvou3-app
@@ -575,7 +905,15 @@ jobs:
             echo "✓ 手动 dmg 打包完成(无 Finder 图标美化)"
           fi
 
-          test -f "$DMG" || { echo "❌ dmg 产物不存在: $DMG"; exit 1; }
+          test -f "$DMG" || { echo "❌ dmg 产物不存在: $DMG"; ls -la "$(dirname "$DMG")"; exit 1; }
+
+          # Compression upgrade: the tauri dmg (bundler's bundle_dmg) is
+          # UDZO/zlib and passes no -imagekey zlib-level, so hdiutil uses its
+          # default compression level 1 (speed-oriented). The shared helper
+          # converts it to ULMO (LZMA, mountable since macOS 10.15+; our
+          # floor is 11.0) and degrades to keeping the original dmg on
+          # failure; see scripts/convert-dmg-ulmo.sh for the rationale.
+          bash "$GITHUB_WORKSPACE/scripts/convert-dmg-ulmo.sh" "$DMG"
 
           # 校验 universal dmg 双架构完整性 + 写 checksum 文件(随 artifact 附带)
           BIN="src-tauri/target/universal-apple-darwin/release/bundle/macos/pinvou3.app/Contents/MacOS/pinvou3-tauri"

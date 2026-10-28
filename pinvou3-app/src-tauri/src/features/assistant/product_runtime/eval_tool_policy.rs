@@ -42,7 +42,7 @@ impl EvalToolPolicy {
                 "<system-reminder>Evaluation tool contract: answer directly without tools by default. The only callable tools are exactly `read`, `list_dir`, `file_search`, `grep_files`, `Web`, and `image_analyze`; never invent or call weather, date, time, browser, web_search, fetch_url, read_file, `File`, or other tool names. Use `Web` only when the question requires current or external public information. In that case, make exactly one `Web` call promptly, with `action: \"search\"` and a concise `query`; use its result to answer and do not perform follow-up Web calls. Never call a file tool unless the user message includes an attachment; copy the exact attachment path shown in the message. Every `Web` call must include the `action` field. If a tool fails, do not retry it; always produce a concise final answer from available evidence and state the limitation.</system-reminder>"
             }
             Self::GaiaPublicWebV1 => {
-                "<system-reminder>GAIA evaluation tool contract: answer directly without tools when the answer is already known. The only callable tools are exactly `read`, `list_dir`, `file_search`, `grep_files`, `Web`, and `image_analyze`; never invent or call weather, date, time, browser, web_search, fetch_url, read_file, `File`, or other tool names. For public evidence, use `Web` with `action: \"search\"` and a concise `query`; use `action: \"fetch\"` with a result URL when the source page must be inspected. Every JSONPath in Web `fields` must start with `$`. If fetch reports JavaScript-only or unreadable content, search for the exact page title or an alternate authoritative source instead of retrying the same URL. Multiple Web calls are allowed when a task genuinely requires multi-step research, but stop as soon as the evidence determines the answer and never exceed 8 total tool calls for one task. Do not repeat an unchanged failed call. Never call a file tool unless the user message includes an attachment, and copy the exact attachment path shown in the user message instead of guessing a basename or `/dev/stdin`. Every `Web` call must include the `action` field. Always finish with a concise final answer and state any evidence limitation.</system-reminder>"
+                "<system-reminder>GAIA evaluation tool contract: answer directly without tools when the answer is already known. The only callable tools are exactly `read`, `list_dir`, `file_search`, `grep_files`, `Web`, and `image_analyze`; never invent or call weather, date, time, browser, web_search, fetch_url, read_file, `File`, or other tool names. For public evidence, use `Web` with `action: \"search\"` and a concise `query`; use `action: \"fetch\"` with a result URL when the source page must be inspected. Every JSONPath in Web `fields` must start with `$`. If fetch reports JavaScript-only or unreadable content, search for the exact page title or an alternate authoritative source instead of retrying the same URL. Multiple Web calls are allowed when a task genuinely requires multi-step research; stop as soon as the evidence determines the answer. Do not repeat an unchanged failed call. Never call a file tool unless the user message includes an attachment, and copy the exact attachment path shown in the user message instead of guessing a basename or `/dev/stdin`. Every `Web` call must include the `action` field. Always finish with a concise final answer and state any evidence limitation.</system-reminder>"
             }
             Self::GaiaOfflineV1 => {
                 "<system-reminder>Evaluation tool contract: the only callable tools are exactly `read`, `list_dir`, `file_search`, and `grep_files`. Never invent or call `File`, read_file, browser, web, search, date, time, or other tool names. Use a file tool only when the user message includes an attachment, and copy the exact attachment path shown in the message. Do not retry an unchanged failed call.</system-reminder>"
@@ -58,12 +58,6 @@ impl EvalToolPolicy {
 pub(crate) struct EvalTurnPolicy {
     pub id: EvalToolPolicy,
     pub allowed_tools: &'static [&'static str],
-}
-
-impl EvalTurnPolicy {
-    pub(crate) fn allows(&self, tool: &str) -> bool {
-        self.allowed_tools.contains(&tool)
-    }
 }
 
 static GAIA_PUBLIC_WEB_V1: EvalTurnPolicy = EvalTurnPolicy {
@@ -188,6 +182,39 @@ mod tests {
     }
 
     #[test]
+    fn resolved_policy_fields_match_their_id_arms() {
+        // Production gating consumes `EvalTurnPolicy.allowed_tools` (the
+        // field) while the per-id contract lives in the enum arm; a static
+        // initializer that drifts from its id must fail here. Probes include
+        // tools no eval policy may allow ("File", "web_search").
+        const PROBES: [&str; 8] = [
+            "read",
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "Web",
+            "image_analyze",
+            "File",
+            "web_search",
+        ];
+        let policies = [
+            resolve_eval_policy("pinvou-read-only-web/v1").unwrap(),
+            resolve_eval_policy("pinvou-gaia-public-web/v1").unwrap(),
+            resolve_eval_policy("pinvou-gaia-offline/v1").unwrap(),
+            resolve_eval_policy("pinvou-gaia-final-answer-only/v1").unwrap(),
+        ];
+        for policy in policies {
+            for tool in PROBES {
+                assert_eq!(
+                    policy.allowed_tools.contains(&tool),
+                    policy.id.allows(tool),
+                    "{policy:?}: field and id arm disagree on {tool:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn profiles_have_exact_network_separation() {
         let product = resolve_eval_policy("pinvou-read-only-web/v1").unwrap();
         let public = resolve_eval_policy("pinvou-gaia-public-web/v1").unwrap();
@@ -195,14 +222,14 @@ mod tests {
 
         let final_only = resolve_eval_policy("pinvou-gaia-final-answer-only/v1").unwrap();
         assert!(final_only.allowed_tools.is_empty());
-        assert!(!final_only.allows("read"));
-        assert!(product.allows("read"));
-        assert!(!product.allows("File"));
-        assert!(product.allows("Web"));
-        assert!(product.allows("image_analyze"));
-        assert!(public.allows("Web"));
-        assert!(!offline.allows("Web"));
-        assert!(!offline.allows("image_analyze"));
+        assert!(!final_only.id.allows("read"));
+        assert!(product.id.allows("read"));
+        assert!(!product.id.allows("File"));
+        assert!(product.id.allows("Web"));
+        assert!(product.id.allows("image_analyze"));
+        assert!(public.id.allows("Web"));
+        assert!(!offline.id.allows("Web"));
+        assert!(!offline.id.allows("image_analyze"));
         assert!(EvalToolPolicy::ProductV1.allows("Web"));
         assert!(!EvalToolPolicy::ProductV1.allows("web_search"));
         assert!(
@@ -214,11 +241,6 @@ mod tests {
             EvalToolPolicy::GaiaPublicWebV1
                 .model_reminder()
                 .contains("Multiple Web calls are allowed")
-        );
-        assert!(
-            EvalToolPolicy::GaiaPublicWebV1
-                .model_reminder()
-                .contains("never exceed 8 total tool calls")
         );
         assert!(
             EvalToolPolicy::GaiaPublicWebV1
@@ -235,6 +257,42 @@ mod tests {
                 .model_reminder()
                 .contains("exactly one non-empty line")
         );
+    }
+
+    /// The per-turn tool-call cap is gone everywhere (claim: benchmark-hooks
+    /// pin of 8, `PINVOU3_MAX_TOOL_CALLS`, eval arming, and the GAIA
+    /// reminder's 8-call sentence). The removal of the reminder sentence is
+    /// pinned as an ABSENCE here — the old presence-assert was deleted
+    /// without a replacement, so re-adding any call-budget wording to an
+    /// eval reminder would otherwise regress silently. "tool call" alone is
+    /// not forbidden wording: the final-answer policy legitimately says
+    /// "do not request or describe a tool call" (tools are disabled there,
+    /// no budget is involved).
+    #[test]
+    fn no_eval_model_reminder_couples_to_a_tool_call_budget() {
+        for policy in [
+            EvalToolPolicy::ProductV1,
+            EvalToolPolicy::GaiaPublicWebV1,
+            EvalToolPolicy::GaiaOfflineV1,
+            EvalToolPolicy::GaiaFinalAnswerOnlyV1,
+        ] {
+            let reminder = policy.model_reminder();
+            for forbidden in [
+                "never exceed 8 total tool calls",
+                "at most 8",
+                "no more than",
+                "call budget",
+                "tool-call budget",
+                "tool calls remaining",
+                "budget of",
+            ] {
+                assert!(
+                    !reminder.to_lowercase().contains(forbidden),
+                    "{policy:?} reminder must not couple to a per-turn tool-call budget \
+                     (found {forbidden:?}): {reminder}"
+                );
+            }
+        }
     }
 
     #[test]

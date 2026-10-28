@@ -34,6 +34,7 @@ pub(super) async fn create_turn_checkpoint(
     session_id: &str,
     ledger: std::path::PathBuf,
     execution: std::path::PathBuf,
+    label: String,
     caller: &str,
 ) -> Option<String> {
     let store_count = store.clone();
@@ -57,6 +58,7 @@ pub(super) async fn create_turn_checkpoint(
             &execution,
             turn_number,
             checkpoints::CheckpointKind::Turn,
+            &label,
         )
         .map(Some)
     })
@@ -161,7 +163,11 @@ pub async fn checkpoint_diff(
     )
     .await?;
     tauri::async_runtime::spawn_blocking(move || {
-        checkpoints::diff_checkpoint(&ledger, &execution, &checkpoint_id)
+        // `false`: the webview renders only the `changes` list (RewindChip);
+        // generating the unified diff here would cost a full `git diff` per
+        // preview open for bytes nothing reads. The patch surface is the
+        // CLI's, whose caller passes `true`.
+        checkpoints::diff_checkpoint(&ledger, &execution, &checkpoint_id, false)
             .map_err(|error| format!("读取检查点差异失败: {error:#}"))
     })
     .await
@@ -287,6 +293,19 @@ fn busy_peer_on_same_execution_root(
         .map_err(|error| format!("枚举会话失败: {error:#}"))?;
     for metadata in sessions.iter() {
         if metadata.id == session_id {
+            continue;
+        }
+        // Aux side-chat sessions have no writer surface by construction
+        // (PR #433; ADR-0024 leaves them at most one scoped READ-only tool):
+        // they can never write files, so the gate's premise — a peer engine
+        // leaving half-written files in the shared execution root — is
+        // structurally false for them. In production the exclusion is defense-in-depth:
+        // `SessionStore::session_roots` resolves an aux id to its private
+        // `sessions/aux-<id>/workspace` (no codex record, no workspace-binding
+        // sidecar is ever written for aux), so an aux root can never equal
+        // the parent's. The skip keeps the gate correct against any future
+        // resolver change that would surface a shared root for aux records.
+        if crate::features::sessions::is_aux_session_id(&metadata.id) {
             continue;
         }
         let roots = match store.session_roots(&metadata.id) {
@@ -693,6 +712,7 @@ mod tests {
             id: id.into(),
             turn,
             kind,
+            label: String::new(),
             commit: format!("commit-{id}"),
             created_at: 0,
         }
@@ -770,6 +790,23 @@ mod tests {
         (store, guard)
     }
 
+    /// 同长覆写已被影子 index 暂存的执行根文件时，若写入落在一个时间戳 tick
+    /// 内且 ext4 把刚释放的 inode 立刻复用，stat 与 index 缓存项完全一致，
+    /// 后续 `add -A` 会信任旧 blob（新旧快照树相同 → 提交复用，新内容丢失）。
+    /// 与 features/code_checkpoints 的 TestDir::write #590 加固同款：先写
+    /// 兄弟临时文件（创建时旧 inode 仍在，编号必不相同）再 rename 覆盖，
+    /// 与时间戳粒度和 inode 复用行为无关。
+    fn rewrite_staged_file(path: &std::path::Path, content: &str) {
+        let mut staging = path.as_os_str().to_os_string();
+        staging.push(format!(
+            ".pinvou3-new-{}",
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        let staging = std::path::PathBuf::from(staging);
+        std::fs::write(&staging, content).expect("write staging file");
+        std::fs::rename(&staging, path).expect("rename staging file over target");
+    }
+
     /// 跨会话忙碌门：同执行根的其它会话忙碌 → 返回其标题；不忙碌、
     /// 不同根、自身忙碌都不拦截。非 code 会话（plain/scheduled）同根且在途
     /// 也拦截——门看的是「谁在往这个目录写文件」，不是会话类型。
@@ -827,6 +864,77 @@ mod tests {
         let hit =
             busy_peer_on_same_execution_root(&store, &alice_id, &project, |id| id == busy_bob)
                 .expect("gate");
+        assert_eq!(hit, Some(bob.metadata.title.clone()));
+    }
+
+    /// An aux session (aux-) is not intercepted even when bound to the same
+    /// execution root and streaming an answer (PR #433 round-20 Major-1):
+    /// under the scoped-read-only semantics it cannot write files into the
+    /// directory, so the busy gate's premise structurally does not hold for
+    /// it. Note
+    /// (round-22 correction): the production root resolver always returns
+    /// None for aux ids (no codex record, and no workspace binding sidecar is
+    /// written), so the aux root always resolves to the private
+    /// `sessions/aux-<id>/workspace`, and the same-root-as-main scenario is
+    /// unreachable in production — the resolver binding below is a
+    /// hypothetical configuration that production could never produce for an
+    /// aux; what this test pins is the defensive exclusion itself, not a
+    /// mis-lock that ever really happened.
+    #[test]
+    fn busy_gate_ignores_busy_aux_peers_on_same_root() {
+        let (store, _g) = isolated_store("aux-peer");
+        let project = std::env::temp_dir().join(format!(
+            "pinvou3-rewind-gate-aux-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        std::fs::create_dir_all(&project).expect("project dir");
+        let main = store
+            .create_new("/model".into(), None, project.clone())
+            .expect("create main");
+        let main_id = main.metadata.id.clone();
+        let aux = store
+            .get_or_create_aux_session(&main_id)
+            .expect("create aux");
+
+        // Defensive configuration: the production root resolver always returns
+        // None for aux ids (see the test doc comment); here the aux is
+        // explicitly given the same root as the main session, purely to pin
+        // the exclusion logic itself.
+        let bound = project.clone();
+        let (m, x) = (main_id.clone(), aux.id.clone());
+        store.set_execution_root_resolver(Arc::new(move |id: &str| {
+            if id == m || id == x {
+                Some(bound.clone())
+            } else {
+                None
+            }
+        }));
+
+        // The aux session is streaming an answer (busy evaluates true) -> not intercepted.
+        let busy_aux = aux.id.clone();
+        let none =
+            busy_peer_on_same_execution_root(&store, &main_id, &project, |id| id == busy_aux)
+                .expect("gate");
+        assert_eq!(none, None, "busy aux peer must not block the main session");
+
+        // Control: a busy ordinary session on the same root still blocks (the
+        // aux exclusion did not weaken existing semantics).
+        let bob = store
+            .create_new("/model".into(), None, project.clone())
+            .expect("create bob");
+        let bound2 = project.clone();
+        let (m2, b2) = (main_id.clone(), bob.metadata.id.clone());
+        store.set_execution_root_resolver(Arc::new(move |id: &str| {
+            if id == m2 || id == b2 {
+                Some(bound2.clone())
+            } else {
+                None
+            }
+        }));
+        let busy_bob = bob.metadata.id.clone();
+        let hit = busy_peer_on_same_execution_root(&store, &main_id, &project, |id| id == busy_bob)
+            .expect("gate");
         assert_eq!(hit, Some(bob.metadata.title.clone()));
     }
 
@@ -898,12 +1006,15 @@ mod tests {
 
         // 旧分支：turn 1/2/3 各打一个 Turn 快照（模拟会话进行到第 3 轮）。
         std::fs::write(exec.join("a.txt"), "0\n").expect("write");
-        checkpoints::create_checkpoint(&ledger, &exec, Some(1), CheckpointKind::Turn).expect("c1");
-        std::fs::write(exec.join("a.txt"), "1\n").expect("write");
-        let old_t2 = checkpoints::create_checkpoint(&ledger, &exec, Some(2), CheckpointKind::Turn)
-            .expect("c2");
-        std::fs::write(exec.join("a.txt"), "2\n").expect("write");
-        checkpoints::create_checkpoint(&ledger, &exec, Some(3), CheckpointKind::Turn).expect("c3");
+        checkpoints::create_checkpoint(&ledger, &exec, Some(1), CheckpointKind::Turn, "t1")
+            .expect("c1");
+        rewrite_staged_file(&exec.join("a.txt"), "1\n");
+        let old_t2 =
+            checkpoints::create_checkpoint(&ledger, &exec, Some(2), CheckpointKind::Turn, "t2")
+                .expect("c2");
+        rewrite_staged_file(&exec.join("a.txt"), "2\n");
+        checkpoints::create_checkpoint(&ledger, &exec, Some(3), CheckpointKind::Turn, "t3")
+            .expect("c3");
 
         // 回退到第 1 轮（编排层在 restore + 截断成功后调用的正是本函数）。
         invalidate_abandoned_turn_checkpoints(&ledger, 1);
@@ -918,8 +1029,9 @@ mod tests {
 
         // 重新创作：新分支的 turn 2 打新快照。若旧 t2 未作废，find 会先命中它。
         std::fs::write(exec.join("a.txt"), "new-branch\n").expect("write");
-        let new_t2 = checkpoints::create_checkpoint(&ledger, &exec, Some(2), CheckpointKind::Turn)
-            .expect("c2 new");
+        let new_t2 =
+            checkpoints::create_checkpoint(&ledger, &exec, Some(2), CheckpointKind::Turn, "t2-new")
+                .expect("c2 new");
         assert_ne!(old_t2.id, new_t2.id);
         let plan = resolve_rewind_plan(
             checkpoints::list_checkpoints(&ledger).expect("list"),
@@ -1078,15 +1190,20 @@ mod tests {
         std::fs::create_dir_all(&ledger).expect("ledger dir");
         std::fs::write(exec.join("code.txt"), "v2\n").expect("write v2");
         // 镜像 rewind_to_turn 步骤 1：恢复代码前强制的 PreRestore（内容 = rewind 前 v2）。
-        let pre_restore =
-            checkpoints::create_checkpoint(&ledger, &exec, None, CheckpointKind::PreRestore)
-                .expect("pre-restore checkpoint");
+        let pre_restore = checkpoints::create_checkpoint(
+            &ledger,
+            &exec,
+            None,
+            CheckpointKind::PreRestore,
+            "回滚点",
+        )
+        .expect("pre-restore checkpoint");
         // 镜像步骤 2：截断对话，记录绑定本次回退的 PreRestore。
         store
             .truncate_to_user_turn(&id, 1, Some(pre_restore.id.clone()))
             .expect("rewind to turn 1");
         // 模拟 rewind 的代码侧结果：执行根已是回退后状态 v1。
-        std::fs::write(exec.join("code.txt"), "v1\n").expect("write v1");
+        rewrite_staged_file(&exec.join("code.txt"), "v1\n");
 
         // 条件齐全 → Some，字段正确（被截 1 轮，checkpoint_id 为记录绑定的 PreRestore）。
         let info = rewind_undo_state_inner(&store, &id)
@@ -1146,8 +1263,14 @@ mod tests {
         std::fs::create_dir_all(&ledger).expect("ledger dir");
         std::fs::write(exec.join("code.txt"), "user-work\n").expect("write");
         // 一次更早的完整回退留下的 PreRestore（与本次降级回退无关）。
-        checkpoints::create_checkpoint(&ledger, &exec, None, CheckpointKind::PreRestore)
-            .expect("unrelated pre-restore");
+        checkpoints::create_checkpoint(
+            &ledger,
+            &exec,
+            None,
+            CheckpointKind::PreRestore,
+            "无关回滚点",
+        )
+        .expect("unrelated pre-restore");
         std::fs::write(exec.join("code.txt"), "user-work-new\n").expect("write new");
 
         // 降级记录（rewound_code_session 以 None 绑定截断）：undo 状态可用但
@@ -1200,17 +1323,27 @@ mod tests {
         let exec = roots.execution.clone();
         std::fs::create_dir_all(&ledger).expect("ledger dir");
         std::fs::write(exec.join("code.txt"), "v2\n").expect("write v2");
-        let bound =
-            checkpoints::create_checkpoint(&ledger, &exec, None, CheckpointKind::PreRestore)
-                .expect("bound pre-restore");
+        let bound = checkpoints::create_checkpoint(
+            &ledger,
+            &exec,
+            None,
+            CheckpointKind::PreRestore,
+            "回滚点",
+        )
+        .expect("bound pre-restore");
         store
             .truncate_to_user_turn(&id, 1, Some(bound.id.clone()))
             .expect("rewind to turn 1");
         // 模拟 undo 步骤 1 已成功、步骤 2 失败：restore 内部新打的更晚 PreRestore。
-        std::fs::write(exec.join("code.txt"), "v1\n").expect("write v1");
-        let poisoned =
-            checkpoints::create_checkpoint(&ledger, &exec, None, CheckpointKind::PreRestore)
-                .expect("poisoning pre-restore");
+        rewrite_staged_file(&exec.join("code.txt"), "v1\n");
+        let poisoned = checkpoints::create_checkpoint(
+            &ledger,
+            &exec,
+            None,
+            CheckpointKind::PreRestore,
+            "undo 步骤 1 的副作用快照",
+        )
+        .expect("poisoning pre-restore");
         assert_ne!(bound.id, poisoned.id);
 
         // 重试 undo：候选仍是绑定的回滚点，不是更晚的那条。

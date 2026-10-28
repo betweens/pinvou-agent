@@ -36,6 +36,14 @@ const desktopSessionsBridge = readSource(
   path.join(bridgeRoot, 'bridge', 'sessions.js'),
   'utf8',
 );
+const desktopAuxChatBridge = readSource(
+  path.join(bridgeRoot, 'bridge', 'aux-chat.js'),
+  'utf8',
+);
+const sharedBridgeHelpers = readSource(
+  path.join(root, 'src', 'shared', 'bridge-shared-helpers.js'),
+  'utf8',
+);
 const desktopBridgeSources = [
   readSource(path.join(bridgeRoot, 'bridge.js'), 'utf8'),
   ...fs.readdirSync(path.join(bridgeRoot, 'bridge'))
@@ -103,8 +111,8 @@ const codexWorkspacePanel = readSource(
   path.join(root, 'src', 'features', 'codex', 'CodexWorkspacePanel.jsx'),
   'utf8',
 );
-const codeViewerModal = readSource(
-  path.join(root, 'src', 'features', 'codex', 'CodeViewerModal.jsx'),
+const codeViewerContent = readSource(
+  path.join(root, 'src', 'features', 'codex', 'CodeViewerContent.jsx'),
   'utf8',
 );
 const acpPlatformClient = readSource(path.join(root, 'src', 'features', 'codex', 'acpClient.js'), 'utf8');
@@ -132,10 +140,6 @@ for (const command of [
   'set_active_model',
   'test_model_connection',
   'set_disabled_connectors',
-  'install_marketplace_skill',
-  'install_marketplace_tool',
-  'uninstall_marketplace_skill',
-  'uninstall_marketplace_tool',
   'install_marketplace_skill',
   'install_marketplace_tool',
   'uninstall_marketplace_skill',
@@ -176,6 +180,13 @@ for (const command of [
   // stash / checkout): desktop-only, the web client rejects them explicitly.
   'list_codex_workspace_branches',
   'checkout_codex_workspace_branch',
+  // Clipboard reads are desktop-privacy surface: the paste fallback runs on
+  // the desktop host only; web pastes go through the device-upload path.
+  'paste_clipboard_image',
+  // Dependency detection shells out to system package managers and is
+  // deliberately not allowlisted on the web; the web hides the whole
+  // dependency section behind the dependencyInstall capability bit.
+  'check_dependencies',
 ]) {
   assert.equal(allowed.has(command), false, `${command} must remain desktop-only`);
 }
@@ -192,12 +203,45 @@ for (const command of [
   assert.equal(allowed.has(command), true, `${command} must be allowed on Web (KB import controls)`);
 }
 
+// Builtin feature switches (docs/builtin-toolset-contract.md §3.3): the WebUI
+// proxies to the same desktop host, so the feature-off state must be readable
+// from the browser too — otherwise a browser client keeps a switched-off
+// feature (session mention) fully live while read_session is gone on the
+// host. list_builtin_features is lane-agnostic and read-only; the write side
+// stays desktop-only.
+for (const command of ['list_builtin_features']) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (builtin feature registry read)`);
+}
+for (const command of ['set_builtin_feature_enabled']) {
+  assert.equal(allowed.has(command), false, `${command} must remain desktop-only (builtin feature toggles)`);
+}
+// Hot refresh: switch toggles broadcast remote_control:tools_changed; the relay
+// must forward it (allowlist) and the web bridge must re-dispatch the shared
+// pinvou:tools-changed DOM event so ChatView's registry subscription updates
+// on browser clients too (desktop gets the same event via chat-events.js).
+assert.equal(
+  allowedEvents.has('remote_control:tools_changed'), true,
+  'remote_control:tools_changed must be allowed on Web (builtin feature switch hot refresh)',
+);
+assert.match(
+  webBridge,
+  /listen\("remote_control:tools_changed", function \(\) \{\s*try \{ window\.PinvouToolStoreEvents\.notifyComposerToolsChanged\(\); \}/,
+  'web bridge must re-dispatch pinvou:tools-changed through the shared module from remote_control:tools_changed (bounded to the adjacent dispatch line — round-23 asto minor 3: the old unbounded gap stayed green on a deleted dispatch; round-9: FFE4-1 conversion completed, the web lane now matches the desktop chat-events.js twin)',
+);
+
 // Memory organize is a global action (no session scope, same surface as
 // get_memory_overview): the settings "AI 整理记忆" (AI organize memory) button and
 // the "上次整理" (last organized) history read must work on WebUI too; missing
 // either one makes the button fail silently with command_not_allowed.
 for (const command of ['organize_memory', 'get_memory_organize_history']) {
   assert.equal(allowed.has(command), true, `${command} must be allowed on Web (memory organize)`);
+}
+
+// Scene-label sidecars sync per session switch on Web exactly like the
+// persona-events / pinvou-reviews siblings; dropping either entry logs a
+// sidecar failure per session switch and silently stops label sync.
+for (const command of ['get_session_pinvou_scene_events', 'save_session_pinvou_scene_events']) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (scene-label sidecars)`);
 }
 
 // Authorized-connector toggle/skill state queries are part of the WebUI surface
@@ -298,6 +342,36 @@ assert.equal(allowed.has('list_sessions'), false,
 assert.equal(allowed.has('list_archived_sessions'), false,
   'Web must not call the native archived list that exposes host workspace metadata');
 
+// Aux chat domain: platform/web/bridge.js's auxChatEnsure/
+// auxChatReset invoke these commands directly; sending goes through the
+// existing web_access_chat (an aux session can be store.load'ed by id and is
+// not affected by the list_sessions filter). Missing any entry would make
+// the Web aux chat fail silently.
+for (const command of [
+  'get_or_create_aux_session',
+  'reset_aux_session',
+]) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (aux chat)`);
+}
+assert.equal(allowed.has('get_aux_session'), false,
+  'the dead get_aux_session command must stay removed from the Web surface');
+
+// get_or_create_aux_session and reset_aux_session cross the Web/Relay
+// boundary, so they must return the minimal AuxSessionBinding projection (id
+// only) — never the full SessionMetadata, whose inherited host workspace
+// path would leak to the browser (the redaction invariant behind
+// redact_session_metadata_for_web).
+assert.match(commands, /pub struct AuxSessionBinding \{\s*pub id: String,?\s*\}/,
+  'the aux session command must return an id-only projection');
+assert.match(commands, /fn get_or_create_aux_session\([\s\S]{0,300}?-> Result<AuxSessionBinding, String>/,
+  'get_or_create_aux_session must not return raw SessionMetadata across the Web boundary');
+assert.match(commands, /get_or_create_aux_session\(&session_id\)[\s\S]{0,200}?AuxSessionBinding \{ id: metadata\.id \}/,
+  'the aux session projection must be built from the store metadata without exposing it');
+assert.match(commands, /fn reset_aux_session\([\s\S]{0,400}?-> Result<AuxSessionBinding, String>/,
+  'reset_aux_session must not return raw SessionMetadata across the Web boundary');
+assert.match(commands, /fn reset_aux_session[\s\S]{0,600}?WebSessionOperation::ResetAuxSession/,
+  'reset_aux_session errors must fold into the stable web_session code');
+
 assert.equal(allowedEvents.has('acp:event'), true,
   'the shared ACP timeline must reach WebUI through the normal event transport');
 assert.match(bootstrap, /acpCodeMode:\s*\{[\s\S]*?commands:\s*\[[\s\S]*?web_access_codex_acp_prompt[\s\S]*?events:\s*\["acp:event"\]/,
@@ -332,8 +406,8 @@ assert.match(codexWorkspacePanel, /can\('externalSystemOpen'\)/,
 assert.match(codexWorkspacePanel, /onOpen=\{systemOpenAvailable/);
 assert.match(codexWorkspacePanel, /onReveal=\{systemOpenAvailable/);
 assert.match(codexWorkspacePanel, /onOpenInNewWindow=\{systemOpenAvailable/);
-assert.match(codeViewerModal, /\{!diff && onReveal && \(/);
-assert.match(codeViewerModal, /\{!diff && onOpen && \(/,
+assert.match(codeViewerContent, /\{!hideDesktopActions && onReveal && \(/);
+assert.match(codeViewerContent, /\{!hideDesktopActions && onOpen && \(/,
   'the shared code preview must omit desktop system actions when callbacks are unavailable');
 
 // 浏览器本机上传:双入口按能力协商门控,分块有界,取消/失败路径完备。
@@ -361,10 +435,11 @@ assert.match(webBridge, /web_access_discard_attachment/,
   'removed or late-cancelled attachments must release their opaque desktop handle');
 assert.match(remoteControlCommands, /stage_uploaded_attachments\(attachments, session_id, &?store\)/,
   'uploaded attachments must be staged into the Session workspace before the engine sees their paths');
-// Agent 安装命令行/输出可能含内部镜像源或主机路径，Web status 投影必须清除。
+// Agent 安装命令行/输出可能含内部镜像源或主机路径，Web status 投影必须清除；
+// 安装终局的 error 字段同为错误链，一并仅桌面端展示。
 assert.match(remoteControlCommands,
-  /project_acp_status_for_web[\s\S]*?status\.install_command = None[\s\S]*?status\.install_latest_line = None/,
-  'the Web agent-status projection must strip install command and output lines');
+  /project_acp_status_for_web[\s\S]*?status\.install_command = None[\s\S]*?status\.install_latest_line = None[\s\S]*?status\.install_finished = None/,
+  'the Web agent-status projection must strip install command/output lines and the install outcome');
 assert.match(remoteControlCommands, /redact_workspace_path_for_web|list_codex_acp_sessions_for_web/,
   'the Web session list must redact host workspace paths to a directory name');
 assert.match(remoteControlCommands,
@@ -383,7 +458,7 @@ assert.match(remoteControlCommands,
   /impl<'a> WebSavedSession<'a>[\s\S]*?redact_session_metadata_for_web\(session\.metadata\.clone\(\)\)[\s\S]*?web_artifact_storage_path[\s\S]*?ledger_root\(&session_id\)[\s\S]*?session_artifacts_dir\(&session_id\)[\s\S]*?WebSavedSession::project\(&saved, &artifact_roots, &revision\)/,
   'the Web session projection must redact metadata and scope legacy artifact paths before serialization');
 assert.match(webBridge,
-  /IS_WEB \? "web_access_list_sessions" : "list_sessions"[\s\S]*?IS_WEB \? "web_access_list_archived_sessions" : "list_archived_sessions"/,
+  /invoke\("web_access_list_sessions"\)[\s\S]*?"web_access_list_archived_sessions"/,
   'Web history refreshes must use path-redacted session list commands');
 assert.match(remoteControlCommands,
   /fn web_operation_result[\s\S]*?format!\("\{prefix\}_\{operation\}_failed"\)[\s\S]*?fn web_workspace_result[\s\S]*?web_operation_result\([\s\S]*?"web_workspace"[\s\S]*?web_access_list_codex_workspace[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Listing, result\)[\s\S]*?web_access_search_codex_workspace[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Search, result\)[\s\S]*?web_access_preview_codex_workspace_file[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Preview, result\)[\s\S]*?web_access_get_codex_workspace_changes[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Changes, result\)[\s\S]*?web_access_get_codex_workspace_diff[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Diff, result\)/,
@@ -572,7 +647,6 @@ assert.match(bootstrap, /sendReady\(false\)/);
 assert.match(bootstrap, /state_ready: stateReady/);
 assert.match(bootstrap, /markStateReady\(\)/);
 assert.match(bootstrap, /if \(!this\.frontendReady \|\| !this\.stateReady\)/);
-assert.match(bootstrap, /if \(!this\.frontendReady \|\| !this\.stateReady\)/);
 const main = readSource(path.join(root, 'src', 'app', 'main.jsx'), 'utf8');
 // The desktop-only saveSearchSettingsAndRestart wrapper (and its
 // "unsupported by the Web host" stub) was removed from the web bridge as dead
@@ -584,7 +658,7 @@ assert.doesNotMatch(webBridge, /async function saveSearchSettingsAndRestart/,
   'the desktop-only restart wrapper must stay off the web bridge');
 assert.match(main, /const saved = isWeb[\s\S]{0,180}saveSearchSettings\(search\)[\s\S]{0,180}saveSearchSettingsAndRestart\(search\)/,
   'the shared UI must save without requesting a desktop restart in WebUI');
-assert.match(webBridge, /state\.settings = await invoke\(IS_WEB \? "web_access_update_settings" : "update_settings"/,
+assert.match(webBridge, /state\.settings = await invoke\("web_access_update_settings"/,
   'WebUI must keep the canonical settings returned by the desktop backend');
 assert.match(webBridge, /web_access_update_settings", \{ patch: \{ (?:search: search|search) \} \}/,
   'WebUI search saves must send a narrow patch instead of a full settings snapshot');
@@ -630,9 +704,41 @@ assert.match(webBridge, /composerDraft: ""/,
   'WebUI must keep a per-session in-memory composer draft');
 assert.match(webDomainAdapter, /chat: domain\(\["sendMessage", "sendMessageToSession", "getComposerDraft", "setComposerDraft"/,
   'WebUI domain facade must expose the same composer draft API as desktop');
-assert.match(webBridge, /buf\.composerDraft = state\.composerDraft/,
+assert.match(webDomainAdapter, /auxChat: domain\(\[\], \{\s*ensure: "auxChatEnsure",\s*send: "auxChatSend",\s*snapshot: "auxChatSnapshot",\s*reset: "auxChatReset"/,
+  'WebUI domain facade must expose the same auxChat domain as desktop');
+// M7: the auxChat domain bodies live in the shared lane (cluster "auxChat");
+// both lanes consume it and keep only their send dispatch. Renaming an
+// operation in the shared cluster must turn these pins red.
+assert.match(sharedBridgeHelpers, /"auxChat": function \(deps\)/,
+  'the shared bridge base must register the auxChat cluster (M7)');
+assert.match(sharedBridgeHelpers, /async function auxChatEnsure\(taskId\)/);
+assert.match(webBridge, /PinvouBridgeShared\.create\("auxChat", \{/,
+  'the Web lane must consume the shared auxChat cluster (M7)');
+assert.match(desktopAuxChatBridge, /PinvouBridgeShared\.create\("auxChat", \{/,
+  'the desktop lane must consume the shared auxChat cluster (M7)');
+assert.match(sharedBridgeHelpers, /invoke\("get_or_create_aux_session", \{ sessionId: task \}\)/,
+  'aux chat must create-or-fetch the aux session by task id');
+assert.match(webBridge, /invoke\("web_access_chat", \{ message, attachmentHandles: \[\], sessionId: sid, restrictTools: true \}\)/,
+  'WebUI aux chat sends must ride the bounded web chat command with tools restricted');
+assert.match(sharedBridgeHelpers, /async function auxChatReset\(taskId\)/);
+assert.match(sharedBridgeHelpers, /invoke\("reset_aux_session", \{ sessionId: task \}\)/,
+  'aux chat restart must ride the atomic reset command (M6)');
+// M5: the aux id is a pure function of the task id (aux-<taskId>, round-30
+// B8), so both lanes derive it at the purge site — the redundant, never-pruned
+// auxIdByTask maps are gone.
+assert.doesNotMatch(webBridge, /auxIdByTask/,
+  'the WebUI aux id must be derived, not stored in an unbounded per-task map (M5)');
+assert.doesNotMatch(desktopAuxChatBridge, /auxIdByTask/,
+  'the desktop aux id must be derived, not stored in an unbounded per-task map (M5)');
+assert.match(bridge, /registry\.auxChat = function \(context\)/,
+  'the desktop bridge must register the auxChat feature module');
+assert.match(desktopAuxChatBridge, /invoke\("chat", \{ message, attachments: \[\], sessionId: sid, restrictTools: true \}\)/,
+  'desktop aux chat sends must restrict tools and skip attachments');
+// The lane-merge residual wave moved the working-set save/restore bodies into
+// the shared base; the Web lane executes them through its cluster instance.
+assert.match(sharedBridgeHelpers, /buf\.composerDraft = state\.composerDraft/,
   'WebUI session switching must save the active composer draft');
-assert.match(webBridge, /state\.composerDraft = buf\.composerDraft/,
+assert.match(sharedBridgeHelpers, /state\.composerDraft = buf\.composerDraft/,
   'WebUI session switching must restore the destination composer draft');
 assert.match(webBridge, /(?:var|const|let) draftComposer = realId \? "" : \(state\.composerDraft \|\| ""\)/,
   'WebUI background session events must snapshot an unmaterialized draft');
@@ -666,7 +772,10 @@ assert.match(bridge, /remoteAdmissionKeys/);
 assert.match(bridge, /(?:var|const|let) activePlanCards = Object\.create\(null\)/);
 assert.match(bridge, /(?:var|const|let) hydratedKey = planCardHydrationKey\(hydratedPlan\)/);
 assert.match(bridge, /hydratedPlan\.cardState = "active"/);
-assert.match(bridge, /if \(item\.type === "plan_card"\) return false/);
+// Wave 5 moved the hydration live-card filter into the shared base
+// (liveChatItemKeptForHydration); pin the shared body + the lane delegation.
+assert.match(bridge, /liveChatItemKeptForHydration/);
+assert.match(readSource(path.join(root, 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8'), /if \(item\.type === "plan_card"\) return false/);
 assert.match(bridge, /action === "accept_plan"/);
 assert.match(bridge, /acceptedMode = payload\.mode_state \|\| payload\.modeState/);
 assert.match(bridge, /planNotActive = errorText\.(?:indexOf\("plan_not_active"\)|includes\("plan_not_active"\))/);
@@ -725,7 +834,26 @@ assert.match(bridge, /MAX_WEB_ARTIFACT_DOWNLOAD_BYTES = 256 \* 1024 \* 1024/);
 assert.match(bridge, /if \(IS_WEB && !hasCapability\("artifactDownload"\)\)/);
 assert.match(bridge, /(?:var|const|let) info = await artifactInfo\(path, resolvedSessionId\)/);
 assert.match(bridge, /if \(expectedSize > MAX_WEB_ARTIFACT_DOWNLOAD_BYTES\)/);
-assert.match(bridge, /if \(bytes\.length > MAX_WEB_ARTIFACT_DOWNLOAD_BYTES - offset\)/);
+// F-XT7-7: the per-part overflow re-check lives in the shared
+// streamBase64PartsToBlob core (maxBytes-parameterized); both download
+// pipelines must route through it.
+assert.match(bridge, /streamBase64PartsToBlob\(function \(offset\)/);
+assert.match(bridge, /if \(bytes\.length > maxBytes - offset\)/);
+// Round-2 review minor: the maxBytes ARGUMENT at each call site is
+// load-bearing — the core re-checks are only as strong as the binding passed
+// in (e.g. Infinity would silently disarm them), so both download pipelines
+// must pass the module cap explicitly, exactly once each.
+assert.equal(
+  (bridge.match(/\}, expectedSize, MAX_WEB_ARTIFACT_DOWNLOAD_BYTES, \{/g) || []).length,
+  1,
+  'the artifact download pipeline must pass MAX_WEB_ARTIFACT_DOWNLOAD_BYTES as maxBytes',
+);
+assert.equal(
+  (bridge.match(/\}, null, MAX_WEB_ARTIFACT_DOWNLOAD_BYTES, \{/g) || []).length,
+  1,
+  'the attachment download pipeline must pass MAX_WEB_ARTIFACT_DOWNLOAD_BYTES as maxBytes',
+);
+assert.match(bridge, /streamBase64PartsToBlob\(function \(offset\) \{\n {6}return invoke\("web_access_read_conversation_attachment_chunk"/);
 assert.match(artifactsPanel, /const canDownloadArtifacts = can\('artifactDownload'\);/);
 assert.ok((artifactsPanel.match(/\(!isWeb \|\| canDownloadArtifacts\)/g) || []).length >= 2,
   'WebUI artifact download buttons must hide when the installed desktop lacks download support');
@@ -763,10 +891,23 @@ assert.ok(
 // 提交信号由发送链路在后端受理新一轮后派发：常规发送（desktop/web doSendFor）、
 // Web 首轮提交、接受计划（desktop/web acceptPlan）、编辑重跑（desktop/web
 // editLastTurn）、原生代码车道发送与接受方案，缺任一处 pending 都不会转正。
-assert.match(bridge, /window\.dispatchEvent\(new CustomEvent\("pinvou:chat-round-committed", \{ detail: \{ scope: "plain" \} \}\)\)/);
+// FFE4-1：原始 dispatch 只存在于 shared/tool-store-events.js；platform 桥接层
+// 的 7 处发送/接受/重跑路径必须经 window.PinvouToolStoreEvents 调用。
+const toolStoreEventsShared = readSource(path.join(root, 'src', 'shared', 'tool-store-events.js'), 'utf8');
+assert.match(toolStoreEventsShared, /pinvou:chat-round-committed/);
+assert.match(toolStoreEventsShared, /pinvou:tools-changed/);
+assert.match(
+  bridge,
+  /window\.PinvouToolStoreEvents\.notifyChatRoundCommitted\(\)/,
+  'platform bridges must dispatch the round-committed event through the shared helper',
+);
 assert.ok(
-  (bridge.match(/pinvou:chat-round-committed/g) || []).length >= 7,
+  (bridge.match(/PinvouToolStoreEvents\.notifyChatRoundCommitted\(\)/g) || []).length >= 7,
   'desktop doSendFor/acceptPlan/editLastTurn and web doSendFor/first-turn/acceptPlan/editLastTurn must each dispatch the round-committed event',
+);
+assert.ok(
+  (bridge.match(/PinvouToolStoreEvents\.notifyComposerToolsChanged\(\)/g) || []).length >= 1,
+  'the desktop bridge must dispatch the tools-changed refresh through the shared helper',
 );
 assert.ok(
   (codexView.match(/notifyChatRoundCommitted\('code'\);/g) || []).length >= 2,
@@ -797,7 +938,7 @@ assert.match(toolStoreView,
   'purge handler must fail closed in WebUI');
 assert.match(knowledgeView, /const canDownloadArtifacts = !isWeb \|\| can\('artifactDownload'\);/);
 assert.match(knowledgeView, /const canPickHostFiles = !isWeb \|\| can\('hostFilePicker'\);/);
-assert.match(knowledgeView, /const outputSessionId = o\.sessionId \|\| o\.session_id \|\| null;/);
+assert.match(knowledgeView, /const outputSessionId = o\.sessionId \|\| null;/);
 assert.match(knowledgeView, /const cacheKey = `\$\{outputSessionId \|\| ''\}\|\$\{o\.path\}\|\$\{o\.mtime \|\| 0\}`;/);
 assert.ok((knowledgeView.match(/o\.path, outputSessionId/g) || []).length >= 5,
   'output previews must authorize every Web artifact read with the owning session');
@@ -815,6 +956,10 @@ assert.match(settingsView, /const canPickHostFiles = can\('hostFilePicker'\);/);
 assert.match(toolCommon, /const canOpenArtifact = !isWeb \|\| can\('artifactDownload'\);/);
 assert.match(connectionStatus, /incompatible_desktop/);
 assert.match(connectionStatus, /BLOCKING[\s\S]*incompatible_desktop/);
+assert.match(connectionStatus, /copy\[connection\.status\] \? fallback : \(connection\.message \|\| fallback\)/,
+  'known connection states must use localized copy while unknown states retain diagnostics');
+assert.doesNotMatch(connectionStatus, /connection\.status === 'error'.*connection\.message/s,
+  'known error states must not expose unlocalized backend diagnostics');
 assert.match(settingsView, /remoteCopy = t\.uiRemote/);
 assert.match(settingsView, /\{remoteCopy\.title\}/);
 assert.match(settingsView, /\{remoteCopy\.link\}/);

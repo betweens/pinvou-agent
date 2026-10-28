@@ -1,7 +1,9 @@
 /// 连接器 / 包可见性 / 项目级 skills 开关共用的热刷收尾：重写在线会话组合目录
 /// + 热刷工具白名单 + 热刷 execpolicy 规则集，并向远控端广播
 /// `remote_control:tools_changed`（其它窗口/实例借此刷新开关状态）。
-async fn refresh_tools_and_broadcast(app: &AppHandle, pool: &EnginePool) {
+/// `pub(super)`: the builtin-plugin feature switch (commands::builtin) reuses
+/// the same wrap-up.
+pub(super) async fn refresh_tools_and_broadcast(app: &AppHandle, pool: &EnginePool) {
     pool.refresh_live_sessions_skills().await;
     pool.refresh_disallowed_tools().await;
     pool.refresh_permission_rulesets().await;
@@ -39,9 +41,14 @@ pub async fn set_disabled_connectors(
 #[tauri::command]
 pub async fn get_disabled_connectors(scope: Option<String>) -> Result<Vec<String>, String> {
     let scope = parse_connector_scope(scope.as_deref())?;
-    Ok(crate::features::marketplace::load_disabled_bundles_for(
-        scope,
-    ))
+    // The read path tries the cross-process flock (#515) and degrades instead
+    // of blocking, but it still takes the in-process scope mutex and does file
+    // I/O; keep it off the executor thread (aligned with the write commands).
+    tokio::task::spawn_blocking(move || {
+        crate::features::marketplace::load_disabled_bundles_for(scope)
+    })
+    .await
+    .map_err(|e| format!("get_disabled_connectors join: {e}"))
 }
 
 /// 商店「管理可见性」：写某 scope 被「不可见」的包 id 列表。控制 composer 列表显隐 +
@@ -54,9 +61,15 @@ pub async fn set_bundle_visibility(
     pool: State<'_, EnginePool>,
 ) -> Result<(), String> {
     let scope = parse_connector_scope(scope.as_deref())?;
-    let ids = bundle_ids.clone();
+    // Builtin plugins cannot be hidden (docs/builtin-toolset-contract.md
+    // §3.1 defense in depth): the write fails loudly instead of silently
+    // filtering the id out.
+    crate::features::marketplace::builtin::reject_builtin_ids(&bundle_ids)?;
+    // The visibility write shares the fail-loud contract restored by round-19
+    // MAJOR 1: a save failure propagates via `??` (the frontend rolls the
+    // toggle back and alerts) instead of degrading to a log line.
     tokio::task::spawn_blocking(move || {
-        crate::features::marketplace::save_hidden_bundles_for(scope, &ids)
+        crate::features::marketplace::save_hidden_bundles_for(scope, &bundle_ids)
     })
     .await
     .map_err(|e| format!("set_bundle_visibility join: {e}"))??;
@@ -69,7 +82,115 @@ pub async fn set_bundle_visibility(
 #[tauri::command]
 pub async fn get_bundle_visibility(scope: Option<String>) -> Result<Vec<String>, String> {
     let scope = parse_connector_scope(scope.as_deref())?;
-    Ok(crate::features::marketplace::load_hidden_bundles_for(scope))
+    tokio::task::spawn_blocking(move || {
+        crate::features::marketplace::load_hidden_bundles_for(scope)
+    })
+    .await
+    .map_err(|e| format!("get_bundle_visibility join: {e}"))
+}
+
+/// Outcome of `enable_marketplace_packages` (round-11 m11): an explicit
+/// shape replaces the previous `Ok(blocked)` overload where a non-empty Ok
+/// doubled as "refused, nothing enabled, hot-refresh skipped" — an implicit
+/// contract that held only because both JS callers checked the payload.
+#[derive(serde::Serialize)]
+pub struct EnablePackagesOutcome {
+    /// The batch was applied and persisted with full per-id coverage (round-27
+    /// m10: the hot refresh is gated on the domain `state_changed`, not this
+    /// flag — a mixed batch or a hidden-only un-hide persists state while this
+    /// reads false).
+    pub enabled: bool,
+    /// Non-empty = refused: these ids sit in the scope's **explicit** user
+    /// switch state (install-default offs lift freely, round-11 B2); nothing
+    /// was enabled and no hot-refresh ran. The caller must surface the ids.
+    pub blocked: Vec<String>,
+    /// Non-empty (round-13 m3) = requested ids that matched no entry in the
+    /// DenyAll expansion — likely a concurrent install that had not committed
+    /// when the expansion snapshotted, or an unknown id. Everything else in
+    /// the batch may still have applied; the caller must not present the
+    /// opt-in of these ids as done.
+    ///
+    /// State-space caveat (round-20 minor 2): only the uninitialized
+    /// (expansion) arm can detect these. In an **initialized** scope an
+    /// unknown id is treated as already-on and is NOT reported — both lists
+    /// come back empty and `enabled` reads true while the id matched nothing.
+    /// Fail-closed in effect (an uninstalled pack is off by default anyway);
+    /// do not cite an empty `not_applied` as coverage evidence there.
+    pub not_applied: Vec<String>,
+}
+
+// Round-16 minor 9: the IPC shape carries `enabled`; the domain shape
+// (`features::marketplace::scope::EnablePackagesOutcome`) does not. The
+// mapping lives in this single conversion so the two structs cannot drift:
+// `enabled` is honest about coverage — a refused batch or any id that matched
+// nothing (not_applied) means the batch did not fully apply, so it is not
+// reported as a plain success; the caller surfaces blocked/not_applied. The
+// initialized-arm caveat on `not_applied` applies here unchanged: an empty
+// `not_applied` from an initialized scope is "no signal", not "coverage
+// proven". The hot-refresh gate below uses the domain `state_changed` (round-26
+// minor 1), not `enabled` — they are different predicates: a mixed batch and a
+// hidden-only un-hide both change persisted state while `enabled` reads false.
+impl From<crate::features::marketplace::scope::EnablePackagesOutcome> for EnablePackagesOutcome {
+    fn from(value: crate::features::marketplace::scope::EnablePackagesOutcome) -> Self {
+        let blocked = value.blocked;
+        let not_applied = value.not_applied;
+        Self {
+            enabled: blocked.is_empty() && not_applied.is_empty(),
+            blocked,
+            not_applied,
+        }
+    }
+}
+
+/// Batch package enabling for user actions such as scene opt-in (review #455
+/// R7-M3): the backend performs "read the currently effective disabled set →
+/// remove package_ids → persist" inside a single
+/// cross-process critical section (`file_lock::with_file_lock` on the scope
+/// file); the frontend no longer does a whole-table
+/// read-modify-write (a cross-IPC compound operation would overwrite a
+/// concurrent composer toggle with a stale snapshot, and fail-open would
+/// resurrect a package the user explicitly turned off). After persisting, it
+/// hot-refreshes on the same path as `set_disabled_connectors`: rewrite
+/// online session composite skills directories + the tool allowlist +
+/// execpolicy rulesets — visible to sessions from the **next** conversation
+/// turn (round-26 minor 1, aligning this wording with the engine-pool
+/// hot-refresh doc; the refresh is not applied retroactively to an in-flight
+/// turn).
+#[tauri::command]
+pub async fn enable_marketplace_packages(
+    package_ids: Vec<String>,
+    scope: Option<String>,
+    app: AppHandle,
+    pool: State<'_, EnginePool>,
+) -> Result<EnablePackagesOutcome, String> {
+    let scope = parse_connector_scope(scope.as_deref())?;
+    // The inner `?` is the persist failure (round-12 review): the command must
+    // fail rather than report `enabled: true` for state that never reached
+    // disk — the frontend renders its failure notice from the rejected invoke.
+    let domain_outcome = tokio::task::spawn_blocking(move || {
+        crate::features::marketplace::scope::enable_packages_in_scope(scope, &package_ids)
+    })
+    .await
+    .map_err(|e| format!("enable_marketplace_packages join: {e}"))??;
+    let state_changed = domain_outcome.state_changed;
+    let outcome: EnablePackagesOutcome = domain_outcome.into();
+    // Round-26 minor 1 (review #455): the refresh gate is "did the persisted
+    // state actually change", not the IPC `enabled` coverage flag. A mixed
+    // batch (some ids applied+persisted, some `not_applied`) and a
+    // hidden-only un-hide (the hidden-set leg persists a visibility change
+    // with every id `not_applied`) both leave live sessions with stale
+    // allowlists if the refresh is skipped. `enabled` stays false for those
+    // — it honestly reports partial coverage — but the refresh must run.
+    // Round-24 minor 11's underlying point stands for the truly-inert case:
+    // a refused batch and a not_applied-only batch change nothing, so the
+    // full hot refresh stays skipped there (state_changed is false).
+    if state_changed {
+        // Identical finalization to the other switch writers (round-16 minor
+        // 9: previously re-inlined the same seven statements). Skipped only
+        // when the batch was refused (round-10 Major 2) and no state changed.
+        refresh_tools_and_broadcast(&app, pool.inner()).await;
+    }
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +206,14 @@ pub async fn set_project_skills_enabled(
     app: AppHandle,
     pool: State<'_, EnginePool>,
 ) -> Result<(), String> {
-    crate::features::marketplace::scope::set_project_skills_enabled(enabled)?;
+    // The write path takes the cross-process file lock (#515) and can block
+    // on flock until the peer process releases it; keep it off the executor
+    // (aligned with set_disabled_connectors / set_bundle_visibility).
+    tokio::task::spawn_blocking(move || {
+        crate::features::marketplace::scope::set_project_skills_enabled(enabled)
+    })
+    .await
+    .map_err(|e| format!("set_project_skills_enabled join: {e}"))??;
     // The toggle affects code-session composed catalogs: rewrite the online
     // session composed catalogs, hot-refresh the load_skill hidden check and the
     // execpolicy rule set (project-level skills rejoin the deny/allow sets), and
@@ -99,7 +227,9 @@ pub async fn set_project_skills_enabled(
 /// 项目级 skills 开关状态（默认关）。
 #[tauri::command]
 pub async fn get_project_skills_enabled() -> Result<bool, String> {
-    Ok(crate::features::marketplace::scope::project_skills_enabled())
+    tokio::task::spawn_blocking(crate::features::marketplace::scope::project_skills_enabled)
+        .await
+        .map_err(|e| format!("get_project_skills_enabled join: {e}"))
 }
 
 /// 解析前端传入的 scope:缺省/空 = plain;已注册模式名(`SessionMode` 的
@@ -135,32 +265,15 @@ pub async fn refresh_connector_auth_gates(
     Ok(result)
 }
 
-fn track_cli_install(app: &AppHandle, tool_key: &str, tool_name: &str) {
-    crate::features::behavior_telemetry::track(
-        app,
-        crate::features::behavior_telemetry::BehaviorEvent::new("tool_install_completed")
-            .tool(tool_key, tool_name, "cli")
-            .success(true),
-    );
-}
-
-fn was_new_cli_install(result: &Value) -> bool {
-    result
-        .get("already")
-        .and_then(Value::as_bool)
-        .is_some_and(|already| !already)
-}
-
-#[tauri::command]
-pub async fn feishu_ensure_cli(app: AppHandle) -> Result<Value, String> {
-    let result = feishu_domain::feishu_ensure_cli().await?;
-    if was_new_cli_install(&result) {
-        track_cli_install(&app, "feishu", "飞书");
-    }
-    Ok(result)
-}
-async_command_passthrough!(feishu_domain, feishu_connect_begin(app: AppHandle) -> Result<Value, String>);
-async_command_passthrough!(feishu_domain, feishu_cancel(app: AppHandle) -> Result<Value, String>);
+async_command_passthrough!(feishu_domain, feishu_ensure_cli() -> Result<Value, String>);
+async_command_passthrough!(
+    feishu_domain,
+    feishu_connect_begin(app: AppHandle) -> Result<Value, String>
+);
+async_command_passthrough!(
+    feishu_domain,
+    feishu_cancel(app: AppHandle) -> Result<Value, String>
+);
 async_command_passthrough!(feishu_domain, feishu_logout() -> Result<Value, String>);
 /// Post-connect/disconnect skill-gating funnel: the domain layer writes or
 /// deletes skill files per `show`, and with show=true syncs every scope's
@@ -176,16 +289,15 @@ pub async fn feishu_apply_skills(pool: State<'_, EnginePool>) -> Result<Value, S
 }
 async_command_passthrough!(feishu_domain, feishu_skills_state() -> Result<Value, String>);
 
-#[tauri::command]
-pub async fn wecom_ensure_cli(app: AppHandle) -> Result<Value, String> {
-    let result = wecom_domain::wecom_ensure_cli().await?;
-    if was_new_cli_install(&result) {
-        track_cli_install(&app, "wecom", "企业微信");
-    }
-    Ok(result)
-}
-async_command_passthrough!(wecom_domain, wecom_connect_begin(app: AppHandle) -> Result<Value, String>);
-async_command_passthrough!(wecom_domain, wecom_cancel(app: AppHandle) -> Result<Value, String>);
+async_command_passthrough!(wecom_domain, wecom_ensure_cli() -> Result<Value, String>);
+async_command_passthrough!(
+    wecom_domain,
+    wecom_connect_begin(app: AppHandle) -> Result<Value, String>
+);
+async_command_passthrough!(
+    wecom_domain,
+    wecom_cancel(app: AppHandle) -> Result<Value, String>
+);
 async_command_passthrough!(wecom_domain, wecom_logout() -> Result<Value, String>);
 /// 同 `feishu_apply_skills`（五轮评审 M-6）：技能落盘/禁用集同步后热刷
 /// execpolicy 规则集。
@@ -197,16 +309,15 @@ pub async fn wecom_apply_skills(pool: State<'_, EnginePool>) -> Result<Value, St
 }
 async_command_passthrough!(wecom_domain, wecom_skills_state() -> Result<Value, String>);
 
-#[tauri::command]
-pub async fn dingtalk_ensure_cli(app: AppHandle) -> Result<Value, String> {
-    let result = dingtalk_domain::dingtalk_ensure_cli().await?;
-    if was_new_cli_install(&result) {
-        track_cli_install(&app, "dingtalk", "钉钉");
-    }
-    Ok(result)
-}
-async_command_passthrough!(dingtalk_domain, dingtalk_connect_begin(app: AppHandle) -> Result<Value, String>);
-async_command_passthrough!(dingtalk_domain, dingtalk_cancel(app: AppHandle) -> Result<Value, String>);
+async_command_passthrough!(dingtalk_domain, dingtalk_ensure_cli() -> Result<Value, String>);
+async_command_passthrough!(
+    dingtalk_domain,
+    dingtalk_connect_begin(app: AppHandle) -> Result<Value, String>
+);
+async_command_passthrough!(
+    dingtalk_domain,
+    dingtalk_cancel(app: AppHandle) -> Result<Value, String>
+);
 async_command_passthrough!(dingtalk_domain, dingtalk_logout() -> Result<Value, String>);
 /// 同 `feishu_apply_skills`（五轮评审 M-6）：技能落盘/禁用集同步后热刷
 /// execpolicy 规则集。
@@ -218,16 +329,15 @@ pub async fn dingtalk_apply_skills(pool: State<'_, EnginePool>) -> Result<Value,
 }
 async_command_passthrough!(dingtalk_domain, dingtalk_skills_state() -> Result<Value, String>);
 
-#[tauri::command]
-pub async fn tmeet_ensure_cli(app: AppHandle) -> Result<Value, String> {
-    let result = tmeet_domain::tmeet_ensure_cli().await?;
-    if was_new_cli_install(&result) {
-        track_cli_install(&app, "tmeet", "腾讯会议");
-    }
-    Ok(result)
-}
-async_command_passthrough!(tmeet_domain, tmeet_connect_begin(app: AppHandle) -> Result<Value, String>);
-async_command_passthrough!(tmeet_domain, tmeet_cancel(app: AppHandle) -> Result<Value, String>);
+async_command_passthrough!(tmeet_domain, tmeet_ensure_cli() -> Result<Value, String>);
+async_command_passthrough!(
+    tmeet_domain,
+    tmeet_connect_begin(app: AppHandle) -> Result<Value, String>
+);
+async_command_passthrough!(
+    tmeet_domain,
+    tmeet_cancel(app: AppHandle) -> Result<Value, String>
+);
 async_command_passthrough!(tmeet_domain, tmeet_logout() -> Result<Value, String>);
 /// 同 `feishu_apply_skills`（五轮评审 M-6）：技能落盘/禁用集同步后热刷
 /// execpolicy 规则集。
@@ -239,9 +349,17 @@ pub async fn tmeet_apply_skills(pool: State<'_, EnginePool>) -> Result<Value, St
 }
 async_command_passthrough!(tmeet_domain, tmeet_skills_state() -> Result<Value, String>);
 
-/// ima 连接成功会安装配套技能 ima-skills（domain 层落盘）→ 重写在线会话组合目录
-/// （skill 双 scope 治理事件驱动时机）+ 热刷 execpolicy 规则集（技能脚本 deny 规则
-/// 随目录变化，四轮评审 M-6a）。失败时技能未装上，不重写。
+/// A successful ima connect installs the companion skill `ima-skills` (the
+/// domain layer lands it on disk) → rewrites the online-session composition
+/// dirs (the skill dual-scope governance event-driven moment) + hot-refreshes
+/// the execpolicy rulesets (skill-script deny rules change with the dirs;
+/// M-6a). Failures split in two: a domain-layer
+/// credential/pre-install failure means the skill never landed and no
+/// rewrite was due; a **consent-gate refusal** (deny-first
+/// semantics) means the gate ran before any credential write or content
+/// landed — the command returns `Err` with **nothing landed** (no
+/// credential, no skill dir, no record), so skipping this function's
+/// rewrite is harmless.
 // The disallowed hot-refresh is required since the native-tool ownership gate:
 // the freshly installed package flips `ima_openapi` from denied to admitted
 // for DenyAll scopes' explicit-enable path, and online engines must see it.

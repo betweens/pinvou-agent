@@ -22,6 +22,7 @@ if [[ -z "$platform" ]]; then
   case "$(uname -s)-$(uname -m)" in
     Linux-aarch64 | Linux-arm64) platform="linux-arm64" ;;
     Linux-x86_64) platform="linux-x64" ;;
+    Linux-loongarch64) platform="linux-loong64" ;;
     Darwin-arm64) platform="darwin-arm64" ;;
     Darwin-x86_64) platform="darwin-x64" ;;
     *) echo "无法探测连接器平台，请显式传 --platform" >&2; exit 2 ;;
@@ -34,13 +35,34 @@ case "$platform" in
   darwin-arm64) platform_resources="macos/aarch64"; suffix="" ;;
   darwin-x64) platform_resources="macos/x86_64"; suffix="" ;;
   windows-x64) platform_resources="windows/x86_64"; suffix=".exe" ;;
+  # Explicit-unsupported (not a generic unknown-platform error): connector
+  # vendors have not published loongarch64 builds yet, so the missing
+  # artifacts must be reported as such instead of surfacing as a lock-file
+  # error or a failed download deep in the fetch loop.
+  # platform values follow the Node arch spelling (linux-x64/linux-arm64,
+  # hence loong64 rather than the kernel's loongarch64 machine name).
+  linux-loong64) echo "connectors are not yet published for linux-loong64" >&2; exit 1 ;;
   *) echo "未知连接器平台: $platform" >&2; exit 2 ;;
 esac
 
 lock="$repo_root/pinvou3-app/src-tauri/resources/platforms/$platform_resources/bundle/connectors/connectors.lock.json"
 destination="$(dirname "$lock")/$platform/bin"
 
-for command_name in node curl tar install mktemp; do
+if [[ ! -f "$lock" ]]; then
+  echo "missing connector lock: $lock" >&2
+  exit 1
+fi
+
+required_commands=(node curl tar install mktemp)
+# ZIP artifacts exist only for windows-x64, and GNU tar cannot read them; check
+# unzip up front with the other dependencies rather than after the download.
+# --check only re-hashes files already on disk, so it never needs an extractor.
+# Scope the probe to the url field, which is what extract_archive keys off; any
+# other value ending in .zip (a name, a version) must not demand an extractor.
+if ! "$check_only" && grep -qE '"url"[[:space:]]*:[[:space:]]*"[^"]*\.zip"' "$lock"; then
+  required_commands+=(unzip)
+fi
+for command_name in "${required_commands[@]}"; do
   command -v "$command_name" >/dev/null || {
     echo "missing required command: $command_name" >&2
     exit 1
@@ -56,7 +78,23 @@ compute_sha256() {
 }
 
 verify_file() {
-  [[ -f "$1" ]] && [[ "$(compute_sha256 "$1")" == "$2" ]]
+  if [[ -f "$1" ]] && [[ "$(compute_sha256 "$1")" == "$2" ]]; then
+    return 0
+  fi
+  # The three real call sites (the --check gate, the post-download recheck
+  # and the pre-install binary check) run bare under `set -e`, so the
+  # mismatch diagnostic must live here or the script exits with no output;
+  # the pre-download cache probe silences it with >/dev/null 2>&1.
+  # An unreadable file is an I/O failure, not a hash difference, so it gets
+  # its own message instead of a misleading "mismatch ... actual )".
+  if [[ ! -f "$1" ]]; then
+    echo "sha256 check failed: $1 is missing (expected $2)" >&2
+  elif [[ ! -r "$1" ]]; then
+    echo "sha256 check failed: $1 is not readable (expected $2)" >&2
+  else
+    echo "sha256 mismatch: $1 (expected $2, actual $(compute_sha256 "$1"))" >&2
+  fi
+  return 1
 }
 
 names=()
@@ -106,11 +144,7 @@ extract_archive() {
   local archive="$1" dest="$2"
   mkdir -p "$dest"
   if [[ "$archive" == *.zip ]]; then
-    if command -v unzip >/dev/null 2>&1; then
-      unzip -q -o "$archive" -d "$dest"
-    else
-      tar -xf "$archive" -C "$dest"
-    fi
+    unzip -q -o "$archive" -d "$dest"
   else
     tar xzf "$archive" -C "$dest"
   fi

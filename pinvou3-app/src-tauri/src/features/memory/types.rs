@@ -27,6 +27,14 @@ pub trait MemoryReviewModel {
     /// "restart later" locale switch (see memory_output_language_directive for
     /// reachability).
     fn memory_locale_tag(&self) -> String;
+
+    /// Conversation key for the OpenCode gateway session-affinity header:
+    /// session-bound bridges share the conversation's session ID (matching
+    /// the official client, where auxiliary calls use the conversation's
+    /// session ID); the default falls back to the caller's feature label.
+    fn aux_conversation_key(&self, feature_label: &str) -> String {
+        feature_label.to_string()
+    }
 }
 
 pub const PROFILE_VERSION: u32 = 1;
@@ -45,7 +53,6 @@ pub const PENDING_MEMORY_ACTIVE_MAX_STORED: usize = 20;
 pub const PENDING_MEMORY_RESOLVED_MAX_STORED: usize = 80;
 pub const NEVER_MEMORY_MAX_STORED: usize = 200;
 pub const MEMORY_REVIEW_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
-pub const PENDING_STATUS_OBSERVED: &str = "observed";
 pub const PENDING_STATUS_PENDING: &str = "pending_confirm";
 pub const PENDING_STATUS_CONFIRMED: &str = "confirmed";
 pub const PENDING_STATUS_IGNORED: &str = "ignored";
@@ -278,16 +285,15 @@ pub struct PreferenceFile {
 }
 
 #[derive(Debug, Clone)]
-pub struct TopicMutation<T> {
-    pub value: T,
-    pub cleanup_warning: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct TopicRead<T> {
     pub value: T,
     pub cleanup_warning: Option<String>,
 }
+
+/// Write-path alias of [`TopicRead`] (same shape): named for the mutation
+/// returns (`update_preference` / `update_work_context`) so call sites keep
+/// their read/write distinction without a second identical struct.
+pub type TopicMutation<T> = TopicRead<T>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TopicMigrationJournal {
@@ -392,10 +398,35 @@ pub(super) fn normalize_profile_label(value: &str, topic: &str) -> String {
     clean_memory_label(&clean_profile_memory_content(value, topic)).unwrap_or_default()
 }
 
+/// Round-40 review: whether a submitted identity label would be silently
+/// EMPTIED by `normalize_profile_label` (over twelve characters after the
+/// punctuation/particle strip, question-shaped, sensitive/task-like, or
+/// emptied outright by the content filter). `memory profile set` must
+/// refuse this shape up front: `MemoryProfile::normalize` maps a rejected
+/// label to `""` and the update persists it, so without this check a
+/// misspelled or over-long call name destroyed the stored value with exit
+/// 0 and no note on any channel. `pub` for the CLI lane. Round-51 review
+/// honesty: the GUI save path does NOT gate wipe-shaped labels today —
+/// SettingsView only trims and `update_memory_profile` applies the patch
+/// unguarded, so a whitespace/over-long GUI label is silently normalized
+/// (possibly to `""`). The guard itself also short-circuits on a
+/// trim-empty value, so a whitespace CLI value bypasses it too — that
+/// lane is closed CLI-side by parse refusal; this logic stays as-is.
+pub fn profile_label_would_be_wiped(value: &str, topic: &str) -> bool {
+    !value.trim().is_empty() && normalize_profile_label(value, topic).is_empty()
+}
+
+/// The default preference bucket `normalize_preference_topic` folds every
+/// unmatched (including empty) topic onto. `pub` + re-exported from
+/// `features::memory`: the CLI's add lane predicts the pending row's topic
+/// from the ORIGINAL input, so it names this value instead of hand-copies
+/// the literal (same single-sourcing rationale as the text caps).
+pub const DEFAULT_PREFERENCE_TOPIC: &str = "answer_style";
+
 pub(super) fn normalize_preference_topic(topic: &str) -> String {
     match clean_id(&clean_text(topic, 40)).as_str() {
         "answer_style" | "output_style" | "output_preference" | "reply_style" => {
-            "answer_style".to_string()
+            DEFAULT_PREFERENCE_TOPIC.to_string()
         }
         "workflow_preference" | "work_style" | "workflow" | "process" | "collaboration" => {
             "workflow_preference".to_string()
@@ -406,7 +437,7 @@ pub(super) fn normalize_preference_topic(topic: &str) -> String {
         | "report_style"
         | "ppt_style"
         | "document_style" => "document_preference".to_string(),
-        _ => "answer_style".to_string(),
+        _ => DEFAULT_PREFERENCE_TOPIC.to_string(),
     }
 }
 
@@ -433,10 +464,10 @@ pub(super) fn normalize_timed_memory_kind(kind: &str) -> String {
     }
 }
 
-pub(super) fn normalize_timed_memory_topic(kind: &str, _topic: &str) -> String {
-    // The topic input is not consumed: every kind folds onto its single
-    // canonical bucket regardless of the value (the former match arms were
-    // self-echoes whose default equaled every listed alternative).
+pub(super) fn normalize_timed_memory_topic(kind: &str) -> String {
+    // The kind alone decides the bucket: every kind folds onto its single
+    // canonical topic regardless of the input value (the former match arms
+    // were self-echoes whose default equaled every listed alternative).
     if kind == "recent_activity" {
         "completed_work".to_string()
     } else {
@@ -444,7 +475,12 @@ pub(super) fn normalize_timed_memory_topic(kind: &str, _topic: &str) -> String {
     }
 }
 
-pub(super) fn looks_like_profile_preference_text(text: &str) -> bool {
+// `pub` (re-exported from the `features::memory` facade) so the CLI can probe
+// it before enqueueing a preference candidate: the confirm path silently skips
+// profile-shaped text (see `write_preference_unlocked`) while still marking
+// the candidate confirmed, so `memory add` must reject that content up front
+// instead of stranding a confirmed-but-unmaterialized pending entry.
+pub fn looks_like_profile_preference_text(text: &str) -> bool {
     let text = clean_text(text, 120);
     [
         "称呼用户",

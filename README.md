@@ -54,6 +54,7 @@ Use **Codex, Claude Code, or Kimi** through [ACP](docs/multi-agent-acp.md) in th
 - **Artifact panel** automatically collects every file the agent creates or edits; preview, locate, and open them in one place
 - **Editable Markdown artifacts** — edit directly, or select a passage and ask the agent to revise it
 - **Plan / YOLO modes** — review the plan first for complex work, or execute directly when the task is clear
+- **Auxiliary chat** — ask side questions while a task runs, in a per-task side session whose only tool is a server-enforced read-only view of that task's own history (ADR-0024), isolated from the task's execution context
 
 ### 🧠 Knowledge and memory
 
@@ -71,6 +72,7 @@ Use **Codex, Claude Code, or Kimi** through [ACP](docs/multi-agent-acp.md) in th
 
 ### 🖥️ Built for daily operation
 
+- **Global bring-to-front shortcut** (off by default, `Ctrl/Cmd+Alt+P`) — enable it in Settings → General to summon the window with a key while it runs in the background
 - **Local voice input** with on-demand speech model downloads
 - **Centralized monitoring** of GPU, memory, disk, model service, and context usage
 - **Updates via GitHub Releases** — in-app update checks are not enabled yet
@@ -124,7 +126,7 @@ Endpoints, model names, and API keys can also be managed directly in the applica
 - The [Tauri 2 system dependencies](https://v2.tauri.app/start/prerequisites/) for your platform
 - An accessible OpenAI-compatible model endpoint
 
-The source tree supports **Linux, Windows, and macOS**. Linux release packages target Ubuntu 22.04 or newer (glibc 2.35+) on x86_64 and arm64; the deb also requires WebKitGTK 2.40+ (any 22.04 system with the standard updates pocket applied satisfies this). macOS release packages are universal (Apple Silicon and Intel) builds for macOS 11 or later. Speech-recognition engines can be packaged per build configuration; file parsing (PDF / Office / OCR / archives) relies on optional external tools installable via your platform's package manager (see `pinvou3-app/INSTALL.md`).
+The source tree supports **Linux, Windows, and macOS**. Linux release packages target Ubuntu 22.04 or newer (glibc 2.35+) on x86_64 and arm64, and LoongArch64 (new-world; UOS V25 or deepin 23 or newer, glibc 2.38+); the deb also requires WebKitGTK 2.40+ (any 22.04 system with the standard updates pocket applied satisfies this). Old-world LoongArch systems (UOS V20 Loongson Edition, Loongnix 20, and the Kylin V10 era) are not supported — they offer no webkit2gtk-4.1/libsoup3, which the Tauri 2 runtime requires, and their rustc toolchains top out at 1.58. macOS release packages are universal (Apple Silicon and Intel) builds for macOS 11 or later. Speech-recognition engines can be packaged per build configuration; file parsing (PDF / Office / OCR / archives) relies on optional external tools installable via your platform's package manager (see `pinvou3-app/INSTALL.md`).
 
 ### Run from source
 

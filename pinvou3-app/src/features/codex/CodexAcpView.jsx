@@ -1,12 +1,16 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isImeComposing } from '../../shared/ime-guard.mjs';
+import { useAutoResizeTextarea } from '../../hooks/useAutoResizeTextarea.js';
 import {
-  Brain, Check, ChevronDown, FileText, FolderOpen, GitBranch, Monitor, Paperclip,
+  Brain, Check, ChevronDown, FileText, FolderOpen, GitBranch, MessageSquare, Monitor, Paperclip,
   RefreshCw, Send, Sparkles, StopCircle, Upload, User,
 } from '../../components/icons.jsx';
 import { AcpAgentLogo } from './AcpAgentLogo.jsx';
 import { CodexWorkspacePanel } from './CodexWorkspacePanel.jsx';
 import { SubagentTranscriptPanel } from '../multiagent/SubagentTranscriptPanel.jsx';
+import { AuxChatPanel } from '../aux-chat/AuxChatPanel.jsx';
+import { AuxQuoteSelection } from '../aux-chat/AuxQuoteSelection.jsx';
+import { ViewErrorBoundary } from '../../shared/ViewErrorBoundary.jsx';
 import { RunningAgentsOverlay } from '../multiagent/RunningAgentsOverlay.jsx';
 import {
   refreshAcpAgentCatalog,
@@ -16,8 +20,10 @@ import {
 import {
   classifyAcpServiceFailure,
   isAcpAuthenticationFailure,
+  latestAgentRuntimeNotice,
 } from './runtimeNoticeState.js';
 import {
+  AgentRuntimeNotice,
   AgentServiceFailureNotice,
   RuntimeNotice,
   runtimeSourceLabel,
@@ -41,15 +47,17 @@ import {
   createAcpGapResyncScheduler,
   mergeAcpTimelineSnapshot,
   updateAcpAttachmentDraft,
-  projectAcpTimeline,
   resolveAcpSessionControls,
 } from './acp-state.js';
+import { createAcpTimelineProjector } from './acp-timeline-projector.js';
+import { timelineDisplayError } from '../conversation/deepseek-conversation.js';
 import {
   applyNativeChatEvent,
   appendLocalUserMessage,
   appendNativeSystemItem,
   createNativeLane,
   hydrateNativeLane,
+  nativeModelServiceContext,
   projectNativeLane,
   removeLocalUserMessage,
 } from './code-native-lane.js';
@@ -79,13 +87,14 @@ import {
   RewindUndoChip,
   RewindUndoConfirmDialog,
 } from './RewindChip.jsx';
-import { ModalDialogShell } from './ModalDialogShell.jsx';
+import { ModalShell } from '../../components/ModalShell.jsx';
 import {
   ConversationMarkdown,
   ConversationStatusBadge,
-  ConversationTurn,
+  ConversationTimeline,
   LiveConversationActivityIndicator,
 } from '../conversation/ConversationTimeline.jsx';
+import { shouldVirtualizeConversationTurns } from '../conversation/conversation-virtualization.js';
 import {
   transitionConversationScrollState,
   useConversationBottomFollower,
@@ -119,21 +128,29 @@ import {
   restoreConversationScrollPosition,
 } from '../conversation/conversation-model.js';
 import { QuestionChoiceCard } from '../conversation/QuestionChoiceCard.jsx';
-import { buildUserInputAnswers, normalizeUserInputQuestions } from '../../shared/user-input-shared.js';
+import { buildUserInputAnswers, normalizeElicitationQuestions, normalizeUserInputQuestions } from '../../shared/user-input-shared.js';
 import {
   PlanLayer,
   ToolCard,
   cardBoxCls,
-  cardBtnCls,
 } from '../tools/tool-renderers.jsx';
+import { cardBtnCls } from '../../shared/card-buttons.mjs';
 import { YoloConfirmCard } from '../../shared/yolo-confirm-card.jsx';
 import { notifyChatRoundCommitted } from '../tools/tool-events.js';
 import { AttachmentChips } from '../attachments/AttachmentChips.jsx';
 import { formatAttachmentLimitError } from '../attachments/attachment-limit-errors.js';
-import { collectClipboardImages, readPasteImageAsBytes } from '../attachments/paste-image.js';
+import {
+  collectClipboardImages,
+  pasteEventNeedsClipboardFallback,
+  pasteImageClipboardFallbackAvailable,
+  readPasteImageAsBytes,
+} from '../attachments/paste-image.js';
 import { ComposerAttachmentDropOverlay } from '../attachments/ComposerAttachmentDropOverlay.jsx';
 import { HomeModeSwitcher } from '../conversation/HomeModeSwitcher.jsx';
 import { bridge } from '../../hooks/useBridge.js';
+import { describeKeychain, workspaceNoticeTone } from '../projects/workspacePickerState.js';
+import { interpretFolderEnsureOutcomes } from '../projects/folderEnsure.js';
+import { consumePickerRequest } from './picker-request.js';
 import {
   invokeTauri,
   listenTauri,
@@ -160,7 +177,11 @@ import {
   setAcpModel,
   submitAcpPrompt,
   uploadAcpDeviceAttachment,
+  alignAcpSession,
+  ensureFolderProjects,
 } from './acpClient.js';
+import { WorkspaceKeychainChip } from '../projects/WorkspaceKeychainChip.jsx';
+import { resolveSessionProjectId } from '../projects/projectGrouping.js';
 import { can, canInvoke, isWeb, onPlatformConnectionChange } from '../../shared/platform.js';
 import {
   forgetWorkspace,
@@ -267,19 +288,19 @@ function WorkspacePanelToggle({ testId, active, changeCount, onToggle, copy }) {
 // open (conditional rendering at the call site).
 function BranchDialogShell({ copy, busy, testid, labelledBy, initialFocusRef, onCancel, children }) {
   return (
-    <ModalDialogShell
+    <ModalShell
       testid={testid}
       zIndexClass="z-[120]"
       backdropLabel={copy.branchSwitchCancel}
       backdropClass="absolute inset-0 cursor-default bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200"
-      panelClass="relative w-[min(400px,calc(100vw-24px))] rounded-[24px] p-6 bg-white text-[#1F1F1F] outline-none dark:bg-[#1E1F20] dark:text-[#E8EAED]"
+      panelClass="w-[min(400px,calc(100vw-24px))] rounded-[24px] p-6 bg-white text-[#1F1F1F] outline-none dark:bg-[#1E1F20] dark:text-[#E8EAED]"
       busy={busy}
       initialFocusRef={initialFocusRef}
       labelledBy={labelledBy}
       onCancel={onCancel}
     >
       {children}
-    </ModalDialogShell>
+    </ModalShell>
   );
 }
 
@@ -419,48 +440,13 @@ function CodexComposerConfigSelect({
 
 function ElicitationCard({ elicitation, pending, onRespond, responding, copy, conversationCopy }) {
   const request = elicitation.request || {};
-  const schema = request.requestedSchema || {};
-  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
-  const fields = Object.entries(schema.properties || {});
-  const otherFields = new Map(fields
-    .filter(([, field]) => field && field._meta && field._meta.codex && field._meta.codex.isOtherAnswer)
-    .map(([id, field]) => [String(field._meta.codex.questionId || ''), { id, field }]));
-  const questions = fields.filter(([, field]) => (
-    !(field && field._meta && field._meta.codex && field._meta.codex.isOtherAnswer)
-  ));
+  // Schema → question mapping (companion other-answer folding, choice/custom-reply pin)
+  // lives in shared/user-input-shared.js next to the request_user_input normalization.
+  const questions = normalizeElicitationQuestions(
+    request.requestedSchema,
+    (conversationCopy && conversationCopy.otherPlaceholder) || '',
+  );
   const actionable = !!pending && !elicitation.resolved;
-
-  function choices(field) {
-    if (Array.isArray(field && field.oneOf)) {
-      return field.oneOf.map(option => ({
-        value: option && option.const,
-        label: option && (option.title || option.const),
-        description: option && option.description,
-      })).filter(option => option.value != null);
-    }
-    if (Array.isArray(field && field.enum)) {
-      return field.enum.map(value => ({ value, label: String(value), description: '' }));
-    }
-    return [];
-  }
-
-  const normalizedQuestions = questions.map(([id, field]) => {
-    const other = otherFields.get(id);
-    return {
-      id,
-      answerKey: id,
-      otherAnswerKey: other && other.id,
-      header: field.title || id,
-      question: field.description || '',
-      options: choices(field),
-      allowOther: Boolean(other),
-      otherPlaceholder: other && (other.field.title || (conversationCopy && conversationCopy.otherPlaceholder)),
-      required: required.has(id)
-        || Boolean(field && field._meta && field._meta.codex && field._meta.codex.isOther),
-      inputType: field.type || 'string',
-      secret: Boolean(field && field._meta && field._meta.codex && field._meta.codex.isSecret),
-    };
-  });
 
   function submit(groups) {
     // content 用无原型对象构造（见 buildElicitationContent）：answerKey 为
@@ -474,7 +460,7 @@ function ElicitationCard({ elicitation, pending, onRespond, responding, copy, co
     <QuestionChoiceCard
       title={copy.choiceTitle}
       description={request.message && request.message !== 'Input requested' ? request.message : ''}
-      questions={normalizedQuestions}
+      questions={questions}
       resolved={!actionable}
       submitting={responding}
       submitLabel={copy.submit}
@@ -495,7 +481,7 @@ function ElicitationCard({ elicitation, pending, onRespond, responding, copy, co
 }
 
 // 原生（品悟 Engine）会话的选择确认卡：chat:user_input_required → submit_user_input。
-// 选项归一化逻辑与主聊天 UserInputCard 对齐（allow_free_text / multi_select），
+// 选项归一化与自定义回复钉死与主聊天 UserInputCard 共用（shared/user-input-shared.js），
 // 但提交走显式 sessionId，不依赖 bridge 全局 activeSession。
 const NATIVE_CHAT_EVENTS = [
   'chat:user_message',
@@ -570,12 +556,12 @@ function NativePlanCard({ item, theme, t, copy, modePlan, busy, onAccept, onDisc
   return (
     <div className={cardBoxCls('border-[#0B57D0]/20 dark:border-[#A8C7FA]/30')}>
       <div className={`text-[14px] font-semibold mb-3 ${isDark ? 'text-[#E3E3E3]' : 'text-[#1F1F1F]'}`}>{t.planReady}</div>
-      {(!item.plan && !item.todos)
-        ? <div className={`text-[13px] ${isDark ? 'text-[#C4C7C5]' : 'text-[#444746]'}`}>{t.planEmpty}</div>
-        : <>
+      {(item.plan || item.todos)
+        ? <>
             <PlanLayer label={t.planLabel} explanation={item.plan && item.plan.explanation} items={item.plan && item.plan.items} field="step" />
             <PlanLayer label={t.planTodos} items={item.todos && item.todos.items} field="content" />
-          </>}
+          </>
+        : <div className={`text-[13px] ${isDark ? 'text-[#C4C7C5]' : 'text-[#444746]'}`}>{t.planEmpty}</div>}
       <div className={`h-px my-3 ${isDark ? 'bg-white/10' : 'bg-black/10'}`}></div>
       {active ? (
         <div className="flex items-center gap-2 flex-wrap">
@@ -600,6 +586,16 @@ function NativePlanCard({ item, theme, t, copy, modePlan, busy, onAccept, onDisc
     </div>
   );
 }
+
+// Typed align-error markers → localized copy (ALIGN_BUSY/ALIGN_NO_WORKSPACE
+// are thrown as-is by acpClient; everything else is the generic failure).
+// Extracted so the align handler stays under the cognitive-complexity cap
+// (chat-lane parity, review #484 round-19 minor 11).
+function alignErrorCopy(message, uiKeychain) {
+  if (message.startsWith('ALIGN_BUSY')) return uiKeychain.alignBusy;
+  if (message.startsWith('ALIGN_NO_WORKSPACE')) return uiKeychain.alignNoWorkspace;
+  return uiKeychain.alignFailed;
+}
 // eslint-disable-next-line sonarjs/cognitive-complexity -- ACP code main view: session/event/draft/attachment/scroll lifecycles share one set of ref+state; refactoring is high-risk
 export function CodexAcpView({
   theme,
@@ -616,6 +612,24 @@ export function CodexAcpView({
   onGotoModelSettings,
   onGotoSettings,
   fixedSession = false,
+  // The "choose workspace" picker (§2) delivers its result through here:
+  // { epoch, path, projectId, roots }; path=null = temporary session.
+  // onOpenWorkspacePicker opens the picker (held by the host, main.jsx).
+  onOpenWorkspacePicker,
+  workspacePickerRequest = null,
+  // Consumption acknowledgement (review #484 M1): the host clears the request
+  // once the view has applied it, so a remount can never replay a stale one.
+  onWorkspacePickerRequestConsumed,
+  // Toast channel for the align action's result feedback (§9.7).
+  onNotify,
+  // The host (main.jsx) mirrors the lane's effective mode so sidebar surfaces
+  // opened while the codex lane is active (manage-folders panel) show the
+  // same mode-aware copy as the lane itself.
+  onLaneModeChange,
+  // The host mirrors whether the lane's current agent receives only the
+  // primary root (third-party ACP, §6 stage-gate), so host-side grant
+  // notices (sidebar project-row "+") use the recorded-only copy too.
+  onLaneDeliveryChange,
 }) {
   const codexCopy = t.uiCodex;
   const [agents, setAgents] = useState(null); // null=加载中，[] 才允许回退当前 Agent。
@@ -668,7 +682,7 @@ export function CodexAcpView({
   const [error, setError] = useState('');
   const showError = (nextError) => {
     console.error('Codex operation failed:', nextError);
-    setError(acpErrorMessage(nextError, codexCopy, { allowRaw: !isWeb }));
+    setError(acpErrorMessage(nextError, codexCopy, { allowRaw: isWeb ? false : undefined }));
   };
   const [respondingSessionId, setRespondingSessionId] = useState(null);
   const responding = Boolean(activeId && respondingSessionId === activeId);
@@ -772,7 +786,12 @@ export function CodexAcpView({
     await checkoutWorkspaceBranch(branch, 'carry');
   }
   const [dismissedFailureKey, setDismissedFailureKey] = useState('');
+  const [dismissedNoticeKey, setDismissedNoticeKey] = useState('');
   const [draftWorkspacePath, setDraftWorkspacePath] = useState(null);
+  // Ownership and keychain snapshot brought in by the project channel
+  // (picker) (§9.3): passed down with createAcpSession at materialization;
+  // beginDraft's other entries (temporary/recent directory) clear it.
+  const [draftProjectBinding, setDraftProjectBinding] = useState(null);
   // 会话内用 sessionId 解析工作区；草稿态（会话未创建）直接扫描已选目录。
   const branchWorkspacePath = activeId ? null : draftWorkspacePath;
   // Branch context marker mirrored from activeId/branchWorkspacePath; checkout
@@ -816,6 +835,9 @@ export function CodexAcpView({
   const [voiceAsrPopoverOpen, setVoiceAsrPopoverOpen] = useState(false);
   const voiceAsrPopoverRef = useRef(null);
   const voiceComposerTextareaRef = useRef(null);
+  // Auto-grow the composer with its content, clamped to the code page's 48-192px band;
+  // the textarea keeps overflow scrolling once the clamp height is reached.
+  useAutoResizeTextarea(voiceComposerTextareaRef, draft, { min: 48, max: 192 });
   // Mounted-state ref: after unmount/view switch, reject in-flight ASR/LLM callbacks from
   // writing back (the hook's isStillActive defense line).
   const composerMountedRef = useRef(true);
@@ -868,11 +890,8 @@ export function CodexAcpView({
   // error notice copy needs the current UI language and model config;
   // the latest values are threaded through a ref so closures never hold a
   // stale bridge state snapshot (same pattern as activeIdRef).
+  // Assigned below, once the native session's own model context is known.
   const nativeEventContextRef = useRef({ language: null, modelServiceState: null });
-  nativeEventContextRef.current = {
-    language: bs && bs.settings && bs.settings.language,
-    modelServiceState: bs,
-  };
   useLayoutEffect(() => {
     // loadSession may optimistically point this ref at a just-created session before
     // the parent commits activeId. Do not overwrite that handoff from an intermediate
@@ -883,9 +902,10 @@ export function CodexAcpView({
     acpSendOperationTracker.switchSession(activeId || DRAFT_ATTACHMENT_KEY);
   }, [acpConfigOperationTracker, acpSendOperationTracker, activeId]);
   const acpModelServiceLanguage = bs && bs.settings && bs.settings.language;
+  const projectAcpTimeline = useMemo(() => createAcpTimelineProjector(), []);
   const projection = useMemo(
     () => projectAcpTimeline(events, { language: acpModelServiceLanguage }),
-    [events, acpModelServiceLanguage],
+    [events, acpModelServiceLanguage, projectAcpTimeline],
   );
   // 草稿态（!activeId）没有会话，退回使用该 agent 缓存的配置快照来预展示选项。
   const draftControlsInfo = activeId ? null : draftControlsCache[draftAgentId] || null;
@@ -905,6 +925,10 @@ export function CodexAcpView({
   const composerModeValue = sessionControlsInfo
     ? controls.effectiveMode || ''
     : (draftConfigSelection && draftConfigSelection.mode) || controls.effectiveMode || '';
+  // Report the lane's effective mode upward (see the prop contract above).
+  useEffect(() => {
+    if (onLaneModeChange) onLaneModeChange(composerModeValue || null);
+  }, [composerModeValue, onLaneModeChange]);
   function composerConfigOptionValue(option) {
     if (sessionControlsInfo) return option.currentValue || '';
     const staged = draftConfigSelection && draftConfigSelection.configs
@@ -928,6 +952,12 @@ export function CodexAcpView({
     [sessions, activeId],
   );
   const activeAgentId = activeSession?.agent_id || draftAgentId;
+  // Keychain chip derivation, memoized: computing describeKeychain four times
+  // per render (once per chip prop) was pure waste.
+  const activeKeychain = useMemo(
+    () => (activeSession ? describeKeychain(activeSession.workspace_roots) : null),
+    [activeSession],
+  );
   // 原生（品悟 Engine）代码会话：发消息走 chat 命令 + chat:* 事件，会话状态按
   // session 缓存在 lane Map 里（后台会话的 turn 也能继续推进，切回不丢流式内容）。
   const isNativeAgent = activeAgentId === 'pinvou';
@@ -983,6 +1013,24 @@ export function CodexAcpView({
     multiAgentAvailable: false,
   });
   const [nativeDraftControls, setNativeDraftControls] = useState({});
+  // Grant-notice/picker mode source, agent-aware (review #484 round-8 m4):
+  // the native selector's staged mode only describes the native agent — a
+  // YOLO touched there followed by switching the draft to a third-party ACP
+  // agent must not under-report that agent's notice. ACP drafts read their
+  // own cached controls through composerModeValue instead.
+  const laneNoticeMode = isNativeAgent
+    ? (nativeDraftControls.mode || composerModeValue || null)
+    // Round-13 minor 5: a native-staged YOLO must not leak into a third-party
+    // ACP draft's grant notice (an agent switch does not clear the native
+    // controls); an unknown posture falls through to the restricted tone,
+    // which is the safe side of the §9.4 wording.
+    : (composerModeValue || null);
+  // Same mirror for the root-delivery state (§6 stage-gate): a third-party
+  // ACP agent only ever receives the primary root on the wire. Lives below
+  // isNativeAgent's declaration — the lint gate rejects use-before-declaration.
+  useEffect(() => {
+    if (onLaneDeliveryChange) onLaneDeliveryChange(!isNativeAgent);
+  }, [isNativeAgent, onLaneDeliveryChange]);
   // First-send session creation persists draft controls before activation. Keep the
   // staged values associated with that exact session until its authoritative load
   // completes so the selector never falls back to a different global model in between.
@@ -1005,31 +1053,29 @@ export function CodexAcpView({
   // 知识库集合列表与 embedding 安装态由 ComposerKbSelector 内部经 bridge.knowledge
   // （kb_collection_list / kb_model_status，全局只读、不带会话）自行加载，代码页
   // 不再重复拉取（PR #214 统一底栏控件时移除 nativeKb* 本地变量）。
-  // projectNativeLane only consumes bs's model-service fields
-  // (providerLabelFromState reads currentSessionModelId/activeModelId/
-  // savedModels/effectiveModelConfig/activeProvider; the language comes
-  // from settings.language). bs is a whole-state snapshot that changes
-  // reference on every streaming notify, so depending on it directly
-  // would invalidate this useMemo throughout streaming and re-project
-  // everything; the deps are narrowed to the consumed field references.
+  // Only the native session's authoritative controls identify its model.
+  // bs belongs to the chat workspace: reuse its shared model catalog, never
+  // its active/effective model or provider, which describe a different
+  // session. A stale controls owner or an unloaded model yields no context
+  // (the error text's own provider signal still applies). Deps are the
+  // consumed references only, so streaming notifies do not re-project.
   const nativeModelServiceLanguage = bs && bs.settings && bs.settings.language;
+  const nativeControlsOwner = nativeControlsSessionRef.current;
+  const nativeSavedModels = bs && bs.savedModels;
   const nativeModelServiceState = useMemo(
-    () => (bs ? {
-      currentSessionModelId: bs.currentSessionModelId,
-      activeModelId: bs.activeModelId,
-      savedModels: bs.savedModels,
-      effectiveModelConfig: bs.effectiveModelConfig,
-      activeProvider: bs.activeProvider,
-    } : null),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only the field references providerLabelFromState actually consumes, not the whole bs snapshot
-    [bs && bs.currentSessionModelId, bs && bs.activeModelId, bs && bs.savedModels, bs && bs.effectiveModelConfig, bs && bs.activeProvider],
+    () => nativeModelServiceContext(activeId, nativeControlsOwner, nativeControls.modelId, nativeSavedModels),
+    [activeId, nativeControlsOwner, nativeControls.modelId, nativeSavedModels],
   );
+  nativeEventContextRef.current = {
+    language: nativeModelServiceLanguage,
+    modelServiceState: nativeModelServiceState,
+  };
   const nativeProjection = useMemo(
     () => (isNativeAgent ? projectNativeLane(activeNativeLane, activeId, {
       // Same as the main chat ChatView: the timeline error card's friendly
-      // copy is built in the UI language, with the provider label derived
-      // from bridge state (internally, a provider signal in the error text
-      // still wins).
+      // copy is built in the UI language; the provider label comes from the
+      // native session's own controls (nativeModelServiceState above), and a
+      // provider signal in the error text itself still wins.
       language: nativeModelServiceLanguage,
       modelServiceState: nativeModelServiceState,
     }) : null),
@@ -1167,6 +1213,42 @@ export function CodexAcpView({
     rememberScrollBeforeRightPanelChange();
     setWorkspaceOpen(false);
   }, [rememberScrollBeforeRightPanelChange]);
+  // Aux chat panel: the same persistent, Q&A-only, one-per-task conversation
+  // as the work-mode task page (bridge.auxChat, restrictTools; it never
+  // touches the code session's execution or context). Unlike subagentPanel:
+  // it does not close when switching code sessions — the panel rebinds itself
+  // by sessionId; in draft state (no activeSession) the panel hides with its
+  // mount condition and restores automatically once the session is ready.
+  // auxChatDockActive is the panel's real visibility in the dock (same as
+  // workspaceDockActive): when covered by the workspace panel the entry
+  // button does not highlight, and clicking it again brings the panel to
+  // the front.
+  const [auxChatPanel, setAuxChatPanel] = useState(null);
+  const [auxChatDockActive, setAuxChatDockActive] = useState(false);
+  const openAuxChatPanel = useCallback(() => {
+    rememberScrollBeforeRightPanelChange();
+    setAuxChatPanel(current => ({ openTick: (current?.openTick || 0) + 1 }));
+  }, [rememberScrollBeforeRightPanelChange]);
+  const closeAuxChatPanel = useCallback(() => {
+    rememberScrollBeforeRightPanelChange();
+    setAuxChatPanel(null);
+  }, [rememberScrollBeforeRightPanelChange]);
+  // When the mount condition (auxChatPanel && activeSession && isNativeAgent
+  // && bridge.available && bridge.auxChat, see the panel mount point below)
+  // goes away, the panel unmounts outright,
+  // and RightDockPanel's onActiveChange has no unmount cleanup, so the
+  // highlight would linger; reset it synchronously here when the mount
+  // condition drops, and once the session is back the panel re-mounts and
+  // reports its real visibility again. isNativeAgent is part of the condition:
+  // switching to an external-ACP agent must unmount the panel, not leave it
+  // rebound to a session the side chat must not answer on. The bridge
+  // conjuncts keep the gate identical to the entry button and the sessionId
+  // prop (round-25 minor consistency note).
+  useEffect(() => {
+    if (auxChatPanel && activeSession && isNativeAgent && bridge.available && bridge.auxChat) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously reset dock highlight when the panel unmounts; one-shot mirror, same pattern as the subagent reset below
+    setAuxChatDockActive(false);
+  }, [auxChatPanel, activeSession, isNativeAgent]);
   useLayoutEffect(() => {
     const snapshot = rightPanelScrollRef.current;
     if (!snapshot) return;
@@ -1180,7 +1262,7 @@ export function CodexAcpView({
       autoScrollRef.current = true;
       setShowScrollBottom(false);
     }
-  }, [subagentPanel, workspaceDockActivation, workspaceOpen]);
+  }, [auxChatPanel, subagentPanel, workspaceDockActivation, workspaceOpen]);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously collapse the subagent panel on session switch; one-shot mirror
     setSubagentPanel(null);
@@ -1226,6 +1308,18 @@ export function CodexAcpView({
   const visibleServiceFailure = serviceFailure?.key === dismissedFailureKey
     ? null
     : serviceFailure;
+  // Adapter stderr can appear here; always redact it before display, as for turn errors.
+  const runtimeNotice = useMemo(() => {
+    const notice = latestAgentRuntimeNotice(events);
+    if (!notice) return null;
+    return {
+      ...notice,
+      detail: timelineDisplayError(notice.detail, { language: acpModelServiceLanguage }) || '',
+    };
+  }, [events, acpModelServiceLanguage]);
+  const visibleRuntimeNotice = runtimeNotice?.key === dismissedNoticeKey
+    ? null
+    : runtimeNotice;
   const workspaceUnavailable = Boolean(
     activeSession
       && activeSession.workspace_kind === 'project'
@@ -1794,6 +1888,16 @@ export function CodexAcpView({
     acpEventSeqTrackerRef.current.rebase(sessionId, maxSeq);
   }
 
+  // reload 前置归属检查（评审 M4）：回退/撤销在途时用户切到其它会话，
+  // loadSession(原会话) 会把 activeIdRef 改回原会话、作废新会话的在途
+  // 加载并冻结其流式输出。已切走则跳过重载——磁盘已是目标状态，切回时
+  // loadSession 自然重注水；notice 补发走 pendingNotice 暂存。
+  function guardedReload(sessionId) {
+    return activeIdRef.current === sessionId
+      ? loadSession(sessionId)
+      : Promise.resolve(null);
+  }
+
   // 打开回退确认弹窗；有快照的目标懒加载 diff 预览（「将撤销的变更」摘要）。
   function openRewindDialog(entry) {
     setRewindError('');
@@ -1832,13 +1936,7 @@ export function CodexAcpView({
           conversationOnly: target.conversationOnly,
         });
       const { error: reloadError } = await reloadSessionAfterRewind({
-        // reload 前置归属检查（评审 M4）：回退/撤销在途时用户切到其它会话，
-        // loadSession(原会话) 会把 activeIdRef 改回原会话、作废新会话的在途
-        // 加载并冻结其流式输出。已切走则跳过重载——磁盘已是目标状态，切回时
-        // loadSession 自然重注水；notice 补发走 pendingNotice 暂存。
-        reload: () => (activeIdRef.current === sessionId
-          ? loadSession(sessionId)
-          : Promise.resolve(null)),
+        reload: () => guardedReload(sessionId),
         bumpTick: () => setNativeLaneTick(tick => tick + 1),
       });
       // 跨会话竞态：await 期间会话被程序化切换（remote control）时，UI 收口
@@ -1911,13 +2009,7 @@ export function CodexAcpView({
         await invoke('undo_last_rewind', { sessionId });
       }
       const { error: reloadError } = await reloadSessionAfterRewind({
-        // reload 前置归属检查（评审 M4）：回退/撤销在途时用户切到其它会话，
-        // loadSession(原会话) 会把 activeIdRef 改回原会话、作废新会话的在途
-        // 加载并冻结其流式输出。已切走则跳过重载——磁盘已是目标状态，切回时
-        // loadSession 自然重注水；notice 补发走 pendingNotice 暂存。
-        reload: () => (activeIdRef.current === sessionId
-          ? loadSession(sessionId)
-          : Promise.resolve(null)),
+        reload: () => guardedReload(sessionId),
         bumpTick: () => setNativeLaneTick(tick => tick + 1),
       });
       // 跨会话竞态：await 期间会话被程序化切换时不再写原会话的 UI 状态。
@@ -1974,16 +2066,29 @@ export function CodexAcpView({
     const requestedAgentId = draftAgentId;
     setError('');
     setWorkspaceMenuOpen(false);
+    // Capture the keychain/project ownership synchronously (re-picking during
+    // the await does not affect this creation).
+    const requestedProjectBinding = draftProjectBinding;
     const metadata = await createAcpSession({
       workspacePath: requestedWorkspacePath,
       workspaceHandle: requestedWorkspaceHandle,
       agentId: requestedAgentId,
+      workspaceRoots: requestedProjectBinding ? requestedProjectBinding.roots : null,
+      projectId: requestedProjectBinding ? requestedProjectBinding.projectId : null,
     });
     // loadSession 用 nativeSessionIdsRef 判定分流；新会话先登记，避免它读到旧 prop。
     if (requestedAgentId === 'pinvou') nativeSessionIdsRef.current.add(metadata.id);
     if (requestedWorkspacePath) setRecentWorkspaces(rememberWorkspace(requestedWorkspacePath));
     setDraftWorkspaceHandle(current => (
       current === requestedWorkspaceHandle ? null : current
+    ));
+    // The staged project binding is consumed by this creation too: clear it
+    // unless a re-pick during the await replaced it (same conditional-clear
+    // idiom as the handle above) — otherwise the stale binding would ride the
+    // next temporary creation and the payload would claim roots the session
+    // was never granted (review #484 round-5 M4).
+    setDraftProjectBinding(current => (
+      current === requestedProjectBinding ? null : current
     ));
     await refreshSessions();
     // Persist native controls before the first load. If persistence fails after the
@@ -2012,6 +2117,7 @@ export function CodexAcpView({
     setWorkspaceMenuOpen(false);
     setDraftWorkspacePath(workspacePath);
     setDraftWorkspaceHandle(workspaceHandle);
+    setDraftProjectBinding(null);
     // 选定项目工作区即默认展开工作区面板（无会话也可浏览文件）；临时会话无路径可浏览。
     setWorkspaceOpen(Boolean(workspacePath) && !isWeb);
     if (clearComposer) {
@@ -2041,16 +2147,20 @@ export function CodexAcpView({
       // The composer moves to the new draft. Browser attachment handles are
       // one-shot resources, so retaining a second owner on the old session
       // would let a consumed handle reappear when the user switches back.
-      setAttachmentDrafts(current => {
-        const next = { ...current, [DRAFT_ATTACHMENT_KEY]: current[activeId] || [] };
-        delete next[activeId];
-        return next;
-      });
-      setWorkspaceReferenceDrafts(current => {
-        const next = { ...current, [DRAFT_ATTACHMENT_KEY]: current[activeId] || [] };
-        delete next[activeId];
-        return next;
-      });
+      setAttachmentDrafts(current => transferAcpDraftItems(
+        current,
+        activeId,
+        DRAFT_ATTACHMENT_KEY,
+        current[activeId] || [],
+        attachment => attachment.id,
+      ));
+      setWorkspaceReferenceDrafts(current => transferAcpDraftItems(
+        current,
+        activeId,
+        DRAFT_ATTACHMENT_KEY,
+        current[activeId] || [],
+        reference => reference,
+      ));
     }
     setEvents([]);
     setPending([]);
@@ -2062,6 +2172,25 @@ export function CodexAcpView({
     setError('');
     if (onActiveSessionChange) onActiveSessionChange(null);
   }
+
+  // Picker result landing: project/folder channels → beginDraft(path) with the
+  // ownership and keychain staged; temporary session → beginDraft(null). The
+  // effect depends on epoch, so re-delivering the same choice still applies.
+  const pickerRequestEpochRef = useRef(0);
+  useEffect(() => {
+    const request = consumePickerRequest(workspacePickerRequest, pickerRequestEpochRef.current);
+    if (!request) return;
+    pickerRequestEpochRef.current = request.epoch;
+    const { path, projectId, roots } = request;
+    // beginDraft first (it clears the old staged binding internally), then set
+    // the target values — the later write wins within the same batch.
+    beginDraft(path || null, { clearComposer: false });
+    setDraftProjectBinding(projectId ? { projectId, roots: roots || [] } : null);
+    // Acknowledge consumption: the host clears the request object, so a later
+    // remount (this ref resets to 0) cannot replay it (review #484 M1).
+    if (onWorkspacePickerRequestConsumed) onWorkspacePickerRequestConsumed();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- beginDraft is a stable local function; the effect is driven by the request epoch only
+  }, [workspacePickerRequest]);
 
   function recreateUnavailableWorkspaceSession() {
     if (activeSession && activeSession.workspace_path) {
@@ -2080,6 +2209,38 @@ export function CodexAcpView({
       setRecentWorkspaces(rememberWorkspace(selected.path));
       beginDraft(selected.path, { workspaceHandle: selected.workspaceHandle });
     }
+  }
+
+  // Recents channel (§9.9 folder-channel parity, desktop): a recents pick is
+  // the same explicit folder choice as the picker's browse channel, so it
+  // runs the same ensure (anchor reuse / materialize) and stages the anchored
+  // project id as the draft binding — without it the created session has no
+  // tier-1 assignment and tier-2 nested grouping adopts it into a broader
+  // project whose root covers the folder (e.g. a Desktop-rooted project).
+  async function chooseRecentDraft(path) {
+    if (isWeb) {
+      await chooseProjectDraft(path);
+      return;
+    }
+    let interpreted;
+    try {
+      interpreted = interpretFolderEnsureOutcomes(await ensureFolderProjects([path]));
+    } catch (error) {
+      // IPC-level failure: same promise as the browse channel — the draft
+      // still lands at the picked folder, as a plain one.
+      console.warn('ensure folder project failed', error);
+      beginDraft(path);
+      return;
+    }
+    if (!interpreted.materialized && interpreted.failed) {
+      // A backend refusal (nesting conflict etc.) is not the exclusion list:
+      // landing a plain draft would let tier-2 adopt the session into a
+      // broader project — surface the failure instead.
+      throw new Error(t.uiProjects.opFailed);
+    }
+    // Excluded folders (no outcome) land plain with a null binding.
+    beginDraft(path);
+    setDraftProjectBinding(interpreted.projectId ? { projectId: interpreted.projectId, roots: [path] } : null);
   }
 
   function updateAttachments(sessionId, update) {
@@ -2296,7 +2457,7 @@ export function CodexAcpView({
     },
     canStart: () => !busy && !working && !activeRuntimeBusy,
     canSendTask: canSendNativeVoiceTask,
-    sendTask: async outgoing => send(outgoing),
+    sendTask: async (outgoing, context) => send(outgoing, { voiceOperationId: context?.operationId }),
   });
   const handleNativeVoiceTrigger = nativeVoice.triggerVoice;
 
@@ -2304,7 +2465,9 @@ export function CodexAcpView({
     nativeVoice.cancelVoice();
   }
   function handleNativeVoiceClose() {
-    nativeVoice.closeVoice();
+    // Dismiss without ending the unsent operation (an in-flight recording
+    // still cancels); closeVoice would abandon it.
+    nativeVoice.dismissVoice();
   }
 
   // 离开代码页（切模式/视图，组件卸载）时可靠取消进行中的语音输入：
@@ -2326,7 +2489,33 @@ export function CodexAcpView({
     // WebKit-safe filter + image File extraction shared with the chat paste path;
     // whether to swallow the event is decided here (single preventDefault below).
     const images = collectClipboardImages(event);
-    if (!images.length) return;
+    if (!images.length) {
+      // Linux WebKitGTK surfaces an image clipboard as an empty clipboardData
+      // (swallowing the text part too); the native layer reads the clipboard
+      // instead, mirroring the chat paste path. Browsers hand images over
+      // through clipboardData items, so web keeps the device-upload path.
+      if (deviceFileUploadAvailable) return;
+      if (!pasteImageClipboardFallbackAvailable(bs && bs.platformCapabilities)) return;
+      if (!pasteEventNeedsClipboardFallback(event)) return;
+      event.preventDefault();
+      // 直连 invoke 与既有 save_paste_image 用法一致；语义对齐 chat 侧的
+      // bridge.attachments.addPasteImageFromClipboard（command 返回 null = 无图
+      // 像，静默维持「无内容可贴」）。fulfiller 内保持非 async：附件入列失败
+      // 单独 .catch，避免 .then 第二参覆盖不到而成为 unhandled rejection。
+      invoke('paste_clipboard_image').then((path) => {
+        if (!path) return;
+        addAttachmentByPath(path, attachmentKey).catch(showError);
+      }, (err) => {
+        const limitError = formatAttachmentLimitError(err, t.uiAttachments);
+        if (limitError) {
+          console.error('Codex clipboard paste failed:', err);
+          setError(limitError);
+        } else {
+          showError(err);
+        }
+      });
+      return;
+    }
     if (!deviceFileUploadAvailable && !canInvoke('save_paste_image')) return;
     event.preventDefault();
     images.forEach(file => {
@@ -2461,7 +2650,14 @@ export function CodexAcpView({
       const sessionId = payload.session_id;
       if (!sessionId || !nativeSessionIdsRef.current.has(sessionId)) return;
       const lane = getNativeLane(sessionId);
-      const changed = applyNativeChatEvent(lane, name, payload, nativeEventContextRef.current);
+      const eventContext = nativeEventContextRef.current;
+      // Background lanes must not inherit the foreground session's model or
+      // provider. Their explicit error evidence remains sufficient; the
+      // owning model context applies once that session is opened.
+      const changed = applyNativeChatEvent(lane, name, payload, {
+        language: eventContext.language,
+        modelServiceState: sessionId === activeIdRef.current ? eventContext.modelServiceState : null,
+      });
       if (name === 'chat:turn_started' || name === 'chat:done') {
         refreshSessions().catch(() => {});
       }
@@ -2530,7 +2726,13 @@ export function CodexAcpView({
       activeIdRef.current = null;
       sessionLoadRequestRef.current += 1;
       if (preserveDraftWorkspaceRef.current) preserveDraftWorkspaceRef.current = false;
-      else setDraftWorkspacePath(null);
+      else {
+        setDraftWorkspacePath(null);
+        // The binding travels with the staged path: resetting the draft but
+        // keeping it would let a stale project binding leak into the next
+        // temporary creation's payload (review #484 round-5 M4).
+        setDraftProjectBinding(null);
+      }
       // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously reset events/pending/session info when returning to draft; one-shot mirror
       setEvents([]);
       setPending([]);
@@ -2557,17 +2759,8 @@ export function CodexAcpView({
 
   useEffect(() => {
     if (!activeStatus?.login_in_progress) return;
-    let cancelled = false;
-    let timer = null;
-    const poll = async () => {
-      await refreshStatus(activeAgentId).catch(() => {});
-      if (!cancelled) timer = window.setTimeout(poll, 750);
-    };
-    timer = window.setTimeout(poll, 750);
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
+    const stopPolling = startSerialStatusPolling(() => refreshStatus(activeAgentId), 750, 750);
+    return () => { void stopPolling(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- poll only on the login-in-progress edge; refreshStatus reference changes must not restart the poll chain
   }, [activeAgentId, activeStatus?.login_in_progress]);
 
@@ -2647,7 +2840,11 @@ export function CodexAcpView({
     if (!element) return;
     autoScrollRef.current = true;
     setShowScrollBottom(false);
-    element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' });
+    // Smooth gliding through a virtualized document mounts and unmounts
+    // rows for its whole duration while estimates go stale; jump instead
+    // (same decision as the overflowAnchor gate below).
+    const virtualized = shouldVirtualizeConversationTurns(visibleTurns.length, scroller);
+    element.scrollTo({ top: element.scrollHeight, behavior: virtualized ? 'auto' : 'smooth' });
   }
 
   function beginRuntimeOperation(agentId, operation) {
@@ -2752,6 +2949,7 @@ export function CodexAcpView({
     sendBody,
     draftFailureCleanup,
     backgroundErrorLabel,
+    voiceOperationId,
   }) {
     let targetId = activeId;
     const materializingDraft = !targetId;
@@ -2760,11 +2958,24 @@ export function CodexAcpView({
     setError('');
     try {
       if (!targetId) {
+        // Park before materialization too: a cancel during createSession
+        // must wait for the admission result instead of recording
+        // voice_cancelled for a message that is then delivered (begin is
+        // idempotent; the begin after creation binds the created session).
+        if (voiceOperationId && bridge.voice && typeof bridge.voice.beginVoiceSubmission === 'function') {
+          bridge.voice.beginVoiceSubmission(voiceOperationId);
+        }
         const created = await createSession({
           shouldActivate: () => canApplyAcpSendOperation(operation),
           prepareSession,
         });
         targetId = created.id;
+        // First-turn materialization: the voice operation's submission gate
+        // binds to the really created session (shared voice bookkeeping; ACP
+        // itself never reports a chat task attempt).
+        if (voiceOperationId && bridge.voice && typeof bridge.voice.beginVoiceSubmission === 'function') {
+          bridge.voice.beginVoiceSubmission(voiceOperationId, targetId);
+        }
         if (created.activated && activeIdRef.current === targetId) {
           acpSendOperationTracker.switchSession(targetId);
           operation = beginAcpSendOperation(targetId);
@@ -2784,6 +2995,12 @@ export function CodexAcpView({
           workspaceReferencesAtSend,
           reference => reference,
         ));
+      } else if (voiceOperationId && bridge.voice && typeof bridge.voice.beginVoiceSubmission === 'function') {
+        // Existing-session send: park the operation before dispatch too, so a
+        // cancel during the in-flight send waits for the admission result
+        // instead of recording voice_cancelled for a message that was
+        // delivered (same contract as the first-turn branch above).
+        bridge.voice.beginVoiceSubmission(voiceOperationId, targetId);
       }
       await sendBody({ targetId, operation });
       updateAttachments(targetId, current => current.filter(
@@ -2795,10 +3012,20 @@ export function CodexAcpView({
         workspaceReferencesAtSend,
         reference => reference,
       ));
+      // A dispatched ACP send ends its voice operation; without this the
+      // accepted record would sit pending forever (leaking its audio chunks).
+      if (voiceOperationId && bridge.voice?.completeVoiceSubmission) {
+        bridge.voice.completeVoiceSubmission(voiceOperationId, targetId, true);
+      }
       // Voice sendTask treats === false as failure: a real acceptance must explicitly report success.
       return true;
     } catch (err) {
       if (materializingDraft && draftFailureCleanup) draftFailureCleanup();
+      // A failed ACP send un-parks its voice operation and keeps the
+      // retryable association (same contract as the chat lane's rejections).
+      if (voiceOperationId && bridge.voice?.completeVoiceSubmission) {
+        bridge.voice.completeVoiceSubmission(voiceOperationId, targetId || null, false);
+      }
       if (canApplyAcpSendOperation(operation)) {
         showError(err);
         setDraft(message);
@@ -2814,7 +3041,7 @@ export function CodexAcpView({
     }
   }
 
-  async function send(messageOverride) {
+  async function send(messageOverride, sendOptions) {
     const hasMessageOverride = typeof messageOverride === 'string';
     if (!hasMessageOverride && nativeVoice && nativeVoice.editPreview) {
       return nativeVoice.applyVoiceEditPreview({ send: true });
@@ -2827,6 +3054,7 @@ export function CodexAcpView({
     const workspaceReferencesAtSend = workspaceReferences;
     const draftAgentAtSend = draftAgentId;
     const draftConfigAtSend = draftConfigSelections[draftAgentAtSend];
+    const voiceOperationId = sendOptions && sendOptions.voiceOperationId;
     if ((!message && !readyAttachments.length && !workspaceReferences.length)
       || composerSendBlockers.busy || composerSendBlockers.working || composerSendBlockers.configApplying) return false;
     if (composerSendBlockers.authMissing) {
@@ -2840,7 +3068,7 @@ export function CodexAcpView({
     if (composerSendBlockers.workspaceUnavailable) return false;
     if (composerSendBlockers.sessionNotReady) return false;
     if (isNativeAgent) {
-      return sendNative(message, readyAttachments);
+      return sendNative(message, readyAttachments, voiceOperationId);
     }
     return runAcpSendPipeline({
       message,
@@ -2848,6 +3076,7 @@ export function CodexAcpView({
       attachmentsAtSend,
       workspaceReferencesAtSend,
       backgroundErrorLabel: 'ACP',
+      voiceOperationId,
       materializeDraft: async ({ created, targetId, operation }) => {
         const appliedInfo = await applyDraftConfigSelections(
           targetId,
@@ -2881,7 +3110,7 @@ export function CodexAcpView({
 
   /// 原生（品悟 Engine）发送：草稿态先建会话（强制临时工作区），随后走 chat 命令；
   /// 用户气泡乐观插入 lane，chat 命令同步失败（空消息 / turn 占用等）时回滚。
-  async function sendNative(message, readyAttachments) {
+  async function sendNative(message, readyAttachments, voiceOperationId) {
     const attachmentsAtSend = attachments;
     const workspaceReferencesAtSend = workspaceReferences;
     const nativeDraftControlsAtSend = nativeDraftControls;
@@ -2891,6 +3120,7 @@ export function CodexAcpView({
       attachmentsAtSend,
       workspaceReferencesAtSend,
       backgroundErrorLabel: 'native',
+      voiceOperationId,
       prepareSession: async sessionId => {
         const prepared = await persistNativeDraftControls(
           sessionId,
@@ -3013,7 +3243,7 @@ export function CodexAcpView({
     setNativeLaneTick(tick => tick + 1);
   }
 
-  // 原生车道手动压缩：语义镜像 bridge interaction.compactNow——调 compact_now 后，
+  // 原生车道手动压缩：直接调 compact_now 命令（与 work 侧共享同一条命令）——调完后，
   // 进行中/结果由 chat:compaction 系统项呈现（compactStart/compactDone/compactFail）；
   // invoke 本身失败按 work 侧同款补一条 compactFail 系统提示项。
   async function compactNativeSession() {
@@ -3130,7 +3360,8 @@ export function CodexAcpView({
         <ConversationMarkdown
           text={item.legacyItem.text}
           streaming={item.status === 'in_progress'}
-          onOpenExternal={(url) => invoke('open_user_external_url', { url }).catch(showError)}
+          copy={t.uiConversation}
+          onOpenExternal={(url) => openAcpExternalUrl(url).catch(showError)}
           onOpenResource={isWeb ? undefined : openWorkspaceResource}
         />
       );
@@ -3202,7 +3433,10 @@ export function CodexAcpView({
       }
       return <div className="px-1 text-[11px] text-gray-400">{legacy.text}</div>;
     }
-    return null;
+    // ConversationTimeline only falls through to its DefaultItem renderer when
+    // renderItem yields undefined — no return statement here (an explicit null
+    // would suppress the default rendering of unhandled types such as
+    // reasoning and tool_group).
   }
 
   async function openWorkspaceResource(resourcePath) {
@@ -3299,6 +3533,52 @@ export function CodexAcpView({
     await applyAcpConfigChange('mode', targetId => setAcpMode(targetId, modeId));
   }
 
+  // Align to project (§9.7): the session keychain is replaced by the owning
+  // project's full root set at that moment; typed rejections map to copy by
+  // marker and any other failure gets the generic toast; on success the
+  // session list refreshes (the chip's roots update with the list).
+  async function alignKeychainToProject() {
+    if (!activeId) return;
+    try {
+      const outcome = await alignAcpSession(activeId);
+      if (outcome && outcome.applied) {
+        await refreshSessions().catch(() => {});
+        // live_push_failed: written, but the live engine kept the previous
+        // (possibly wider) root set — surface it (review #484 round-9 N2).
+        // Round-10 M2: a failed sidecar rewrite (index committed, disk copy
+        // stale) must surface like the other over-grant windows, not toast as
+        // a plain success.
+        if (onNotify) {
+          onNotify(outcome.sidecar_stale
+            ? t.uiKeychain.alignSidecarStale
+            : (outcome.live_push_failed ? t.uiKeychain.alignPushDeferred : t.uiKeychain.alignDone));
+        }
+      } else if (outcome && outcome.reason === 'no_change' && onNotify) {
+        onNotify(t.uiKeychain.alignNoChange);
+      } else if (outcome && outcome.reason === 'write_skipped' && onNotify) {
+        // Nothing failed and nothing was written (the binding store had no
+        // readable record) — surfacing it beats silence either way.
+        onNotify(t.uiKeychain.alignWriteSkipped);
+      } else if (outcome && outcome.reason === 'no_project' && onNotify) {
+        onNotify(t.uiKeychain.alignNoProject);
+      } else if (onNotify) {
+        // Any other non-applied outcome is unexpected; surface it instead of
+        // failing silently (chat lane parity, review #484 m2).
+        onNotify(t.uiKeychain.alignFailed);
+      }
+    } catch (error) {
+      const message = String((error && error.message) || error || '');
+      // Typed markers map to copy (ALIGN_BUSY/ALIGN_NO_WORKSPACE are thrown
+      // as-is by acpClient); unexpected failures get the generic toast
+      // (chat lane parity, review #484 m2).
+      if (onNotify) {
+        onNotify(alignErrorCopy(message, t.uiKeychain));
+      } else {
+        showError(error);
+      }
+    }
+  }
+
   return (
     <div className={`relative h-full min-h-0 flex flex-col ${theme === 'dark' ? 'text-[#E3E3E3]' : 'text-[#1F1F1F]'}`}>
         <ComposerAttachmentDropOverlay enabled={deviceFileUploadAvailable || (!isWeb && canInvoke('ingest_draft_file_chunk'))} onFiles={files => uploadDeviceFiles(files, attachmentKey)} dark={theme === 'dark'} variant={isWeb ? 'web' : 'desktop'} copy={t.uiAttachments} />
@@ -3307,9 +3587,48 @@ export function CodexAcpView({
           <div className="w-8 h-8 rounded-xl bg-black/[0.04] dark:bg-white/[0.08] flex items-center justify-center"><AcpAgentLogo agentId={activeAgentId} className="h-5 w-5" title={activeAgentName} /></div>
           <div className="min-w-0 flex-1">
             <div className="text-[14px] font-semibold">{activeSession.title || 'Codex'}</div>
-            <div className={`text-[10px] truncate ${activeSession && !activeSession.workspace_available ? 'text-red-500' : 'text-gray-400'}`}
+            <div className={`text-[10px] ${activeSession.workspace_kind === 'project' && activeSession.workspace_available !== false ? '' : 'truncate'} ${activeSession && !activeSession.workspace_available ? 'text-red-500' : 'text-gray-400'}`}
               title={activeSession && activeSession.workspace_path}>
-              {activeAgentName + ' · ' + (activeSession.workspace_kind === 'project' ? activeSession.workspace_path : codexCopy.temporaryWorkspace) + (activeSession.workspace_available ? '' : ' · ' + codexCopy.projectMissing)}
+              {activeAgentName + ' · '}
+              {/* Keychain chip (§6): project sessions show the primary
+                  directory + N and offer "align to project" (§9.7); temporary
+                  sessions / unavailable directories keep the original text
+                  line. No truncate on the chip branch: its overflow:hidden
+                  would clip the chip's pop-up panel (review #484 M2). */}
+              {activeSession.workspace_kind === 'project' && activeSession.workspace_available !== false ? (
+                <WorkspaceKeychainChip
+                  key={activeSession.id}
+                  copy={t.uiKeychain}
+                  // Round-26 MAJOR 3: this mount sits in the page header at
+                  // the viewport top — the panel must open DOWN.
+                  panelDirection="down"
+                  primary={(activeKeychain && activeKeychain.primary) || activeSession.workspace_path}
+                  additionalCount={activeKeychain && activeKeychain.primary
+                    ? activeKeychain.additional
+                    : 0}
+                  roots={activeKeychain && activeKeychain.primary
+                    ? activeKeychain.roots
+                    : [activeSession.workspace_path]}
+                  // Third-party ACP sessions sit behind the §6 stage-gate:
+                  // additional roots are recorded, only the primary is
+                  // delivered — the chip copy must not promise access.
+                  deliveryLimited={!isNativeAgent}
+                  // Consistency with the chat lane (review #484 round-10 m7):
+                  // gate the align entry on the desktop capability, not the
+                  // raw isWeb flag, so the two lanes cannot drift if the
+                  // capability and the platform kind ever diverge.
+                  canAlign={can('desktopChrome') && typeof alignAcpSession === 'function' && !!resolveSessionProjectId(
+                    { id: activeId, workspaceKind: 'project', workspacePath: activeSession.workspace_path },
+                    (bs && bs.projectsList && bs.projectsList.projects) || [],
+                    (bs && bs.projectsList && bs.projectsList.assignments) || {},
+                  )}
+                  busy={busy}
+                  onAlign={alignKeychainToProject}
+                />
+              ) : (
+                activeSession.workspace_kind === 'project' ? activeSession.workspace_path : codexCopy.temporaryWorkspace
+              )}
+              {activeSession.workspace_available ? '' : ' · ' + codexCopy.projectMissing}
             </div>
           </div>
           {configApplying && <span className="text-[10px] text-blue-500 animate-pulse">{codexCopy.applyingConfig}</span>}
@@ -3334,6 +3653,29 @@ export function CodexAcpView({
               t={t}
               swarmOn={nativeMultiAgentEnabled}
             />
+          )}
+          {/* Aux chat answers on Pinvou's internal engine, so the entry is
+              native-agent-only: on an external-ACP task the side chat would
+              silently answer on the default model while the panel copy
+              implies the task's own assistant (round-18 must-land; the quote
+              popover and the panel mount suppress on external ACP for the
+              same reason). */}
+          {activeSession && isNativeAgent && bridge.available && bridge.auxChat && (
+            <button
+              type="button"
+              data-testid="aux-chat-open"
+              aria-label={t.uiAuxChat.openLabel}
+              title={t.uiAuxChat.openLabel}
+              onClick={openAuxChatPanel}
+              className={`h-8 px-2.5 rounded-lg inline-flex items-center gap-1.5 text-[11px] transition-colors ${
+                auxChatPanel && auxChatDockActive
+                  ? 'bg-blue-500/10 text-blue-600 dark:text-blue-300'
+                  : 'text-gray-500 dark:text-gray-400 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+              }`}
+            >
+              <MessageSquare size={14} />
+              <span>{t.uiAuxChat.openLabel}</span>
+            </button>
           )}
           <WorkspacePanelToggle
             active={workspaceOpen && workspaceDockActive}
@@ -3367,12 +3709,17 @@ export function CodexAcpView({
 
         <div className="flex-1 min-h-0 flex">
         <div className="relative min-w-0 flex-1 min-h-0 flex flex-col">
-        <div ref={scroller} className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
-          <div ref={conversationContentRef} className="w-full max-w-[920px] min-h-full mx-auto px-6 py-6 flex flex-col gap-7">
+        <div ref={scroller} className="flex-1 min-h-0 overflow-y-auto custom-scrollbar" style={{
+          // Must match the timeline's own virtualization decision: anchoring off
+          // only while absolute virtual rows own the positioning.
+          overflowAnchor: shouldVirtualizeConversationTurns(visibleTurns.length, scroller) ? 'none' : undefined,
+        }}>
+          {/* relative: the AuxQuoteSelection chip is absolutely positioned inside this column, clamped to its rect. */}
+          <div ref={conversationContentRef} className="relative w-full max-w-[920px] min-h-full mx-auto px-6 py-6 flex flex-col gap-7">
             {workspaceUnavailable ? (
               <div
                 data-testid="codex-workspace-unavailable"
-                className="rounded-xl bg-red-500/8 px-3 py-2 text-[12px] text-red-600 dark:text-red-300"
+                className="rounded-xl bg-red-500/[0.08] px-3 py-2 text-[12px] text-red-700 dark:text-red-300"
               >
                 {fixedSession ? codexCopy.projectMissing : (
                   <>
@@ -3425,6 +3772,12 @@ export function CodexAcpView({
                     providerCopy={t.uiAcpProviders}
                   />
                 )}
+                <AgentRuntimeNotice
+                  notice={visibleRuntimeNotice}
+                  agentName={activeAgentName}
+                  onDismiss={() => setDismissedNoticeKey(runtimeNotice?.key || '')}
+                  copy={codexCopy}
+                />
               </>
             )}
             {!visibleTurns.length && (
@@ -3442,9 +3795,15 @@ export function CodexAcpView({
                 </div>
               </div>
             )}
-            {visibleTurns.map(turn => (
-                  <Fragment key={turn.id}>
-                    {isNativeAgent && rewindEntries.has(turn.id) && (
+            {visibleTurns.length > 0 && (
+                  <ConversationTimeline
+                    turns={visibleTurns}
+                    sessionId={activeId}
+                    scrollElementRef={scroller}
+                    busy={busy}
+                    turnGapPx={28}
+                    followOutputRef={autoScrollRef}
+                    renderBeforeTurn={turn => isNativeAgent && rewindEntries.has(turn.id) ? (
                       // 原生车道 turn 边界回退入口：turn N+1 前的 chip =「回退到第 N 轮」；
                       // 无快照的边界为「仅回退对话」变体（rewindEntriesByTurnId 判定）。
                       <RewindChip
@@ -3453,9 +3812,7 @@ export function CodexAcpView({
                         copy={codexCopy}
                         onOpen={openRewindDialog}
                       />
-                    )}
-                    <ConversationTurn
-                      turn={turn}
+                    ) : null}
                       copy={t.uiConversation}
                       pendingByTool={pendingByTool}
                       onRespond={respond}
@@ -3505,9 +3862,8 @@ export function CodexAcpView({
                       agentLabel={activeAgentName}
                       onOpenExternal={(url) => openAcpExternalUrl(url).catch(showError)}
                       onOpenResource={isWeb ? undefined : openWorkspaceResource}
-                    />
-                  </Fragment>
-                ))}
+                  />
+                )}
             {isNativeAgent && rewindUndoAvailable(rewindUndoState) && (
               // 「撤销回退」入口：渲染在时间线末尾（回退成功的内联提示其后），
               // 与 RewindChip 同门控（仅原生代码车道）；undoState 为 null 即消失。
@@ -3518,6 +3874,20 @@ export function CodexAcpView({
                 onOpen={(state) => { setRewindUndoError(''); setRewindUndoEntry({ ...state, reloadFailed: false }); }}
               />
             )}
+            {/* Selection quotes: select text in the code-lane conversation
+                timeline → stage it as a quote of this session's aux chat and
+                open the panel. Availability matches the header aux-chat
+                entry: external ACP sessions get no quote popover (the aux
+                chat answers on Pinvou's internal engine, see the entry
+                comment; the round-18 boundary previously landed on the entry
+                button only, and the quote selection and panel mount could
+                bypass it). */}
+            <AuxQuoteSelection
+              containerRef={conversationContentRef}
+              sessionId={activeSession && isNativeAgent && bridge.available && bridge.auxChat ? activeSession.id : null}
+              copy={t.uiAuxChat}
+              onQuote={openAuxChatPanel}
+            />
           </div>
         </div>
 
@@ -3618,7 +3988,7 @@ export function CodexAcpView({
                     <span
                       key={path}
                       title={path}
-                      className="max-w-[260px] h-7 pl-2.5 pr-1 rounded-lg inline-flex items-center gap-1.5 bg-blue-500/8 text-blue-700 dark:text-blue-300 text-[10px]"
+                      className="max-w-[260px] h-7 pl-2.5 pr-1 rounded-lg inline-flex items-center gap-1.5 bg-blue-500/[0.08] text-blue-700 dark:text-blue-300 text-[10px]"
                     >
                       <FileText size={12} className="shrink-0" />
                       <span className="truncate">@{path}</span>
@@ -3647,7 +4017,23 @@ export function CodexAcpView({
                   ))}
                 </div>
               )}
-              <textarea ref={voiceComposerTextareaRef} value={draft} onChange={event => setDraft(event.target.value)}
+              <textarea ref={voiceComposerTextareaRef} value={draft} onChange={event => {
+                const value = event.target.value;
+                // Emptying the composer abandons this page's pending voice result —
+                // in-flight through the bridge's live voice state, completed-but-
+                // adoptable through the operation registry ('codex' owner, as booked
+                // at start) — so the transcription can neither land in the cleared
+                // draft (terminal operations skip the write-back) nor be adopted by
+                // an unrelated later send.
+                if (!value.trim() && bridge.voice && typeof bridge.voice.abandonVoiceResult === 'function') {
+                  const pendingOperationId = (nativeVoiceActive && nativeVoiceInput.operationId)
+                    || (typeof bridge.voice.getVoiceOperationId === 'function'
+                      ? bridge.voice.getVoiceOperationId(activeId || null, 'codex')
+                      : null);
+                  if (pendingOperationId) bridge.voice.abandonVoiceResult(pendingOperationId);
+                }
+                setDraft(value);
+              }}
                 onPaste={handlePaste}
                 onKeyDown={event => {
                   if (nativeVoice.editPreview) {
@@ -3670,7 +4056,7 @@ export function CodexAcpView({
                   }
                 }}
                 placeholder={codexCopy.placeholder}
-                rows={1} className="w-full min-h-[48px] max-h-48 resize-none bg-transparent outline-none text-[15px] leading-6 placeholder:text-gray-400" />
+                rows={1} className="w-full min-h-[48px] max-h-48 overflow-y-auto resize-none bg-transparent outline-none text-[15px] leading-6 placeholder:text-gray-400" />
               <div data-testid="codex-composer-footer" className="flex items-center justify-between mt-1">
                 <div className="flex min-w-0 flex-wrap items-center gap-2 text-[10px] text-gray-400">
                   {!activeId && (
@@ -3693,7 +4079,7 @@ export function CodexAcpView({
                       </button>
                       {workspaceMenuOpen && (
                         <div ref={workspaceMenuPanelRef} className="absolute z-40 bottom-9 left-0 w-[280px] max-w-[calc(100vw-32px)] rounded-2xl border border-black/[0.08] dark:border-white/10 bg-white/95 dark:bg-[#202124]/95 backdrop-blur-xl shadow-xl p-2">
-                            <button type="button" onClick={() => chooseProjectDraft().catch(showError)}
+                            <button type="button" onClick={() => (isWeb || !onOpenWorkspacePicker) ? chooseProjectDraft().catch(showError) : onOpenWorkspacePicker({ lane: 'codex', mode: laneNoticeMode, deliveryLimited: !isNativeAgent })}
                               className="w-full rounded-xl px-3 py-2.5 flex items-center gap-3 text-left hover:bg-black/[0.04] dark:hover:bg-white/[0.06]">
                               <FolderOpen size={16} className="text-blue-500 shrink-0" />
                               <span><span className="block text-[12px] font-semibold">{codexCopy.chooseProject}</span><span className="block text-[10px] text-gray-400 mt-0.5">{codexCopy.chooseProjectDesc}</span></span>
@@ -3706,12 +4092,21 @@ export function CodexAcpView({
                             {recentWorkspaces.length > 0 && (
                               <div className="mt-1 pt-2 border-t border-black/[0.05] dark:border-white/[0.06]">
                                 <div className="px-3 pb-1 text-[10px] uppercase tracking-wider text-gray-400">{codexCopy.recentProjects}</div>
+                                {/* Grant-notice parity (§9.4, the same shape as the chat lane's
+    ComposerWorkspaceSelector): a recents pick grants the folder directly
+    (single root), so the mode-aware notice sits on the recents section. The
+    mode mirrors the picker entry above (native draft staging first, then the
+    lane's reported effective mode). No recorded variant here: a single root
+    is the cwd/primary and is delivered to a third-party ACP agent too, so
+    "recorded only" would be false at n=1 (review #484 round-9 N3). */}
+                                <div className="px-3 pb-1 text-[10px] text-gray-400">
+                                  {workspaceNoticeTone(laneNoticeMode) === 'restricted'
+                                    ? t.uiWorkspacePicker.noticeRestricted(1)
+                                    : t.uiWorkspacePicker.noticeVisibility(1)}
+                                </div>
                                 {recentWorkspaces.map(path => (
                                   <button key={path} type="button" title={path}
-                                    onClick={() => {
-                                      if (isWeb) chooseProjectDraft(path).catch(showError);
-                                      else beginDraft(path);
-                                    }}
+                                    onClick={() => { chooseRecentDraft(path).catch(showError); }}
                                     className="w-full rounded-lg px-3 py-1.5 flex items-center gap-2 text-left hover:bg-black/[0.04] dark:hover:bg-white/[0.06]">
                                     <FolderOpen size={13} className="shrink-0 text-gray-400" />
                                     <span className="truncate text-[11px]">{workspaceName(path, codexCopy.unknownDirectory)}</span>
@@ -4046,7 +4441,7 @@ export function CodexAcpView({
                   )}
                 </div>
                 {busy ? (
-                  <button type="button" onClick={cancel} className="w-9 h-9 rounded-full flex items-center justify-center bg-red-500/10 text-red-500 hover:bg-red-500/15"><StopCircle size={18} /></button>
+                  <button type="button" onClick={cancel} aria-label={codexCopy.stop} title={codexCopy.stop} className="w-9 h-9 rounded-full flex items-center justify-center bg-red-500/10 text-red-500 hover:bg-red-500/15"><StopCircle size={18} /></button>
                 ) : (
                   <>
                     <VoiceComposerButton
@@ -4269,8 +4664,22 @@ export function CodexAcpView({
             initialAgentId={subagentPanel.agentId}
             selectionRequestId={subagentPanel.selectionRequestId}
             t={t}
+            language={nativeModelServiceLanguage}
+            modelServiceState={nativeModelServiceState}
             onClose={closeSubagentPanel}
           />
+        )}
+        {auxChatPanel && activeSession && isNativeAgent && bridge.available && bridge.auxChat && (
+          <ViewErrorBoundary t={t} variant="panel">
+            <AuxChatPanel
+              sessionId={activeSession.id}
+              activationKey={auxChatPanel.openTick}
+              onActiveChange={setAuxChatDockActive}
+              t={t}
+              theme={theme}
+              onClose={closeAuxChatPanel}
+            />
+          </ViewErrorBoundary>
         )}
         </div>
     </div>

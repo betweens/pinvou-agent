@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   assistantItemCopyText,
-  assistantMarkdownCopyText,
   assistantResponseAvailable,
   assistantResponseText,
-  copyClipboardText,
-  normalizeAssistantMessageText,
 } from '../src/features/conversation/message-clipboard.js';
+import {
+  assistantMarkdownCopyText,
+  normalizeAssistantMessageText,
+} from '../src/features/conversation/structured-assistant-content.js';
+import { copyClipboardText } from '../src/shared/clipboard.js';
 import {
   assistantExportFilename,
   buildAssistantResponseExport,
@@ -120,6 +122,13 @@ assert.equal(
   'question cards should copy their visible question and numbered options instead of hidden JSON',
 );
 
+// marked is held at ^16.4.2: >=17 follows CommonMark here and a `>` blockquote
+// line at column 0 terminates the enclosing list item, demoting an indented
+// persona-card fence to an inline codespan inside a paragraph -- so the card
+// stops parsing and its hidden prompt copies out as literal text, a disclosure
+// regression (reproduced on 17.0.6 and 18.1.1 with the list blockquote fixture
+// below). Bumping marked means re-verifying every concealment variant in this
+// suite.
 const personaOnly = [
   '```persona-card',
   '{"name":"代码审查员","emoji":"🔎","description":"检查设计与副作用","body":"完整内部提示词"}',
@@ -386,6 +395,8 @@ for (const language of ['zh', 'en', 'ja']) {
   assert.ok(dict[language].uiConversation.copyReply, `${language}.uiConversation.copyReply must exist`);
   assert.ok(dict[language].uiConversation.copyReplySuccess, `${language}.uiConversation.copyReplySuccess must exist`);
   assert.ok(dict[language].uiConversation.copyReplyFailed, `${language}.uiConversation.copyReplyFailed must exist`);
+  assert.ok(dict[language].uiConversation.retryReply, `${language}.uiConversation.retryReply must exist`);
+  assert.ok(dict[language].clearInput, `${language}.clearInput must exist`);
   for (const key of [
     'exportReply', 'exportReplyTitle', 'exportMarkdown', 'exportMarkdownHint', 'exportHtml', 'exportHtmlHint', 'exportSuccess', 'exportFailed',
     'shareReply', 'shareReplyTitle', 'shareSystem', 'shareSystemHint', 'shareApps', 'shareSuccess', 'shareFailed', 'shareUnavailable',
@@ -435,7 +446,33 @@ assert.match(nativeHandler, /commands::assistant_response::export_assistant_resp
 assert.match(nativeHandler, /commands::assistant_response::open_assistant_share_target/);
 assert.doesNotMatch(actions, /targetRef|querySelector/);
 assert.doesNotMatch(clipboard, /querySelectorAll|data-assistant-copy-source/);
-assert.match(timeline, /<AssistantMessageFooter>[\s\S]*?<AssistantMessageActions resolveText=\{\(\) => assistantResponseText\(turn\)\} copy=\{c\}/);
+// Regenerate affordance: the footer button renders only with an onRetry handler and
+// re-sends the turn through the bridge without any analytics payload.
+assert.match(actions, /data-testid="assistant-message-retry"/);
+assert.match(actions, /aria-label=\{copy\.retryReply\}/);
+assert.match(chatView, /const retryLastTurn = useCallback\(\(turn\) => \{/);
+assert.match(chatView, /editLastTurn\(turn\.userText\)/);
+assert.match(chatView, /onRetry=\{isMultiAgentReadOnly \? undefined : retryLastTurn\}/);
+assert.doesNotMatch(chatView, /retryReason|telemetryTurnId/);
+// Clear-input affordance: pinned like every other composer control (testid +
+// consumption of its i18n key, so the key cannot be orphaned), and the
+// eligibility must include the armed edit-preview guard.
+assert.match(chatView, /data-testid="chat-clear-input"/);
+assert.match(chatView, /onClick=\{handleClearInput\}/);
+assert.match(chatView, /aria-label=\{t\.clearInput\}/);
+assert.match(chatView, /const canClearInput = hasDraftText && !voiceActive && !chatVoice\.editPreview;/);
+assert.match(timeline, /<AssistantMessageActions\n\s*resolveText=\{\(\) => assistantResponseText\(turn\)\}\n\s*copy=\{c\}\n\s*onRetry=\{retryHandler\}\n\s*\/>/);
+// Regenerate re-sends raw turn text: turns carrying an attachment marker line
+// (files would be dropped, the marker resent as body text) and empty-text
+// turns (nothing to re-send) must not render the control at all.
+assert.match(timeline, /import \{ splitAttachmentLine \} from '\.\.\/attachments\/attachment-message\.js';/);
+assert.match(timeline, /function retryHandlerForTurn\(onRetry, turn\)/);
+assert.match(timeline, /splitAttachmentLine\(userText\)\.attachments\.length === 0/);
+// Only the newest turn carries the retry handler, in every render path
+// (plain map, virtualized history rows, and the live tail).
+assert.match(timeline, /onRetry=\{index === turns\.length - 1 \? props\.onRetry : undefined\}/);
+assert.match(timeline, /onRetry=\{virtualRow\.index === turns\.length - 1 \? props\.onRetry : undefined\}/);
+assert.match(timeline, /onRetry=\{liveTurnIndex === turns\.length - 1 \? props\.onRetry : undefined\}/);
 // The legacy codex Turn footer was removed along with the old timeline; the completed-response actions contract is carried solely by the unified timeline.
 
 console.log('assistant message actions tests passed');

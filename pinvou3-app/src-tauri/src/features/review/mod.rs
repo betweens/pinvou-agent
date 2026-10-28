@@ -516,7 +516,7 @@ async fn model_review(
     // configured value; cloud providers are not probed.
     let provider = bridge.provider();
     let preset = review_model_preset(bridge);
-    let model_name = if provider == "vllm" {
+    let model_name = if provider == "vllm" || provider == "tachyon" {
         // The served-name probe uses an inference-same-origin key:
         // authenticated vLLM 401s on /v1/models.
         crate::features::monitor::resolve_served_model(
@@ -545,36 +545,26 @@ async fn model_review(
             &prompt,
             user_content,
             1600,
+            bridge.opencode_conversation_key("model-review"),
         )
         .await?
         .text;
         return parse_model_review(&content).context("parse Pinvou review");
     }
-    let mut body = json!({
-        "model": model_name,
-        "messages": [
-            { "role": "system", "content": prompt },
-            { "role": "user", "content": user_content }
-        ],
-        "temperature": 0,
-        "max_tokens": 1600,
-        "stream": false,
-        // 根治偶发非法 JSON(qwen36 长输出漏逗号/字符串内未转义引号,实测 line N col M 解析炸):
-        // vLLM guided decoding token 级保证输出合法 JSON 语法,不靠事后 find('{')..rfind('}') 补救。
-        // 后端实测 json_object/guided_json/json_schema 四种约束均支持,取最通用的 json_object;
-        // 三个 prompt 均含「输出只能是 JSON」字样,满足 json mode 前置要求。
-        "response_format": { "type": "json_object" }
-    });
+    let mut body = review_request_body(&model_name, &prompt, user_content);
     apply_review_reasoning_controls(&mut body, preset, &provider, &base_url, &model_name);
-    let resp = client
-        .post(url)
-        .bearer_auth(bridge.api_key())
-        .json(&body)
-        .send()
-        .await
-        .context("post chat/completions")?
-        .error_for_status()
-        .context("chat/completions status")?;
+    let resp = crate::core::model_endpoint::with_opencode_session_header(
+        client.post(url).bearer_auth(bridge.api_key()),
+        &base_url,
+        bridge.opencode_conversation_key("model-review"),
+    )
+    .json(&body)
+    .send()
+    .await
+    .context("post chat/completions")?;
+    let resp =
+        crate::core::model_endpoint::error_for_status_with_body(resp, "chat/completions status")
+            .await?;
     let value: Value = resp.json().await.context("parse chat/completions json")?;
     let content = value
         .get("choices")
@@ -585,6 +575,33 @@ async fn model_review(
         .and_then(Value::as_str)
         .unwrap_or_default();
     parse_model_review(content).context("parse Pinvou review")
+}
+
+/// One-shot Chat Completions body for model review. Field set mirrors the
+/// main-session engine wire (`model`/`messages`/`max_tokens`/`stream`, and —
+/// pinned by foundation tests — **no `temperature`**): a hard-coded 0 400s on
+/// gateways that pin sampling server-side (Kimi Coding Plan, live-probed
+/// 2026-09-30: "invalid temperature: only 1 is allowed for this model"; the
+/// image-capability probe hit the same constraint on 2026-08). Single source
+/// so the wire-drift budget stays testable.
+fn review_request_body(model: &str, prompt: &str, user_content: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": prompt },
+            { "role": "user", "content": user_content }
+        ],
+        "max_tokens": 1600,
+        "stream": false,
+        // 根治偶发非法 JSON(qwen36 长输出漏逗号/字符串内未转义引号,实测 line N col M 解析炸):
+        // vLLM guided decoding token 级保证输出合法 JSON 语法,不靠事后 find('{')..rfind('}') 补救。
+        // 后端实测 json_object/guided_json/json_schema 四种约束均支持,取最通用的 json_object;
+        // 三个 prompt 均含「输出只能是 JSON」字样,满足 json mode 前置要求。
+        // Deliberate additive drift from the engine wire (the engine sends
+        // none): vLLM guided decoding verified by the team when this landed;
+        // Kimi Coding Plan live-verified accepted 2026-09-30.
+        "response_format": { "type": "json_object" }
+    })
 }
 
 fn review_model_preset(bridge: &Pinvou3Bridge) -> ModelPreset {
@@ -616,7 +633,7 @@ fn review_reasoning_dialect(
     use crate::core::reasoning_dialect::{
         ReasoningDialect, kimi_supports_disabled_thinking, reasoning_dialect_from_base_url,
     };
-    if provider == "vllm" || preset == ModelPreset::LocalVllm {
+    if provider == "vllm" || provider == "tachyon" || preset == ModelPreset::LocalVllm {
         return ReasoningDialect::VllmChatTemplate;
     }
     if provider == "deepseek" || preset == ModelPreset::Deepseek {
@@ -640,6 +657,10 @@ fn review_reasoning_dialect(
         | ModelPreset::LocalVllm
         | ModelPreset::Deepseek
         | ModelPreset::Openai
+        // Custom Responses endpoints only switch the main-session engine
+        // route; review aux calls stay single-shot Chat Completions (no
+        // tool calls), so resolution falls back to URL/model-name sniffing.
+        | ModelPreset::OpenaiResponses
         | ModelPreset::Anthropic
         | ModelPreset::Gemini
         | ModelPreset::Xai => reasoning_dialect_from_base_url(base_url, model),
@@ -942,6 +963,51 @@ mod tests {
     }
 
     #[test]
+    fn review_request_body_mirrors_engine_wire_no_temperature() {
+        let body = review_request_body("k3", "sys prompt", "user content");
+        assert!(
+            body.get("temperature").is_none(),
+            "aux review body must mirror the engine wire (no temperature): a \
+             hard-coded 0 400s on sampling-pinned gateways — Kimi Coding Plan \
+             live 2026-09-30: only 1 is allowed for this model"
+        );
+        assert_eq!(body["model"], "k3");
+        assert_eq!(body["max_tokens"], 1600);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "sys prompt");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "user content");
+    }
+
+    /// Pin the call site, not just the builder: the builder pin above goes
+    /// red when `review_request_body` itself changes, but a re-inlined body
+    /// inside `model_review` would bypass it silently. The request region
+    /// must build through the shared builder and must not carry a sampling
+    /// parameter (the Kimi Coding Plan gateway rejects client temperature).
+    #[test]
+    fn model_review_call_site_builds_body_through_builder() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("async fn model_review")
+            .expect("model_review definition present");
+        let region = &source[start
+            ..source[start..]
+                .find("fn review_request_body")
+                .expect("review_request_body definition present")
+                + start];
+        assert!(
+            region.contains("review_request_body("),
+            "model_review must build its one-shot body via review_request_body"
+        );
+        assert!(
+            !region.contains("\"temperature\""),
+            "the review request region must not re-inline a temperature field"
+        );
+    }
+
+    #[test]
     fn review_reasoning_controls_cover_builtin_presets() {
         let mut qwen = json!({});
         apply_review_reasoning_controls(
@@ -1023,6 +1089,28 @@ mod tests {
                 "openai",
                 "https://api.openai.com/v1",
                 "gpt-4o",
+            ),
+            crate::core::reasoning_dialect::ReasoningDialect::None
+        );
+        // The custom Responses preset rides the same URL-sniff fallback:
+        // review's single-shot calls stay plain Chat (no tools), so the
+        // dialect follows the endpoint/model, not the preset (the compiler
+        // only pins arm exhaustiveness — this pins the semantics).
+        assert_eq!(
+            review_reasoning_dialect(
+                ModelPreset::OpenaiResponses,
+                "openai",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "qwen3.6-flash",
+            ),
+            crate::core::reasoning_dialect::ReasoningDialect::QwenEnableThinking
+        );
+        assert_eq!(
+            review_reasoning_dialect(
+                ModelPreset::OpenaiResponses,
+                "openai",
+                "https://api.openai.com/v1",
+                "gpt-6-sol",
             ),
             crate::core::reasoning_dialect::ReasoningDialect::None
         );

@@ -34,6 +34,7 @@ const CREDENTIALS = fs.readFileSync(
   'utf8'
 );
 const STORE = fs.readFileSync(path.join(TAU, 'features', 'codex_acp', 'store.rs'), 'utf8');
+const FILESYSTEM = fs.readFileSync(path.join(TAU, 'platform', 'filesystem.rs'), 'utf8');
 
 // ---------------------------------------------------------------- 1. 命令注册
 
@@ -103,19 +104,56 @@ for (const file of [CLAUDE, CODEX, KIMI, PROVIDERS_MOD]) {
   );
 }
 
-// 原子写（公共助手在 providers/mod.rs）+ 一次性备份 + 拒绝覆盖不可解析文件
+// 一次性备份 + 拒绝覆盖不可解析文件。
+// round-49 review: `persist_locked` 的正式写入路径是共享
+// `platform::filesystem::atomic_write`（唯一 pid+nanos staging + fsync）；
+// 旧的 `json.{}.tmp` 拼写只存在于已被替换的空转测试里，本 pin 改锚真实
+// 生产调用；唯一的 pid+nanos staging 名改锚共享实现（platform/filesystem.rs）。
 assert.ok(
-  PROVIDERS_MOD.includes('with_extension("tmp")') &&
-    PROVIDERS_MOD.includes('fs::rename'),
-  '公共写入助手必须 .tmp + fs::rename 原子替换'
+  PROVIDERS_MOD.includes('crate::platform::filesystem::atomic_write'),
+  'persist_locked 必须走共享 atomic_write（唯一 pid+nanos staging + fsync）'
+);
+// round-52 fix wave: the CLI-config `atomic_write` helper in this module
+// moved off its hand-rolled `tmp.{pid}` + rename staging onto the shared
+// `filesystem::atomic_write_private` (the hand-rolled pair carried no
+// fsync, so a power cut could land a truncated CLI config, and its fixed
+// staging name let two surfaces trample each other). The pin re-anchors
+// on the shared helper — which carries the unique per-writer staging, the
+// fsync-before-rename, and the two-arm tmp cleanup — and now also rejects
+// a bare hand-rolled `fs::rename(` persist sneaking back into the module
+// outside the helper.
+assert.ok(
+  PROVIDERS_MOD.includes('crate::platform::filesystem::atomic_write_private'),
+  'CLI 配置写入必须走共享 atomic_write_private（唯一 staging + fsync + 0600 临时文件）'
+);
+assert.ok(
+  !/^\s*fs::rename\(/m.test(PROVIDERS_MOD),
+  'providers 不得再留手写 fs::rename 暂存（统一走 atomic_write_private）'
 );
 assert.ok(
   PROVIDERS_MOD.includes('pinvou3-bak'),
   '首次受管写入必须备份 .pinvou3-bak'
 );
 assert.ok(
-  STORE.includes('json.tmp') && STORE.includes('fs::rename'),
-  'store 必须 .tmp + fs::rename 原子写'
+  FILESYSTEM.includes('std::process::id()') &&
+    FILESYSTEM.includes('.{file_name}.tmp-{token}'),
+  '共享 atomic_write 实现必须保留 pid+nanos 唯一 staging 名'
+);
+// round-52 fix wave: AcpConfigDefaultsStore::persist moved off its local
+// hand-rolled `json.tmp.{pid}` + rename staging onto the shared
+// `filesystem::atomic_write` (the hand-rolled pair carried no fsync, so a
+// power cut could land a truncated acp-agent-defaults.json). The pin
+// re-anchors on the shared helper — which carries the unique per-writer
+// staging, the fsync-before-rename, and the two-arm tmp cleanup — and now
+// also rejects a bare hand-rolled `fs::rename(` persist sneaking back into
+// the module outside the helper.
+assert.ok(
+  STORE.includes('crate::platform::filesystem::atomic_write'),
+  'store persist 必须走共享 atomic_write（唯一 staging + fsync + rename）'
+);
+assert.ok(
+  !/^\s*fs::rename\(/m.test(STORE),
+  'store 不得再留手写 fs::rename 暂存（统一走 atomic_write）'
 );
 for (const file of [CLAUDE, CODEX, KIMI]) {
   assert.ok(file.includes('atomic_write'), `${file} 必须经原子写助手落盘`);
@@ -504,11 +542,198 @@ assert.ok(
   '安装进度必须走共享 store，且安装收口后清除'
 );
 
+// ---------------------------------------------------------------- 8.2 Install outcome cross-mount heal
+
+// While installing, the settings panel can be closed/switched away and the
+// initiating instance unmounts — install_acp_agent's return value reaches no
+// mounted component. The backend must record the real outcome into the
+// shared store when it wraps up and carry it back through status
+// (install_finished, cleared when the next install starts); the remounted
+// panel converges the restored in-progress phase from it and must not stay
+// on "downloading" forever.
+assert.ok(
+  MOD.includes('pub install_finished: Option<InstallFinishedInfo>')
+    && MOD.includes('struct InstallOutcomeStore'),
+  'status must carry the install outcome field install_finished (cross-mount heal data source)'
+);
+assert.ok(
+  MOD.includes('app.manage(InstallOutcomeStore::default())'),
+  'InstallOutcomeStore must be registered as managed state (try_state consumers silently no-op otherwise)'
+);
+assert.ok(
+  MOD.includes('fn install_outcome_for_result'),
+  'the outcome mapping must be a pure function (cancel-marker verdict unit-testable)'
+);
+assert.ok(
+  MOD.includes('clear_install_outcome(&self.app, backend)')
+    && MOD.includes('record_install_outcome(&self.app, backend, outcome)'),
+  'install_agent must clear the previous outcome at entry and record this run\'s outcome before returning'
+);
+// The union read and the status-side fill each have exactly two call sites
+// (the Kimi early-return branch and the general branch): deleting either one
+// silently reinstates the strand window for the codex/claude backends, so a
+// substring match is not enough — pin the occurrence count.
+const modCount = needle => MOD.split(needle).length - 1;
+assert.ok(
+  modCount('guard_installing || self.install_active.read().contains(&backend)') === 2,
+  'status.installing must cover the whole install lifecycle (install lock union active window) in BOTH status build branches'
+);
+assert.ok(
+  modCount('fill_install_outcome(&self.app, backend, &mut status)') === 2,
+  'both status build branches must carry install_finished back'
+);
+// The active window must actually register at entry: status.installing only
+// covers the whole lifecycle while the backend is inside the registry, and
+// the preflight cancel arm only fires while the registry holds the backend.
+assert.ok(
+  MOD.includes('if !install_active.write().insert(backend)')
+    && MOD.includes('InstallActiveGuard::try_start(&self.install_active, backend)'),
+  'InstallActiveGuard must register the backend into install_active at install entry (try_start)'
+);
+assert.ok(
+  MOD.indexOf('InstallActiveGuard::try_start(&self.install_active, backend)')
+    < MOD.indexOf('clear_install_outcome(&self.app, backend)'),
+  'the active window must register BEFORE the entry clears: a rejected concurrent install must not clobber the running one\'s outcome or cancel marker'
+);
+assert.ok(
+  MOD.indexOf('record_install_outcome(&self.app, backend, outcome)')
+    < MOD.indexOf('drop(install_active_guard)'),
+  'the outcome must be recorded before the active window closes (no installing=false-without-outcome gap)'
+);
+// A cancel in the preflight window (not spawned yet, no pid to kill) must be
+// armed instead of rejected, then consumed by the spawn-time recheck — or,
+// when the natural failure wins that race, consumed at outcome-record time.
+// Exactly two removes remain: the install entry clear and the record-time
+// consumption (the per-channel wipes are gone — a wipe after guard
+// acquisition would swallow a fresh preflight cancel).
+assert.ok(
+  MOD.includes('!guard_held && !self.install_active.read().contains(&backend)'),
+  'cancel must cover the preflight active window instead of rejecting with "no install in progress"'
+);
+assert.ok(
+  modCount('self.install_cancelled.lock().remove(&backend)') === 2
+    && MOD.includes('let cancel_pending = self.install_cancelled.lock().remove(&backend)'),
+  'the cancel marker must be consumed at install entry (stale marker) and at record time (unraced preflight cancel), and nowhere after guard acquisition'
+);
+assert.ok(
+  /let \(outcome, returned_error\) =\s*settle_install_result\(\s*result\.is_ok\(\),\s*cancel_pending,/.test(MOD),
+  'the record-time verdict must take a still-armed cancel marker into account (via settle_install_result)'
+);
+// The return value must classify the same way the outcome is recorded: a
+// preflight-window cancel whose natural failure won the race is recorded as
+// cancelled, so the initiating caller must see a marker-carrying cancelled
+// error — the catch branch would otherwise overwrite the cancelled phase
+// with failed + red error, a wrong terminal the heal cannot repair.
+assert.ok(
+  MOD.includes('fn settle_install_result'),
+  'the cancellation settlement must be a pure function (return-vs-record classification unit-testable)'
+);
+assert.ok(
+  MOD.includes('Some(detail) => Err(anyhow!(detail)),')
+    && MOD.indexOf('Some(detail) => Err(anyhow!(detail)),') < MOD.indexOf('async fn install_agent_inner'),
+  'the wrapper must return the settlement\'s marker-carrying cancelled error instead of the incidental natural failure'
+);
+assert.ok(
+  /fn install_settlement_returns_recorded_cancellation/.test(MOD),
+  'the cancellation settlement must have a behavioral unit test (armed preflight cancel + natural failure => marker-carrying cancelled return)'
+);
+// Failed outcomes must carry this run's error chain: some failure paths
+// never write runtime_errors, so echoing status.error would show an empty or
+// stale message.
+assert.ok(
+  MOD.includes('error_detail.map(str::to_string)'),
+  'failed outcomes must carry this run\'s error chain (install_finished.error)'
+);
+// Frontend heal: converge only when "installing phase + not initiated by
+// this instance (busy mismatch) + log exists and belongs to the active agent
+// + this instance fetched the status itself for this agent + the status
+// belongs to the active agent and the backend is no longer installing"; all
+// three terminal phases must be mapped and failures must echo the outcome's
+// error chain. Pins are code-anchored (comments may repeat similar strings).
+{
+  const healStart = PROVIDERS_SECTION.indexOf('Cross-mount install heal');
+  assert.ok(healStart > 0, 'the frontend must implement the cross-mount install heal (ProvidersSection)');
+  const heal = PROVIDERS_SECTION.slice(healStart, healStart + 3400);
+  assert.match(
+    heal,
+    /const outcome = status\.install_finished/,
+    'the heal must consume status.install_finished'
+  );
+  assert.match(
+    heal,
+    /installPhase !== 'installing'/,
+    'the heal only converges the installing phase (checking has no log, no card to converge)'
+  );
+  assert.match(
+    heal,
+    /busy === 'install:' \+ activeAgent/,
+    'an install initiated by this instance still converges via its own await, not the heal'
+  );
+  assert.match(
+    heal,
+    /!installLog \|\| installLog\.agent !== activeAgent/,
+    'the log must be non-null and belong to the active agent (the log-null window must not be closed by another agent\'s stale outcome)'
+  );
+  assert.match(
+    heal,
+    /fresh\.agent !== activeAgent \|\| fresh\.seq !== installRunSeqRef\.current/,
+    'the heal trusts only a status this instance fetched itself FOR the active agent, DISPATCHED after the last observed run start (a pre-run snapshot carries the previous run\'s outcome with installing=false)'
+  );
+  assert.ok(
+    PROVIDERS_SECTION.includes('fetchedStatusRef.current = { agent, seq: seqAtDispatch };'),
+    'the self-fetched marker must record WHICH agent was fetched and the dispatch-time run sequence (per-agent, per-run freshness)'
+  );
+  assert.ok(
+    PROVIDERS_SECTION.includes('const seqAtDispatch = installRunSeqRef.current;'),
+    'freshness must capture the run sequence at DISPATCH, not at landing: a response for a pre-event fetch must not re-establish freshness after the command event'
+  );
+  // A run observed through a command event (started at another entrance)
+  // must invalidate pre-event freshness, or the heal consumes the previous
+  // run's outcome and falsely converges while the new run is still going.
+  assert.match(
+    PROVIDERS_SECTION,
+    /installRunSeqRef\.current \+= 1;\s*\n\s*setInstallPhase\('installing'\)/,
+    'a new-run command event must bump the run sequence (invalidate pre-event freshness) before switching the card to installing'
+  );
+  // With a stale status.installing=false in hand, only the installing phase
+  // itself arms the poller — otherwise an observed run at another entrance
+  // never converges. Scoped to the agent whose card is showing so a leftover
+  // phase from another tab cannot poll it.
+  assert.match(
+    PROVIDERS_SECTION,
+    /installPhase === 'installing' && installLog && installLog\.agent === activeAgent/,
+    'the installing phase (scoped to the active agent\'s card) must arm the install poller: an observed run with a stale status.installing=false must keep polling until its own terminal'
+  );
+  assert.match(
+    heal,
+    /status\.agent_id !== activeAgent \|\| status\.installing/,
+    'the status must belong to the active agent and the backend must no longer be installing (no premature convergence)'
+  );
+  assert.match(
+    heal,
+    /outcome\.cancelled \? 'cancelled' : outcome\.ok \? 'done' : 'failed'/,
+    'the heal must map the outcome to cancelled/done/failed'
+  );
+  assert.match(
+    heal,
+    /outcome\.error/,
+    'failed heals must echo the outcome\'s own error chain (aligned with the initiating instance\'s catch branch)'
+  );
+  assert.match(
+    heal,
+    /setError\(failureDetail\)/,
+    'failed heals must write the failure cause into the error area'
+  );
+}
+
 // ---------------------------------------------------------------- 9. Claude 细化模型槽位 + env 生效值（改动 5）
 
 // 槽位定义：mod.rs 提供 CLAUDE_MODEL_SLOTS（opus/sonnet/haiku/fable/subagent → env 键）
+// 槽位表现为 `pub const`：1a32c6e93 为 CLI 走 facade 引用把它从 pub(crate)
+// 放宽为 pub（值仍只为同仓消费者使用）。匹配两种拼法以防可见性再次调整时
+// 契约悄悄失配。
 assert.ok(
-  PROVIDERS_MOD.includes('pub(crate) const CLAUDE_MODEL_SLOTS'),
+  /pub(?:\(crate\))? const CLAUDE_MODEL_SLOTS/.test(PROVIDERS_MOD),
   'mod.rs 必须定义 CLAUDE_MODEL_SLOTS 槽位表'
 );
 for (const envName of [
@@ -584,8 +809,8 @@ assert.doesNotMatch(
 // relay-station users lose the official model suggestions. Removing any entry
 // counts as an intentional shrink and must explicitly update this list.
 const ACP_REQUIRED_MODELS = {
-  anthropic: ['claude-fable-5-1', 'claude-haiku-4-5'],
-  openai: ['gpt-6-astra', 'gpt-5.6-terra'],
+  anthropic: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1', 'claude-haiku-4-5'],
+  openai: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-terra'],
   moonshot: ['kimi-k3', 'kimi-k2.7-code'],
   'kimi-code': ['k3', 'k3-256k'],
   deepseek: ['deepseek-flash', 'deepseek-v4-flash'],
@@ -614,7 +839,8 @@ for (const [presetKey, required] of Object.entries(ACP_REQUIRED_MODELS)) {
 assert.ok(CATALOG.includes('export const ACP_MODEL_PRESETS'), 'the ACP catalog should contain the flat suggestions table ACP_MODEL_PRESETS');
 const FLAT_MODELS_SECTION = CATALOG.slice(CATALOG.indexOf('export const ACP_MODEL_PRESETS'));
 for (const id of [
-  'claude-fable-5-1', 'gpt-6-astra', 'deepseek-flash', 'kimi-k3', 'glm-5.3',
+  'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5',
+  'claude-fable-5-1', 'gpt-6.1-sol', 'gpt-6-astra', 'deepseek-flash', 'kimi-k3', 'glm-5.3',
   'qwen3.8-max', 'MiniMax-M3', 'grok-4.6', 'grok-4.20-reasoning',
   'grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning', 'grok-build-0.1',
 ]) {
@@ -681,8 +907,8 @@ assert.match(
 );
 assert.match(
   MOD,
-  /probe_agent_model_options[\s\S]*?self\.agents\.remove\(&probe_id\)/,
-  '模型探针必须删除 store 记录（防残留）'
+  /probe_agent_model_options[\s\S]*?let probe_owned = probe_id\.clone\(\);[\s\S]*?agents\.remove\(&probe_owned\)/,
+  '模型探针必须删除 store 记录（防残留；round-49 起删除在 blocking worker 上执行，钉住 id 的所有权转移链）'
 );
 assert.match(
   CODEX_VIEW,

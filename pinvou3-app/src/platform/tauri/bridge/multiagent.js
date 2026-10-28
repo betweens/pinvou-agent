@@ -3,7 +3,9 @@
  * Registered before bridge.js builds the backwards-compatible facade.
  *
  * After ADR-0006 this is a thin layer: multi-agent = plain-session capability
- * + proactive delegation. Subagent identity/status/records are persisted by
+ * + the spawn-time swarm contract (delegation is the parent agent's judgment
+ * by actual benefit, not mandated). Subagent identity/status/records are
+ * persisted by
  * the foundation (worker ledger + transcripts); this domain only reads the
  * subagent list and transcripts and forwards subagent bridge events as DOM
  * events for the running overlay, the spawn count rows, and the transcript
@@ -74,6 +76,10 @@
         agentId: p.agent_id,
         role: p.role_id && p.role_id !== p.agent_id ? p.role_id : null,
         status: p.status || null,
+        // 结构化生命周期令牌（与 worker ledger 同一词表）。status 是自由文本
+        // 进展短语，仅作兼容展示；台账令牌与该令牌互相覆盖时标签会来回
+        // 闪烁，展示层必须优先用同词表的结构化态。
+        workerStatus: p.worker_status || null,
         done: false,
         failed: false,
       });

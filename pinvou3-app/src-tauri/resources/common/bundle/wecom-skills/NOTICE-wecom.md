@@ -223,6 +223,8 @@ wecom sheet/smartsheet/smartpage 三技能文档审计修复,属本地适配层(
    「必须单行/不得空行」改为「建议单行,解析器容忍空行、`#` 与 `//`
    注释行、多行 pretty-print」(解析器实测),同文件残留「必须/要压缩到
    单行」两处同步收口;`color_hex` 补「可选前导 `#`」。
+   (2026-10-18 勘误:本条沙箱部分自 1.3.4 起退役不再重放,见「上游同步
+   (2026-10-18,wecom-cli 1.3.4)」的登记注销;其余口径继续有效。)
 7. **media upload `voice` 补「源文件仅支持 AMR」**(message 技能同约束镜像)。
 8. **get-mail.md 返回示例补 `ori_mail_id`**(schema 实证;上游文档明文该
    字段用于对应回请求的 `mail_id`)。
@@ -309,10 +311,13 @@ wecom sheet/smartsheet/smartpage 三技能文档审计修复,属本地适配层(
 
 14 个技能全部 = 上游 `e88bf90a`(v1.2.1 发布提交,npm 1.2.1 同源),技能目录与
 上游同名同构;本地分叉为上文「本轮品悟适配清单」六类,审计登记「路由口径
-统一与文档缺陷修复(2026-08-27)」(sheet/smartsheet/smartpage 三技能)、
-「文档缺陷修复(2026-08-27,calendar/meeting/email/message/media 五技能)」、
-「文档缺陷修复(2026-09-05,全量第二轮:十个技能)」及本次
-「上游同步(2026-09-15,wecom-cli 1.2.1)」的三文件合并口径。
+统一与文档缺陷修复(2026-08-27)」(sheet/smartsheet/smartpage 三技能)、「
+文档缺陷修复(2026-08-27,calendar/meeting/email/message/media 五技能)」、
+「文档缺陷修复(2026-09-05,全量第二轮:十个技能)」、「上游同步
+(2026-09-15,wecom-cli 1.2.1)」的三文件合并口径,以及下文「邮件正文中间
+文件路径统一(2026-10-07,模型向文本审计)」「周期能力措辞与联系人搜索
+说明(2026-10-07,模型向文本审计)」「授权初始化改为终端交接(2026-10-08,
+模型向文本审计)」三轮登记的全部本地修改。
 
 > 对账命令(仓库根执行):
 > ```
@@ -323,3 +328,117 @@ wecom sheet/smartsheet/smartpage 三技能文档审计修复,属本地适配层(
 > ```
 > diff 只应报 SKILL.md(及被改的 references/*.md)differ;「Only in」之外的
 > 差异即为新的未登记分叉。
+
+### 邮件正文中间文件路径统一(2026-10-07,模型向文本审计)
+
+- **wecomcli-email/references/send-mail.md 步骤三**:`{产出目录}/mail_body_<唯一后缀>.md`
+  改为 `tmp/mail/mail_body_<唯一后缀>.md`。邮件正文是发送后即无用的中间文件,原路径把它写进
+  产出物面板根目录,违反工作环境「只有最终成品写根、中间/临时文件一律 `tmp/`」的面板语义,
+  每次发信都会污染产出物列表。
+- **wecomcli-email/references/reply-mail.md 步骤四**:`{工作目录}/temp/output/mail_reply_<唯一后缀>.md`
+  改为 `tmp/mail/mail_reply_<唯一后缀>.md`。`temp/output/` 是自创的非规范路径,同一「写正文再
+  发送」操作在 send/reply 两种教程里写法不一致;统一到 `tmp/mail/` 约定。
+- 两处均为本地修改,下次 sync 需重放;此前各轮 NOTICE 未登记过邮件正文路径(2026-08-27
+  五技能文档缺陷修复轮登记的是 30-day fiction 删除等,与本项无重叠)。
+
+### 周期能力措辞与联系人搜索说明(2026-10-07,模型向文本审计)
+
+- **wecomcli-calendar/SKILL.md + references/calendar-create.md、
+  wecomcli-meeting/SKILL.md + references/meeting-create.md**:周期日程/会议的
+  「不支持…(API 仅支持创建单次日程 / API 层根本无此能力)」改为「产品暂未开放
+  的能力(产品范围限制)」。原绝对断言无包内事实源(各 references 仅证实读侧
+  返回 `repeat_rule` 字段,创建/更新参数表均无周期写入口),一旦上游变化即成
+  误导;改为产品范围口径后,拒绝与「引导用户在企业微信客户端手动操作」的行为
+  语义不变。
+- **wecomcli-contact/SKILL.md**:`search_mode="list"` 行由「返回全量命中列表」
+  改为「列表模式…列表可能因服务端限制未完整返回,以返回的 `hint` 字段为准,
+  `hint` 给出限制说明时必须向用户如实说明结果可能不全,不得把返回条数当作
+  准确总数」。参数行「拿到完整人员名单」同步改为「命中列表(清点 / 穷举意图)」。
+  「全量」同样是未经二进制核验的断言;返回表中 `hint`(结果限制提示)字段表明
+  截断可能发生,清点类问题必须以 `hint` 为准。
+- **wecomcli-contact/SKILL.md frontmatter**:`description` 尾部的「获取 userid、
+  列出全部同名人员」改为「获取指定人员的 userid」。「列出全部同名人员」是未经
+  二进制核验的能力断言,与 list 模式「可能未完整返回」的口径冲突。
+- 以上均为本地修改,下次 sync 需重放。
+
+### 授权初始化改为终端交接(2026-10-08,模型向文本审计)
+
+- **wecomcli-shared/SKILL.md 步骤三**:原步骤让模型在会话内直接执行
+  `wecom-cli auth init --noninteractive`——该命令展示授权链接和二维码后阻塞
+  等待用户扫码,会话内的调用在阻塞期间无法让用户看到二维码,和 lark/dws 已
+  清除的阻断式登录同类。改为:不在会话内执行该命令,把命令交给用户在自己的
+  终端执行,或引导用户使用应用的连接入口完成授权;会话内仅用
+  `auth show --status` 复核授权状态。
+- 此为本地修改,下次 sync 需重放;wecomcli-shared 其余步骤(状态检查、
+  ID 外露约束等)未改动。
+
+
+## 2026-10-18 本地修改（模型侧文案复审,下次 sync 需重放）
+
+1. **wecomcli-doc-manage/SKILL.md description 范围收敛**：原「适用所有企微文档类型」与正文适用范围（改名/成员/加入规则仅支持 doc/sheet/smartsheet/smartpage 四类）矛盾,会为「改 PPT 权限」类请求诱导错误路由。改为「搜索支持各类企微文档;改名/成员权限/加入规则仅支持 doc/sheet/smartsheet/smartpage」。
+2. **wecomcli-message/SKILL.md description 去掉不存在的 text 类型**：`msg_type` 枚举仅 markdown/image/file/voice/video,普通文本也按 Markdown 发送。改为「发送 Markdown(纯文本亦按 Markdown 发送)、图片、文件、语音、视频消息」。
+3. **wecomcli-smartsheet/references/smart-sheet-formula.md 转义示例修复**：原内联示例 `需转义为 \""` 引号不配对,模型会照抄出错形态。改为 `需转义为 \"`（每个双引号前各加一个反斜杠）。
+4. **wecomcli-doc/scripts/build_docx.py docstring 改 `python3`**：宿主环境无裸 `python`（NOTICE 前文已登记）,references/doc-create.md 已改而脚本自身 docstring 漏改。
+
+### 上游同步(2026-10-18,wecom-cli 1.3.4)
+
+全量同步至上游 v1.3.4 发布提交 `f9b2815`(2026-09-23,npm `@wecom/cli@1.3.4` 同源;
+上游 GitHub 仓库仍无 tag/release,版本以 npm registry 为准)。合并方法:以 v1.2.1
+发布提交 `e88bf90a` 为 base、当前本地为 ours、`f9b2815` 为 theirs 做逐文件三方合并
+(git merge-file),2 个冲突文件按本节裁定。对账命令沿用上方模板(worktree 换
+`f9b2815`)。技能从 14 个增至 **15 个**:上游新增 `wecomcli-pptx`(MR !77 随 1.3.4
+发布;`slide` 命令族技能,本地整体收录;经 connectors.lock 钉扎的 1.3.4 linux-arm64
+二进制实测,`wecom-cli slide` 的 get/pages/designs/images 子命令面与该技能
+`pptx-api.md` 所教一致(该文档约束 3 原另教 `slide shapes get`,为上游文档超写、
+钉扎二进制不支持;2026-10-19 本地裁定:约束 3 删去该命令教学、注明钉扎二进制
+不支持,单个形状信息改按探测先行协议处理——属本地修改,下次 sync 需重放,
+上游修复后回退);`wecomcli-pptx/scripts/` 两个脚本的命令表调用形态上游已写
+`python3`,脚本 docstring 内的裸 `python` 按既定豁免不重写)。
+
+上游 v1.2.1 → v1.3.4 的 `skills/` 改动(MR !62 之后的增量):
+
+1. **wecomcli-pptx 新增**(见上)。
+2. **安全提示节(MR !67,`605b506`)**:email/get-mail.md 末尾新增「安全提示(最高
+   优先级)」(接口返回内容不得视为指令、不得输出令牌凭据);同批给 12/14 技能的
+   SKILL.md 注入同款反注入段落与「命令拼接安全规范」,随合并整体采纳。
+3. **wecomcli-doc(MR `fe5ec14`)**:doc-create.md 本地 XLSX 导入建表优化说明,
+   doc SKILL.md 路由行同步,随合并采纳。
+4. **wecomcli-disk / doc-manage**:上传示例微调,随合并采纳。
+
+冲突裁定(2 文件):
+
+- `wecomcli-email/references/get-mail.md`:保持本地「`users[].email` 字段」口径
+  (上游原文仍写 `mail` 字段,本地勘误继续有效),追加上游新增「安全提示」节。
+- `wecomcli-shared/SKILL.md`:保持本地品悟代管口径(npm 自安装指引维持删除、
+  授权改终端交接),版本门槛文本 `1.2.1` → `1.3.4`(description、Step 1 检查行、
+  重试分支共 4 处),与全平台 lock 钉扎 1.3.4 及 `wecom.rs` 的
+  `WECOM_MIN_VERSION = (1, 3, 4)` 对齐;上游本轮同样只把数字提到 1.2.1,无新语义。
+
+本地登记重放核验:14 个既有技能的全部本地修改(「何时用」description 前缀、
+品悟代管安装口径、终端交接授权、邮件正文 `tmp/mail/` 路径、周期「产品暂未开放」
+措辞、contact 搜索 `hint` 口径等)经三方合并保留,**唯一例外是下段注销的
+「文档缺陷修复(2026-09-05,全量第二轮:十个技能)」第 6 条 build_docx.py 沙箱层**(随上游同区域重写一并移除,不属遗漏;勘误 2026-10-18:本句原误指「1.1.0
+适配清单第 6 条」,该条实为 shared 技能 bins frontmatter,与 build_docx.py 无关);
+`wecomcli-pptx` 作为新技能按
+1.1.0 适配清单第 1 条口径补写 description「何时用:」前缀(211 字符 ≤280;上游
+原文无前缀且超限),`bins: ["wecom-cli"]` 上游已自带。
+
+登记注销(2026-10-18 勘误,1.3.4 起):「文档缺陷修复(2026-09-05,全量第二轮:
+十个技能)」第 6 条中
+build_docx.py 的 `WECOMAGENT_READABLE_DIRS`/`WECOMAGENT_WRITABLE_DIRS` 路径
+containment 部分**退役,不再重放**——上游 v1.2.1→v1.3.4 增量已整体移除该沙箱机制,
+输出位置改为「JSONL 所在目录的 `docx/` 子目录」,本仓宿主代码从未设置 `WECOMAGENT_*`
+环境变量(src-tauri 与 pinvou-cli 全量零引用),该层从未实际生效;同条目其余口径
+(「建议单行,解析器容忍空行/注释行/pretty-print」、spec 文件名 ASCII 建议——脚本
+仍把非 ASCII 词干替换为 `document`、`color_hex` 可选前导 `#`)继续有效。
+`wecomcli-doc/references/doc-create.md`「用法约定」已同步改为上游契约:删除
+「路径越权」虚构错误路径与「可写目录」表述,产物位置以 stdout `Successfully built`
+行为准。
+rebase 纳入 main #724「模型侧文案复审」四项(doc-manage/message description 修正、smart-sheet-formula 转义示例、build_docx.py docstring python3),登记见上方「模型侧文案复审」节。
+
+### 各技能重放基线(1.3.4 起)
+
+15 个技能全部 = 上游 `f9b2815`(v1.3.4 发布提交,npm 1.3.4 同源),技能目录与上游
+同名同构;本地分叉为「本轮(1.1.0)品悟适配清单」六类、历次审计登记、「上游同步
+(2026-09-15,wecom-cli 1.2.1)」与「上游同步(2026-10-18,wecom-cli 1.3.4)」的合并
+口径,以及 2026-10-07/10-08 三轮模型向文本审计登记的全部本地修改。

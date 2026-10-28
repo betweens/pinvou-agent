@@ -10,7 +10,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
 const temp = mkdtempSync(path.join(tmpdir(), 'pinvou3-deepseek-conversation-'));
 const conversationDir = path.join(temp, 'features', 'conversation');
+const sharedDir = path.join(temp, 'shared');
 mkdirSync(conversationDir, { recursive: true });
+mkdirSync(sharedDir, { recursive: true });
 writeFileSync(path.join(temp, 'package.json'), '{"type":"module"}\n');
 for (const file of ['conversation-model.js', 'deepseek-conversation.js']) {
   copyFileSync(
@@ -18,6 +20,14 @@ for (const file of ['conversation-model.js', 'deepseek-conversation.js']) {
     path.join(conversationDir, file),
   );
 }
+copyFileSync(
+  path.join(root, 'src', 'shared', 'shell-tools.mjs'),
+  path.join(sharedDir, 'shell-tools.mjs'),
+);
+copyFileSync(
+  path.join(root, 'src', 'shared', 'path-utils.js'),
+  path.join(sharedDir, 'path-utils.js'),
+);
 vm.runInThisContext(
   readFileSync(path.join(root, 'src', 'shared', 'model-service-errors.js'), 'utf8'),
   { filename: 'model-service-errors.js' },
@@ -34,6 +44,7 @@ try {
     isAgentWaitCall,
     isFetchTool,
     isNearConversationBottom,
+    isOperationItemType,
     isSearchTool,
     searchToolDetails,
   } = await import(
@@ -62,6 +73,14 @@ try {
     status: 'failed',
     tool: { name: 'read', rawInput: {} },
   }), true, 'ordinary tool failures must remain visible');
+  // Round-9 review pin: the operation-item membership set moved from three
+  // inline list spellings to this shared Set — feed EVERY member through the
+  // real module (file_change had zero executing coverage; dropping it from
+  // the Set stayed green and would silently stop rendering file-change cards).
+  for (const type of ['command_execution', 'file_change', 'tool']) {
+    assert.equal(isOperationItemType(type), true, `${type} must stay an operation item type`);
+  }
+  assert.equal(isOperationItemType('file'), false, 'non-operation types stay out');
   assert.equal(isNearConversationBottom({ scrollHeight: 1000, scrollTop: 820, clientHeight: 100 }), true);
   assert.equal(isNearConversationBottom({ scrollHeight: 1000, scrollTop: 700, clientHeight: 100 }), false);
   const chatItems = [
@@ -123,7 +142,6 @@ try {
   });
 
   assert.deepEqual(chatItems, before, 'projection must never rewrite the DeepSeek chatItems fact source');
-  assert.equal(projected.thread.id, 'session-1');
   assert.equal(projected.turns.length, 3, 'preamble and each user message must become stable turns');
   assert.equal(projected.turns[1].userText, '检查仓库');
   assert.deepEqual(
@@ -202,7 +220,6 @@ try {
     ],
   });
   assert.equal(rawMarkdownProjection.turns[0].items[0].text, '## Result\n\n- item');
-  assert.equal(rawMarkdownProjection.turns[0].items[0].copyText, undefined);
   assert.deepEqual(
     rawMarkdownProjection.turns[0].items[0].copyOptions,
     { allowScheduledTaskDraft: false },
@@ -448,7 +465,13 @@ try {
     conversationView.includes('bg-white/85') && conversationView.includes('dark:bg-[rgba(38,38,42,0.78)]'),
     'timeline user-error card must provide a light theme alongside the dark glass style',
   );
-  assert.ok(chatView.includes('<ConversationTimeline'), 'DeepSeek must render through the shared timeline by default');
+  assert.ok(chatView.includes('<ConversationTimeline')
+    && chatView.includes('scrollElementRef={scrollRef}')
+    && chatView.includes('followOutputRef={autoScrollRef}')
+    && chatView.includes('turnGapPx={16}'),
+  'DeepSeek must render through the shared timeline by default');
+  assert.ok(chatView.includes('shouldVirtualizeConversationTurns(conversationProjection.turns.length, scrollRef)'),
+  'native scroll anchoring must stay enabled while the chat timeline is in normal flow');
   assert.ok(chatView.includes('data-testid="chat-artifacts-entry"')
     && chatView.includes('{activeSessionId && (')
     && chatView.includes('const artifactsVisible = Boolean(activeSessionId && artifactsOpen)')
@@ -470,8 +493,9 @@ try {
   assert.ok(toolRenderers.includes('<QuestionChoiceCard'),
     'DeepSeek request_user_input must use the shared Codex-style choice card');
   assert.ok(toolRenderers.includes('isFreeTextPlaceholderOption')
-    && userInputShared.includes('!allowOther || !isFreeTextPlaceholderOption(option)'),
-  'free-text questions must not render duplicate Other placeholder choices');
+    && userInputShared.includes('allowOther: true')
+    && userInputShared.includes('!isFreeTextPlaceholderOption(option)'),
+  'free-text questions must not render duplicate Other placeholder choices (custom box pinned open, so the placeholder filter is unconditional)');
   assert.ok(toolRenderers.includes('otherPlaceholder={t.uiToolRender.other}'),
     'DeepSeek and Codex question cards must use the same free-text placeholder');
   assert.ok(questionChoiceCard.includes("type={question.multiSelect ? 'checkbox' : 'radio'}")

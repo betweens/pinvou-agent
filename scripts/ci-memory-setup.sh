@@ -13,6 +13,13 @@
 #   - The Pinvou/pinvou3 hosted runner is 2-core / 7.8 GiB RAM (free -h);
 #     the "16 GiB RAM" claimed by older comments was the public-repo
 #     runner spec.
+#   - 2026-10-01 re-measure (this repo, public-runner image refresh): root
+#     is now 146G with 79-102G free at job start (x64/arm); the 8G disk
+#     swapfile is ~10% of boot free instead of the 72G-era half-the-disk,
+#     and the aggressive cleanup tier measured 27.6 GiB reclaimable. The
+#     disk-cost trade comments below are kept as history; disk pressure is
+#     no longer the binding constraint — quota-evicted caches and RAM peaks
+#     are.
 #
 # Swap layers, preferred first:
 #   1. zram: zstd, priority 100; the virtual device is sized to 2x RAM at
@@ -39,10 +46,11 @@
 #      stuck sysfs write) is uninterruptible; the workflow-side
 #      `timeout 240` + non-fatal wrapper is the last line there, and
 #      PINVOU3_CI_DISABLE_ZRAM=1 is the standing opt-out.
-#   2. /mnt/swapfile (priority 10), 8 GiB, provisioned on EVERY runner:
-#      swap is mandatory, not opt-in (2026-09-19 decision) — with the zram
-#      pool hard-capped at 70% of RAM, this is the only unbounded overflow
-#      layer. The safety guards stay: /mnt is skipped when tmpfs (RAM
+#   2. /mnt/swapfile (priority 10), 8 GiB — raised to 16 GiB whenever the
+#      zram layer is inactive (2026-10 degraded mode; see below) —
+#      provisioned on EVERY runner: swap is mandatory, not opt-in
+#      (2026-09-19 decision) — with the zram pool hard-capped at 70% of
+#      RAM, this is the only unbounded overflow layer. The safety guards stay: /mnt is skipped when tmpfs (RAM
 #      backed) or too small, the file is capped at 60% of actual free
 #      space, and an image-provided /mnt/swapfile is rebuilt in place. On
 #      the single-disk hosted images this costs 8G of build disk — a
@@ -51,11 +59,14 @@
 #      zero active swap (probe data: some ubuntu-22.04 boots ship /swapfile
 #      but leave it inactive), activate it so a zram or disk-swap failure
 #      degrades to "plain swap" instead of "7.8 GiB RAM and nothing else".
-#   4. zswap in front of whatever swap remains, enabled only when no
-#      /dev/zram swap is active, so the "compress in RAM first" layer
-#      exists exactly once.
+#   4. zswap in front of whatever swap remains: enabled only when no
+#      /dev/zram swap is active, and disabled again when zram is active
+#      (stock Ubuntu kernels ship zswap enabled by default), so the
+#      "compress in RAM first" layer exists exactly once.
 #
-# Environment switches:
+# Environment switches (they survive the workflow wrappers'
+# `sudo --preserve-env` alongside GITHUB_ACTIONS; sudo env_reset would
+# otherwise strip them from the job env, silently no-op'ing the opt-out):
 #   PINVOU3_CI_DISABLE_ZRAM=1      skip zram entirely (explicit opt-out for
 #                                  future incidents; zram has been the
 #                                  default first layer since this script
@@ -94,16 +105,30 @@ set -uo pipefail
 log() { echo "[memory-setup] $*"; }
 # Surface degradation warnings as GitHub step annotations when running in
 # Actions: the workflow-side wrapper only annotates the outer 240s timeout,
-# so an in-script degradation would otherwise be step-log-only. Outside
-# Actions (self-hosted debugging) keep plain stderr text.
+# so an in-script degradation would otherwise be step-log-only. Every call
+# site passes GITHUB_ACTIONS through sudo (--preserve-env) so this branch
+# actually engages; outside Actions (manual or self-hosted debugging runs)
+# keep plain stderr text.
 if [[ ${GITHUB_ACTIONS:-} == true ]]; then
-  warn() { echo "::warning::[memory-setup] $*" >&2; }
+  # Workflow commands are single-line: captured stderr (multi-line tool
+  # output) must be folded or the annotation is cut at the first newline
+  # (a stray CR splits lines too -- the runner's .NET line reader treats
+  # it as a terminator, which could forge a second workflow command).
+  warn() { echo "::warning::[memory-setup] ${*//[$'\r\n']/ }" >&2; }
 else
   warn() { echo "[memory-setup] WARNING: $*" >&2; }
 fi
 
+# Steps that normally recover a few lines later (first modprobe miss on
+# hosted images, the image-swap pre-activation belonging to that same
+# recovery, the as-is swapon retry, and the last-resort image-swapfile
+# attempt after all layers fail) must not burn a standing ::warning
+# annotation on every job; keep them visible in the log only.
+# Unrecovered failures still use warn.
+warn_recoverable() { echo "[memory-setup] WARNING: $*" >&2; }
+
 if [[ ${EUID} -ne 0 ]]; then
-  warn "must run as root (invoke as: sudo bash scripts/ci-memory-setup.sh)"
+  warn "must run as root (invoke as: sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash scripts/ci-memory-setup.sh)"
   exit 0
 fi
 
@@ -141,7 +166,7 @@ log "sysctl tuned (best effort): swappiness=130 watermark_scale_factor=300 min_f
 
 # zram knobs: the virtual device is ZRAM_RAM_MULT x RAM (derived at runtime
 # from MemTotal) and the compressed pool is capped at ZRAM_POOL_RAM_PCT
-# percent of RAM. The opt-in disk swap keeps a fixed size.
+# percent of RAM. The mandatory disk swap keeps a fixed size.
 ZRAM_RAM_MULT=2
 ZRAM_POOL_RAM_PCT=70
 ZRAM_PRIORITY=100
@@ -155,22 +180,36 @@ setup_zram() {
   # in the warning so the actual failure reason survives in the log.
   local modprobe_err
   if ! modprobe_err="$(run_to 60 modprobe zram 2>&1)"; then
-    warn "modprobe zram failed${modprobe_err:+: ${modprobe_err}}; installing linux-modules-extra-$(uname -r) and retrying"
+    warn_recoverable "modprobe zram failed${modprobe_err:+: ${modprobe_err}}; installing linux-modules-extra-$(uname -r) and retrying"
     # The module-install path (apt-get, up to minutes) is the slowest stretch
     # of this script and the only one the workflow-side `timeout 240` can
     # realistically interrupt. Activate the image swapfile BEFORE it, so a
     # mid-apt kill degrades to "plain swap" and never to zero swap; if zram
     # comes up afterwards it simply takes over as the higher-priority layer.
     if ! any_swap_active; then
-      warn "no swap active; activating the image swapfile before the slow module install"
+      warn_recoverable "no swap active; activating the image swapfile before the slow module install"
       activate_image_swap_fallback
     fi
-    if ! run_to 120 apt-get update -qq; then
+    if ! run_to 60 apt-get update -qq; then
       warn "apt-get update failed; the module install below may fail too"
     fi
-    if ! run_to 120 apt-get install -y -qq --no-install-recommends \
-      "linux-modules-extra-$(uname -r)"; then
-      warn "apt-get install linux-modules-extra-$(uname -r) failed"
+    # Two install attempts: the 2026-10-01 probe recorded a transient failure
+    # of this exact install (same kernel had succeeded on 2026-09-28), and a
+    # failed attempt degrades every rust-test job on that image to swap-only.
+    # The install caps (90 + 90) fit inside the workflow-side 240s wrapper
+    # next to the 60s update above, but the earlier zram probes and the 15s
+    # kill grace are outside that sum: if the wrapper wins the race the
+    # script dies mid-apt and the degraded-mode 16G swapfile below never
+    # runs — the image-swap fallback activated above is then the only
+    # overflow layer for that job.
+    local modules_pkg="linux-modules-extra-$(uname -r)"
+    if ! run_to 90 apt-get install -y -qq --no-install-recommends \
+      "${modules_pkg}"; then
+      warn "apt-get install ${modules_pkg} failed once; retrying"
+      if ! run_to 90 apt-get install -y -qq --no-install-recommends \
+        "${modules_pkg}"; then
+        warn "apt-get install ${modules_pkg} failed again; giving up on zram layers"
+      fi
     fi
     if ! modprobe_err="$(run_to 60 modprobe zram 2>&1)"; then
       warn "modprobe zram still failing after module install${modprobe_err:+: ${modprobe_err}}; giving up on zram"
@@ -268,9 +307,11 @@ setup_zram() {
   return 0
 }
 
-# Mandatory disk swap: the 8 GiB /mnt/swapfile is the unbounded overflow
-# layer beyond the zram pool cap and is provisioned on every runner (no
-# opt-in switch since 2026-09-19). On hosted images / and /mnt share one
+# Mandatory disk swap: the /mnt/swapfile is the unbounded overflow layer
+# beyond the zram pool cap and is provisioned on every runner (no opt-in
+# switch since 2026-09-19); 8 GiB normally, 16 GiB when zram is inactive
+# (sole overflow layer then, sized for the measured 14.2 GB rust-test
+# link peaks). On hosted images / and /mnt share one
 # ext4, so the guards below keep the file from taking the runner down.
 setup_disk_swap() {
   # /mnt safety checks are load bearing: on images where /mnt is tmpfs
@@ -302,8 +343,10 @@ setup_disk_swap() {
     # swapoff of a large active swapfile can take minutes; the cap keeps it
     # bounded and on timeout the swap simply stays active (kept below).
     if run_to 120 swapoff /mnt/swapfile 2>/dev/null; then
-      rm -f /mnt/swapfile
-      removed_note=" (the previous /mnt/swapfile was removed)"
+      # Only claim removal in removed_note if it actually happened.
+      if rm -f /mnt/swapfile; then
+        removed_note=" (the previous /mnt/swapfile was removed)"
+      fi
     else
       warn "could not swapoff the active /mnt/swapfile; keeping it as is instead of rebuilding"
       return 0
@@ -341,7 +384,7 @@ activate_image_swap_fallback() {
       log "last-resort swap active: ${cand} (image-provided)"
       return 0
     fi
-    warn "swapon ${cand} failed as is; trying chmod 600 + mkswap + swapon once"
+    warn_recoverable "swapon ${cand} failed as is; trying chmod 600 + mkswap + swapon once"
     chmod 600 "${cand}" 2>/dev/null || true
     if run_to 60 mkswap "${cand}" >/dev/null 2>&1 \
       && run_to 60 swapon "${cand}" 2>/dev/null; then
@@ -383,6 +426,17 @@ else
   warn "zram layer unavailable; continuing with the remaining swap layers"
 fi
 
+# Degraded-mode headroom (2026-10): when no zram swap is active — flaky
+# modules-extra install or explicit opt-out — the disk swapfile is the ONLY
+# overflow layer behind the ~14.2GB rust-test link peaks, and 8G was sized
+# assuming zram would exist. Double it in that case; on the current image
+# family (146G root, 79-102G free) the disk cost is minor next to the
+# runner-death risk it backs.
+if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q '/dev/zram'; then
+  DISK_SWAP_SIZE_KIB=$((16 * 1024 * 1024))
+  log "no zram swap active; raising the disk swapfile to 16G as the sole overflow layer"
+fi
+
 # Disk swap is mandatory (2026-09-19): the 8G /mnt swapfile is the only
 # unbounded overflow beyond the 70%-capped zram pool, so no opt-in switch
 # remains. setup_disk_swap's guards still skip RAM-backed or nearly-full
@@ -407,7 +461,11 @@ else
 fi
 
 if ! any_swap_active; then
-  warn "no active swap after all layers; trying the image-provided swapfile"
+  # The last-resort retry usually activates an image swapfile (success logs
+  # its own line) and its terminal failure already annotates inside the
+  # function; annotating here too would leave a standing marker on every
+  # swapless job, against the recoverable-noise policy.
+  warn_recoverable "no active swap after all layers; trying the image-provided swapfile"
   activate_image_swap_fallback
 fi
 

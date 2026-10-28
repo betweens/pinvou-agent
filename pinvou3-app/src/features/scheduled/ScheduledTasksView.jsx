@@ -1,3 +1,4 @@
+import { ScheduledMessageTarget, scheduledRunDescription } from './scheduled-message-display.jsx';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { Check, ChevronDown, ChevronRight, ClipboardCheck, Clock, Database, FileChartLine, MessageCircle, Newspaper, Plus, X } from '../../components/icons.jsx';
@@ -5,7 +6,7 @@ import { bridge, useBridgeState } from '../../hooks/useBridge.js';
 import { formatLocalDateTime } from '../../shared/date-utils.js';
 import { visibleUserModels } from '../../shared/model-options.js';
 import { selectorMainLabel } from '../settings/model-catalog.js';
-import { useConversationSecondClock } from '../conversation/ConversationTimeline.jsx';
+import { useConversationSecondClock } from '../../hooks/useConversationSecondClock.js';
 import { can } from '../../shared/platform.js';
 import dailyBriefImage from '../../assets/scheduled/daily-brief.jpg';
 import followUpMonitorImage from '../../assets/scheduled/follow-up-monitor.jpg';
@@ -14,7 +15,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
 
 /**
  * Scheduled task row record as delivered by `appState.scheduledTasks`
- * (backend wire shape; preview tasks carry the same core fields).
+ * (backend wire shape).
  * @typedef {object} ScheduledTask
  * @property {string} id - Stable task id.
  * @property {string} name - Task display name.
@@ -75,57 +76,6 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
         icon: Database, color: '#F9AB00', image: memoryOrganizeImage
       },
     ];
-
-    const PREVIEW_SCHEDULED_TASKS = [
-      // Display copy (name/scheduleLabel/prompt) is covered in three languages by
-      // scheduledCopy.previewTasks; model: null means the preview "auto select" (rendering falls back to scheduledCopy.autoModel).
-      {
-        id: "preview-daily-brief",
-        templateId: "daily-brief",
-        status: "active",
-        rrule: "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=8;BYMINUTE=0",
-        model: "DeepSeek",
-        nextRunOffsetMs: 1000 * 60 * 42,
-        lastRunAt: "2026-07-14T08:00:00+08:00",
-        hasUnreadRuns: true,
-        isRunning: false,
-      },
-      {
-        id: "preview-follow-up",
-        status: "active",
-        rrule: "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0",
-        model: "GPT-4o",
-        nextRunOffsetMs: 1000 * 60 * 60 * 3 + 1000 * 60 * 12,
-        lastRunAt: "2026-07-14T09:00:00+08:00",
-        hasUnreadRuns: false,
-        isRunning: true,
-      },
-      {
-        id: "preview-weekly-report",
-        status: "paused",
-        rrule: "FREQ=WEEKLY;BYDAY=FR;BYHOUR=16;BYMINUTE=0",
-        model: null,
-        nextRunOffsetMs: 1000 * 60 * 60 * 24 * 3,
-        lastRunAt: "2026-07-10T16:00:00+08:00",
-        hasUnreadRuns: false,
-        isRunning: false,
-      },
-    ];
-
-    const PREVIEW_SCHEDULED_RUNS = {
-      'preview-daily-brief': [
-        { id: 'preview-run-1', automationId: 'preview-daily-brief', sessionId: 'preview-session-1', status: 'completed', scheduledFor: '2026-07-14T08:00:00+08:00', createdAt: '2026-07-14T08:00:02+08:00', unread: true },
-        { id: 'preview-run-2', automationId: 'preview-daily-brief', sessionId: 'preview-session-2', status: 'completed', scheduledFor: '2026-07-13T08:00:00+08:00', createdAt: '2026-07-13T08:00:01+08:00', unread: false },
-        { id: 'preview-run-3', automationId: 'preview-daily-brief', sessionId: null, status: 'failed', scheduledFor: '2026-07-12T08:00:00+08:00', createdAt: '2026-07-12T08:00:00+08:00', error: '外部新闻源请求超时', unread: false },
-      ],
-      'preview-follow-up': [
-        { id: 'preview-run-4', automationId: 'preview-follow-up', sessionId: 'preview-session-4', status: 'running', scheduledFor: '2026-07-14T09:00:00+08:00', createdAt: '2026-07-14T09:00:02+08:00', unread: false },
-        { id: 'preview-run-5', automationId: 'preview-follow-up', sessionId: 'preview-session-5', status: 'completed', scheduledFor: '2026-07-13T09:00:00+08:00', createdAt: '2026-07-13T09:00:03+08:00', unread: false },
-      ],
-      'preview-weekly-report': [
-        { id: 'preview-run-6', automationId: 'preview-weekly-report', sessionId: 'preview-session-6', status: 'completed', scheduledFor: '2026-07-10T16:00:00+08:00', createdAt: '2026-07-10T16:00:04+08:00', unread: false },
-      ],
-    };
 
     // Bare code arrays: display labels are rebuilt per current language by the component (see weekdayOptions/hourlyIntervalOptions).
     const WEEKDAY_CODES = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
@@ -432,6 +382,9 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
 
     // Scheduled-task subcomponents (module scope: types stay stable across renders, avoiding per-render rebuilds that remount subtrees)
     const mutedValue = 'text-[#3C3C43]/60 dark:text-[#EBEBF5]/60';
+    // Inactive filter tabs sit on the tinted segmented track, not on the panel:
+    // the 60% muted ink lands at 3.1–3.2:1 there, so the light leg goes to 80%.
+    const mutedOnTrack = 'text-[#3C3C43]/80 dark:text-[#EBEBF5]/60';
     // Shared scaffolding for the create/detail dialogs: field styles, field-label rows, backdrop + panel frame, footer surface.
     // Per-site differences (min-height, max-width, footer layout) stay at the call sites; the header close button stays per-site
     // because tests pin its data-testid literal — not componentized.
@@ -468,7 +421,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
     };
     /** @param {{ scheduledCopy: ScheduledCopy, taskFilter: string, setTaskFilter: (value: string) => void }} props - Filter tab state and copy. */
     const FilterTabs = ({ scheduledCopy, taskFilter, setTaskFilter }) => (
-      <div data-testid="scheduled-filter-tabs" className={`grid grid-cols-3 rounded-[8px] p-0.5 bg-[#767680]/12 dark:bg-[#767680]/24`}>
+      <div data-testid="scheduled-filter-tabs" className={`grid grid-cols-3 rounded-[8px] p-0.5 bg-[#767680]/[0.12] dark:bg-[#767680]/[0.24]`}>
         {[
           ['all', scheduledCopy.filterAll],
           ['active', scheduledCopy.filterActive],
@@ -479,13 +432,21 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
             className={`h-7 min-w-[72px] rounded-[6.5px] px-3 text-[13px] font-medium transition-colors ${
               taskFilter === value
                 ? 'bg-white text-black shadow-sm dark:bg-[#636366] dark:text-white'
-                : `${mutedValue}`
+                : mutedOnTrack
             }`}>
             {label}
           </button>
         ))}
       </div>
     );
+    // 必填字段（name/prompt/rrule）在 patch 中存在且为空白即视为无效草稿；
+    // 卸载兜底保存与 flushTextEdits 共用同一判定。
+    function hasBlankRequiredField(patch) {
+      return ['name', 'prompt', 'rrule'].some(key =>
+        // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 is the floor; Object.hasOwn is unavailable, and this call is already the safe form
+        Object.prototype.hasOwnProperty.call(patch, key) && !String(patch[key] || '').trim()
+      );
+    }
     // ScheduledTasksView 内的 MyTasksSection 分区（见组件内定义）直接闭包共享状态；
     // 原模块级 makeMyTasksSection 工厂只有一个调用点，已内联为普通渲染函数。
 
@@ -516,32 +477,12 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
       }));
       const canOpenTaskFolder = can('externalSystemOpen');
       const [taskFilter, setTaskFilter] = useState('all');
-      // Second-level clock shared with the conversation timeline: always active, drives the preview nextRunAt and the runs-soon countdown.
+      // Second-level clock shared with the conversation timeline: always active, drives the runs-soon countdown.
       const clockNow = useConversationSecondClock(true);
-      const [previewSelectedId, setPreviewSelectedId] = useState(null);
-      const [previewTaskStatus, setPreviewTaskStatus] = useState({});
-      const [previewCreatedTasks, setPreviewCreatedTasks] = useState([]);
-      const previewMode = !bridge.available && realTasks.length === 0;
-      const tasks = previewMode
-        ? [...PREVIEW_SCHEDULED_TASKS, ...previewCreatedTasks].map(task => ({
-          ...task,
-          ...scheduledCopy.previewTasks[task.id],
-          model: task.model || scheduledCopy.autoModel,
-          status: previewTaskStatus[task.id] || task.status,
-          nextRunAt: task.nextRunAt || new Date(clockNow + (task.nextRunOffsetMs || 1000 * 60 * 60)).toISOString(),
-        }))
-        : realTasks;
+      const tasks = realTasks;
       const selectedId = appState.selectedScheduledTaskId || null;
-      const effectiveSelectedId = previewMode ? previewSelectedId : selectedId;
-      const selectedDetail = previewMode
-        ? tasks.find(task => task.id === effectiveSelectedId) || null
-        : rawSelectedDetail;
-      const runs = previewMode && effectiveSelectedId
-        ? (PREVIEW_SCHEDULED_RUNS[effectiveSelectedId] || []).map(run => ({
-          ...run,
-          error: run.error ? scheduledCopy.previewRunError : run.error,
-        }))
-        : rawRuns;
+      const selectedDetail = rawSelectedDetail;
+      const runs = rawRuns;
       const [createForm, setCreateForm] = useState(null);
       const [createScheduleRepeatIntent, setCreateScheduleRepeatIntent] = useState(null);
       const [deleteConfirmTask, setDeleteConfirmTask] = useState(null);
@@ -590,7 +531,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
           || (taskFilter === 'paused' && task.status !== 'active');
         return matchesFilter;
       }));
-      const selected = tasks.find(task => task.id === effectiveSelectedId) || null;
+      const selected = tasks.find(task => task.id === selectedId) || null;
       const detail = selectedDetail && selected && selectedDetail.id === selected.id ? selectedDetail : selected;
       const bodyText = 'text-[#1F1F1F] dark:text-[#E3E3E3]';
       const fmtDateTime = (value) => {
@@ -684,7 +625,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
         setScheduleRepeatIntent(null);
         setSaveState('idle');
       // eslint-disable-next-line react-hooks/exhaustive-deps -- deps intentionally track only the selected id, so detail object references don't trigger repeated resets
-      }, [effectiveSelectedId, detail && detail.id]);
+      }, [selectedId, detail && detail.id]);
 
       useEffect(() => {
         mountedRef.current = true;
@@ -695,10 +636,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
           const taskId = editTaskIdRef.current;
           saveChainRef.current.catch(() => {}).then(() => {
             const patch = pendingPatchRef.current;
-            const invalid = ['name', 'prompt', 'rrule'].some(key =>
-              // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 is the floor; Object.hasOwn is unavailable, and this call is already the safe form
-              Object.prototype.hasOwnProperty.call(patch, key) && !String(patch[key] || '').trim()
-            );
+            const invalid = hasBlankRequiredField(patch);
             if (!taskId || invalid || !Object.keys(patch).length || !bridge || !bridge.scheduled.updateScheduledTask) return null;
             pendingPatchRef.current = {};
             return bridge.scheduled.updateScheduledTask(taskId, patch);
@@ -742,11 +680,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
         const patch = pendingPatchRef.current;
-        const hasBlankRequiredField = ['name', 'prompt', 'rrule'].some(key =>
-          // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 is the floor; Object.hasOwn is unavailable, and this call is already the safe form
-          Object.prototype.hasOwnProperty.call(patch, key) && !String(patch[key] || '').trim()
-        );
-        if (hasBlankRequiredField) {
+        if (hasBlankRequiredField(patch)) {
           if (mountedRef.current) setSaveState('invalid');
           return Promise.resolve({ok: false, invalid: true});
         }
@@ -809,10 +743,6 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
       async function selectTask(id) {
         setCreateForm(null);
         setCreateScheduleRepeatIntent(null);
-        if (previewMode) {
-          setPreviewSelectedId(id);
-          return;
-        }
         if (!(await flushBeforeAction())) return;
         if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(id);
         if (id && bridge && bridge.scheduled.refreshScheduledTaskData) bridge.scheduled.refreshScheduledTaskData(20).catch(() => {});
@@ -820,8 +750,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
 
       async function startTemplate(template) {
         if (!(await flushBeforeAction())) return;
-        if (previewMode) setPreviewSelectedId(null);
-        else if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(null);
+        if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(null);
         setCreateScheduleRepeatIntent(null);
         setCreateForm({
           templateId: template.id,
@@ -835,8 +764,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
 
       async function startBlankTask() {
         if (!(await flushBeforeAction())) return;
-        if (previewMode) setPreviewSelectedId(null);
-        else if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(null);
+        if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(null);
         setCreateScheduleRepeatIntent(null);
         setCreateForm({
           name: '',
@@ -851,27 +779,6 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
         const name = String(createForm.name || '').trim();
         const prompt = String(createForm.prompt || '').trim();
         if (!name || !prompt) return;
-        if (previewMode) {
-          const created = {
-            id: `preview-created-${Date.now()}`, // eslint-disable-line react-hooks/purity -- preview mode generates a local temporary id; no determinism needed
-            templateId: createForm.templateId || null,
-            name,
-            status: createForm.paused ? 'paused' : 'active',
-            scheduleLabel: scheduleRepeatLabel(scheduleEditorValue(createForm.rrule)),
-            rrule: createForm.rrule,
-            prompt,
-            model: activeModel && activeModel.model || scheduledCopy.autoModel,
-            modelId: activeModel && activeModel.id || null,
-            nextRunAt: new Date(clockNow + 1000 * 60 * 60).toISOString(),
-            hasUnreadRuns: false,
-            isRunning: false,
-          };
-          setPreviewCreatedTasks(current => [created, ...current]);
-          setPreviewSelectedId(null);
-          setCreateForm(null);
-          setCreateScheduleRepeatIntent(null);
-          return;
-        }
         if (!bridge || !bridge.scheduled.createScheduledTask) return;
         try {
           await bridge.scheduled.createScheduledTask({
@@ -916,13 +823,6 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
 
       async function toggleTaskPaused(task) {
         if (!task) return;
-        if (previewMode) {
-          setPreviewTaskStatus(current => ({
-            ...current,
-            [task.id]: task.status === 'active' ? 'paused' : 'active',
-          }));
-          return;
-        }
         if (!bridge) return;
         try {
           if (!(await flushBeforeAction())) return;
@@ -955,8 +855,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
       async function saveDetailAndClose() {
         if (busyAction) return;
         if (!(await flushBeforeAction())) return;
-        if (previewMode) setPreviewSelectedId(null);
-        else if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(null);
+        if (bridge && bridge.scheduled.selectScheduledTask) bridge.scheduled.selectScheduledTask(null);
       }
 
       async function openRunChat(run) {
@@ -1031,32 +930,6 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
             : '',
           hasTimeAnchor,
         };
-      }
-
-      function scheduleRepeatLabel(editor) {
-        if (!editor) return '';
-        if (editor.repeat === 'once') {
-          if (!editor.time) return scheduledCopy.repeatOptions.once;
-          // Mirrors the Rust humanize wording: date + time (scheduledCopy.date carries a trailing space).
-          const [, month, day] = String(editor.date || '').split('-');
-          const dateLabel = month && day ? scheduledCopy.date(Number(month), Number(day)) : '';
-          return `${scheduledCopy.repeatOptions.once} · ${dateLabel}${editor.time}`;
-        }
-        if (editor.repeat === 'hourly') {
-          const interval = editor.interval === 1 ? scheduledCopy.repeatOptions.hourly : scheduledCopy.everyHours(editor.interval);
-          // Day restriction shares the weekly branch's wording: the all-workday set folds to the
-          // localized "workdays" label (mirroring Rust humanize_rrule), other sets join as "Mon、Tue".
-          const days = normalizeScheduleDays(editor.days);
-          const isWorkdaySet = days.join(',') === 'MO,TU,WE,TH,FR';
-          const dayLabel = days.length
-            ? (isWorkdaySet
-              ? scheduledCopy.repeatOptions.workdays
-              : days.map(day => scheduledCopy.weekdays[WEEKDAY_CODES.indexOf(day)][1]).join('、'))
-            : '';
-          const label = dayLabel ? `${dayLabel} ${interval}` : interval;
-          return editor.hasTimeAnchor ? `${label} · ${scheduledCopy.startsAt(editor.time)}` : label;
-        }
-        return scheduledCopy.repeatOptions[editor.repeat] || scheduledCopy.repeatOptions.custom;
       }
 
       function buildRrule(currentRrule, key, value) {
@@ -1410,10 +1283,9 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
 
       // My Tasks 分区（原 makeMyTasksSection 工厂内联为普通渲染函数）：闭包共享本视图的
       // 过滤/加载状态；按普通函数调用而非 JSX 元素——每次渲染新建组件类型会导致子树重挂载。
-      // 唯一调用点固定传 'mb-0'，className 缺省即该值。
-      // eslint-disable-next-line @eslint-react/no-nested-component-definitions -- plain render function, never used as a JSX element (call site is MyTasksSection({ className: 'mb-0' })); the props-like signature only exists because that call form is pinned by tests
-      const MyTasksSection = ({ className = 'mb-0' } = {}) => (
-        <section className={className}>
+      // eslint-disable-next-line @eslint-react/no-nested-component-definitions -- plain render function, never used as a JSX element (call site is MyTasksSection()); the render-function form only exists because that call form is pinned by tests
+      const MyTasksSection = () => (
+        <section className="mb-0">
           <div className="mb-4 ml-1 flex items-center justify-between gap-4">
             <h2 className={`text-[13px] font-bold uppercase tracking-wider ${mutedValue}`}>{scheduledCopy.myTasks}</h2>
             <FilterTabs scheduledCopy={scheduledCopy} taskFilter={taskFilter} setTaskFilter={setTaskFilter} />
@@ -1422,7 +1294,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
             {error && (
               <div role="alert" data-testid="scheduled-error" className={`m-3 flex items-start gap-2 rounded-[12px] px-3 py-2 text-[13px] bg-[#FCE8E6] text-[#A50E0E] dark:bg-[#3A2424] dark:text-[#F2B8B5]`}>
                 <span className="min-w-0 flex-1">{error}</span>
-                <button type="button" onClick={() => bridge?.dismissScheduledTaskError?.()}
+                <button type="button" onClick={() => bridge?.scheduled?.dismissScheduledTaskError?.()}
                   aria-label={scheduledCopy.closeError} className="mt-[-2px] rounded-full p-1 opacity-65 transition-opacity hover:opacity-100">
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -1434,7 +1306,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
               </div>
             ) : (
               <div className={`px-4 py-8 text-center text-[14px] ${mutedValue}`}>
-                {loading ? scheduledCopy.loading : scheduledCopy.empty}
+                {bridge?.available ? (loading ? scheduledCopy.loading : scheduledCopy.empty) : t.uiMonitor.bridgeNotReady}
               </div>
             )}
           </div>
@@ -1529,6 +1401,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
                   <span className={mutedValue}>{scheduledCopy.nextExecution}</span>
                   <span className={`truncate text-right font-medium ${bodyText}`}>{fmtDateTime(selected.nextRunAt)}</span>
                 </div>
+                <ScheduledMessageTarget target={selected.targetSession} label={scheduledCopy.targetSession} mutedClass={mutedValue} bodyClass={bodyText} />
                 <div className="flex items-center justify-between gap-3">
                   <span className={mutedValue}>{scheduledCopy.enableTask}</span>
                   <MacSwitch task={selected} onToggle={toggleTaskPaused} busyAction={busyAction} scheduledCopy={scheduledCopy} />
@@ -1584,7 +1457,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
                               {runStatusLabel(item.status)}
                             </span>
                             <span className={`mt-0.5 block truncate text-[13px] ${bodyText}`}>
-                              {item.error || (item.sessionId ? scheduledCopy.viewRunResult : scheduledCopy.noRunSession)}
+                              {scheduledRunDescription(item, selected.kind, scheduledCopy, runStatusLabel)}
                             </span>
                             <span className={`mt-1 block truncate text-[12px] ${mutedValue}`}>
                               {fmtDateTime(item.scheduledFor || item.createdAt)}
@@ -1647,12 +1520,9 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
                 </div>
               </header>
 
-              <div data-testid="scheduled-left-toolbar" className="sr-only">
-                {FilterTabs({ scheduledCopy, taskFilter, setTaskFilter })}
-              </div>
               <main className="min-h-0 flex-1 overflow-y-auto pb-6 custom-scrollbar">
                 {renderTemplateSuggestions()}
-                {MyTasksSection({ className: 'mb-0' })}
+                {MyTasksSection()}
               </main>
             </div>
           </div>
@@ -1665,7 +1535,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
             <div className="fixed inset-0 z-[300] flex items-center justify-center px-4">
               {/* biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; the keyboard path is covered by the dialog's cancel button */}
               {/* biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container */}
-              <div className="absolute inset-0 bg-black/28 backdrop-blur-[1px]" onClick={(event) => cancelDeleteTask(event)} />
+              <div className="absolute inset-0 bg-black/[0.28] backdrop-blur-[1px]" onClick={(event) => cancelDeleteTask(event)} />
               <div
                 role="alertdialog"
                 aria-modal="true"
@@ -1682,7 +1552,7 @@ import memoryOrganizeImage from '../../assets/scheduled/memory-organize.jpg';
                     {scheduledCopy.deleteDescription(deleteConfirmTask.name)}
                   </p>
                 </div>
-                <div className={`grid grid-cols-2 divide-x divide-[#3C3C43]/16 dark:divide-[#545458]/50`}>
+                <div className={`grid grid-cols-2 divide-x divide-[#3C3C43]/[0.16] dark:divide-[#545458]/50`}>
                   <button type="button" data-testid="scheduled-detail-delete-cancel"
                     onClick={(event) => cancelDeleteTask(event)}
                     disabled={!!busyAction}

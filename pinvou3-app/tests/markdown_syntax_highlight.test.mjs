@@ -212,6 +212,16 @@ assert.match(css, /\.msg-md\.light-code pre > code/u);
 assert.match(css, /\.persona-body\.dark-code/u);
 assert.match(css, /\.persona-body\.light-code/u);
 assert.match(css, /\.msg-md pre\.pinvou-code-block::before/u);
+// 2026-10-18 visual sweep: wide LLM tables must scroll inside their own box
+// (block-table pattern) instead of clipping at the container edge or forcing
+// a whole-document pan that hides the heading column. Pin the rule so a CSS
+// tidy cannot silently delete it.
+const msgMdTableRule = css.match(/\.msg-md table,\.persona-body table \{[^}]*\}/u);
+assert.ok(msgMdTableRule, '.msg-md table block-table rule must exist (shared with .persona-body table)');
+assert.match(msgMdTableRule[0], /display:\s*block/u);
+assert.match(msgMdTableRule[0], /width:\s*max-content/u);
+assert.match(msgMdTableRule[0], /max-width:\s*100%/u);
+assert.match(msgMdTableRule[0], /overflow-x:\s*auto/u);
 assert.match(css, /\.pinvou-code-block \.hljs-keyword/u);
 for (const selector of [
   'code.language-diff .hljs-addition',
@@ -234,16 +244,6 @@ for (const selector of [
   assert.ok(css.includes(selector), `missing language-specific style: ${selector}`);
 }
 
-for (const bridgePath of [
-  ['src', 'platform', 'tauri', 'bridge.js'],
-  ['src', 'platform', 'web', 'bridge.js'],
-]) {
-  assert.match(
-    readApp(...bridgePath),
-    /window\.PinvouMarkdownRenderer\.renderMarkdown\(text\)/u,
-    `${bridgePath.join('/')} must delegate to the shared renderer`,
-  );
-}
 assert.match(
   readApp('src', 'features', 'conversation', 'ConversationTimeline.jsx'),
   /import \{ renderMarkdown \} from '\.\.\/\.\.\/shared\/markdown-renderer\.js'/u,

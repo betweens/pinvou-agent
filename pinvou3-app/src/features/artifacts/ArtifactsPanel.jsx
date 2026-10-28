@@ -7,12 +7,13 @@ import { formatBytes } from '../../shared/format-number.js';
 import { can, isWeb } from '../../shared/platform.js';
 import { OFFICE_HTML_STYLE } from '../../shared/artifact-utils.js';
 import { ScaledHtmlPreview } from '../settings/composer-shared.jsx';
-import { cardBtnCls } from '../tools/tool-renderers.jsx';
-import { useConversationSecondClock } from '../conversation/ConversationTimeline.jsx';
+import { cardBtnCls } from '../../shared/card-buttons.mjs';
+import { useConversationSecondClock } from '../../hooks/useConversationSecondClock.js';
 import { DESIGN_MESSAGE_TYPES, buildDesignRuntimeScript } from './design-runtime.js';
 import { DesignInspectorPanel } from './DesignInspectorPanel.jsx';
 import { EditableMarkdownPreview } from './EditableMarkdownPreview.jsx';
 import { loadArtifactPreview } from './artifact-preview.js';
+import { localizedVisualWarning, visualWarningNeedsDependencyCheck } from './visual-warning.js';
 
 const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls = 'w-5 h-5' }) => {
       return (
@@ -358,7 +359,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
         if (!sel || !sel.path || !pv.loading) return;
         let cancelled = false;
         (async () => {
-          const result = await loadArtifactPreview(sel.path, undefined, { includeInfo: true, isCancelled: () => cancelled });
+          const result = await loadArtifactPreview(sel.path, undefined, { includeInfo: true, includeJson: true, isCancelled: () => cancelled });
           if (!cancelled) setPv(result);
         })();
         return () => { cancelled = true; };
@@ -462,12 +463,15 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
       }, []);
 
       const muted = 'text-[#757575] dark:text-[#8E8E8E]';
-      const needsDependencyCheck = (message) => /LibreOffice/i.test(String(message || ''));
-      const dependencyCheckButton = (message) => (
-        needsDependencyCheck(message) && onGotoSettings
+      // VisualResult 的原始 warning 文案是中文，不渲染原始串：已知
+      // warning_code 渲染三语文案；转换失败（LibreOffice 路径）额外给出
+      // 依赖安装入口。
+      const dependencyCheckButton = (vis) => (
+        visualWarningNeedsDependencyCheck(vis) && onGotoSettings
           ? <button type="button" onClick={onGotoSettings} className={`px-2 py-1 rounded-full font-medium bg-black/5 hover:bg-black/10 text-[#1F1F1F] dark:bg-white/10 dark:hover:bg-white/20 dark:text-[#E3E3E3]`}>{t.depGoInstall || t.depInstallBtn}</button>
           : null
       );
+      const visualWarningLabel = (vis) => localizedVisualWarning(vis, t.artifactPreview);
       const tabBtn = (key, label) => {
         const active = tab === key;
         const disabled = key === 'preview' && !sel;
@@ -506,7 +510,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
               <ArtifactTileIcon name={sel.basename} tileCls="w-6 h-6 rounded-[8px]" glyphCls="w-3.5 h-3.5" />
               <span className="min-w-0 truncate">{sel.basename}</span>
               {artifacts.length > 1 && <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[11px] bg-[#F2F2F7] text-[#6E6E73] dark:bg-white/10 dark:text-[#D1D1D6]`}>{artifacts.length}</span>}
-              <span className={`shrink-0 text-[10px] text-[#8E8E93] dark:text-[#A1A1AA]`}>▼</span>
+              <span className={`shrink-0 text-[10px] text-[#85858B] dark:text-[#A1A1AA]`}>▼</span>
             </button>
             {artifactMenuOpen && (
               <div
@@ -514,7 +518,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                 role="menu"
                 className={`absolute left-0 top-11 z-40 w-[320px] max-w-[calc(100vw-48px)] rounded-[18px] border p-1.5 shadow-2xl backdrop-blur-2xl border-black/10 bg-white/95 text-[#1D1D1F] dark:border-white/10 dark:bg-[#2C2C2E]/95 dark:text-[#F5F5F7]`}
               >
-                <div className={`px-3 pb-1 pt-1 text-[11px] font-medium text-[#8E8E93] dark:text-[#A1A1AA]`}>
+                <div className={`px-3 pb-1 pt-1 text-[11px] font-medium text-[#636366] dark:text-[#A1A1AA]`}>
                   {uiA.switchArtifact}
                 </div>
                 {artifacts.map((a) => {
@@ -527,7 +531,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                       role="menuitem"
                       className={`group flex w-full items-center gap-1 rounded-[12px] transition-colors ${
                         active
-                          ? 'bg-[#E5F0FF] dark:bg-[#0A84FF]/24'
+                          ? 'bg-[#E5F0FF] dark:bg-[#0A84FF]/[0.24]'
                           : 'hover:bg-black/[0.05] dark:hover:bg-white/10'
                       }`}
                       title={a.path}
@@ -541,18 +545,18 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                         <ArtifactTileIcon name={a.basename} tileCls="w-8 h-8 rounded-[10px]" glyphCls="w-4 h-4" />
                         <span className="min-w-0 flex-1">
                           <span className={`block truncate text-[13px] font-medium text-[#1D1D1F] dark:text-[#F5F5F7]`}>{a.basename}</span>
-                          <span className={`block truncate text-[11px] text-[#8E8E93] dark:text-[#A1A1AA]`}>
+                          <span className={`block truncate text-[11px] text-[#636366] ${active ? 'dark:text-[#D1D1D6]' : 'dark:text-[#A1A1AA] dark:group-hover:text-[#D1D1D6]'}`}>
                             {itemInfo ? formatLocalDateTime(itemInfo.modified * 1000, '') : '—'}
                           </span>
                         </span>
-                        {active && <span className="shrink-0 text-[12px] text-[#007AFF]">✓</span>}
+                        {active && <span className="shrink-0 text-[12px] text-[#007AFF] dark:text-[#64B5F6]">✓</span>}
                       </button>
                       {canOpenContainingFolder && (
                         <button
                           type="button"
                           title={t.apBtnLocate}
                           onClick={(event) => { event.preventDefault(); event.stopPropagation(); bridge.artifacts.openContainingFolder(a.path); }}
-                          className={`mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white text-[#6E6E73] dark:hover:bg-white/10 dark:text-[#D1D1D6]`}
+                          className={`mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-white text-[#6E6E73] dark:hover:bg-white/10 dark:text-[#D1D1D6]`}
                         >
                           <FolderOpen size={14} />
                         </button>
@@ -561,7 +565,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                   );
                 })}
                 {info && (
-                  <div className={`mt-1 border-t px-3 pt-2 text-[11px] border-black/10 text-[#8E8E93] dark:border-white/10 dark:text-[#A1A1AA]`}>
+                  <div className={`mt-1 border-t px-3 pt-2 text-[11px] border-black/10 text-[#636366] dark:border-white/10 dark:text-[#A1A1AA]`}>
                     {uiA.currentMtime(formatLocalDateTime(info.modified * 1000, ''))}
                   </div>
                 )}
@@ -614,7 +618,9 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
             />
           );
         }
-        if (pv.kind === 'text') {
+        // includeJson re-kinds a parseable .json result from 'text' to 'json' (see
+        // artifact-preview.js), so both must land here — same as FilePreviewModal.
+        if (pv.kind === 'text' || pv.kind === 'json') {
           return <pre className={`text-[12px] whitespace-pre-wrap break-words font-mono text-[#444746] dark:text-[#C4C7C5]`}>{pv.text}</pre>;
         }
         // 可视化结果
@@ -622,8 +628,8 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
         if (vis && vis.mode === 'html') {
           return (
             <div className="flex flex-col gap-2 h-full">
-              {vis.warning && <div className={`flex items-center gap-2 text-[12px] text-[#E37400] dark:text-[#FDD663]`}><span>⚠️ {vis.warning}</span>{dependencyCheckButton(vis.warning)}</div>}
-              <iframe sandbox="allow-same-origin allow-scripts" className="w-full flex-1 min-h-[480px] border-0 block bg-white"
+              {visualWarningLabel(vis) && <div className={`flex items-center gap-2 text-[12px] text-[#E37400] dark:text-[#FDD663]`}><span>⚠️ {visualWarningLabel(vis)}</span>{dependencyCheckButton(vis)}</div>}
+              <iframe sandbox="allow-same-origin" className="w-full flex-1 min-h-[480px] border-0 block bg-white"
                 title={(sel && sel.path) || t.apTabPreview}
                 data-testid="artifact-html-preview-frame"
                 srcDoc={(vis.html || '') + OFFICE_HTML_STYLE} />
@@ -633,7 +639,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
         if (vis && vis.mode === 'images') {
           return (
             <div className="flex flex-col items-center gap-3">
-              {vis.warning && <div className={`self-start flex items-center gap-2 text-[12px] text-[#E37400] dark:text-[#FDD663]`}><span>⚠️ {vis.warning}</span>{dependencyCheckButton(vis.warning)}</div>}
+              {visualWarningLabel(vis) && <div className={`self-start flex items-center gap-2 text-[12px] text-[#E37400] dark:text-[#FDD663]`}><span>⚠️ {visualWarningLabel(vis)}</span>{dependencyCheckButton(vis)}</div>}
               {(vis.images || []).map((src, i) => (
                 <img key={i} src={src} className="max-w-full h-auto rounded-lg shadow-sm" alt={`page-${i + 1}`} />
               ))}
@@ -647,8 +653,8 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
               ? <ArtifactTileIcon name={sel.basename} tileCls="w-14 h-14 rounded-[16px]" glyphCls="w-7 h-7" />
               : <FileTypeIcon kind="other" className="h-11 w-11" />}
             <span className={`text-[14px] font-medium text-[#1F1F1F] dark:text-[#E3E3E3]`}>{sel && sel.basename}</span>
-            <p className="text-[13px] max-w-[360px]">{(vis && vis.warning) || t.apUnsupported}</p>
-            {vis && dependencyCheckButton(vis.warning)}
+            <p className="text-[13px] max-w-[360px]">{(vis && visualWarningLabel(vis)) || t.apUnsupported}</p>
+            {vis && dependencyCheckButton(vis)}
             {(!isWeb || canDownloadArtifacts) && (
               <button type="button" onClick={() => sel && bridge.artifacts.openArtifactExternal(sel.path, sel.sessionId)} className={cardBtnCls('primary')}>
                 {t.apBtnOpen}
@@ -720,7 +726,17 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                     return (
                       // biome-ignore lint/a11y/useSemanticElements: the list row has multiple nested layouts and inline buttons; a button would break existing styles
                       <div key={a.path} role="button" tabIndex={0} onClick={() => preview(a)}
-                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); preview(a); } }}
+                        onKeyDown={(e) => {
+                          // The row hosts a real <button> (locate folder): ignore
+                          // keys bubbled from it, or preventDefault here would
+                          // swallow its native Enter/Space activation and
+                          // preview the artifact instead.
+                          if (e.target !== e.currentTarget) return;
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            preview(a);
+                          }
+                        }}
                         className={`group flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer
                           ${sel && sel.path === a.path ? 'bg-[#E8EDF2] dark:bg-[#333537]' : 'hover:bg-[#F0F4F9] dark:hover:bg-[#282A2C]'}`}>
                         <ArtifactTileIcon name={a.basename} />
@@ -731,7 +747,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                           </div>
                         </div>
                         {canOpenContainingFolder && <button type="button" title={t.apBtnLocate} onClick={(e) => { e.stopPropagation(); bridge.artifacts.openContainingFolder(a.path); }}
-                          className={`opacity-0 group-hover:opacity-100 w-8 h-8 rounded-full flex items-center justify-center hover:bg-white text-[#444746] dark:hover:bg-[#1E1F20] dark:text-[#C4C7C5]`}><FolderOpen size={16} /></button>
+                          className={`opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 w-8 h-8 rounded-full flex items-center justify-center hover:bg-white text-[#444746] dark:hover:bg-[#1E1F20] dark:text-[#C4C7C5]`}><FolderOpen size={16} /></button>
                         }
                       </div>
                     );
@@ -807,7 +823,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                       {showDesignWorkbench && (
                         <div
                           aria-hidden="true"
-                          className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-32 bg-gradient-to-t from-black/45 via-black/16 to-transparent"
+                          className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-32 bg-gradient-to-t from-black/45 via-black/[0.16] to-transparent"
                         />
                       )}
                       {showDesignWorkbench && (
@@ -833,7 +849,7 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
                                 className={`h-8 rounded-full px-3 text-[12px] font-semibold transition-colors ${
                                   designAiText.trim()
                                     ? 'bg-[#007AFF] text-white shadow-sm hover:bg-[#006EE6]'
-                                    : 'bg-[#E5E5EA] text-[#8E8E93] dark:bg-white/14 dark:text-[#C7C7CC]'
+                                    : 'bg-[#E5E5EA] text-[#8E8E93] dark:bg-white/[0.14] dark:text-[#C7C7CC]'
                                 }`}
                               >
                                 {uiA.send}
@@ -931,6 +947,3 @@ const ArtifactTileIcon = ({ name, tileCls = 'w-9 h-9 rounded-[10px]', glyphCls =
     };
 
 export { ArtifactsPanel };
-
-// Re-export for the pre-existing KnowledgeView import path; KnowledgeView should
-// import from shared/artifact-utils.js directly when that file changes next.

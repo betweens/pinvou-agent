@@ -1,15 +1,21 @@
 import { useEffect, useMemo, useState } from 'react';
 import { FileTypeIcon } from '../../components/files/FileTypeIcon.jsx';
-import { BookOpen, Building2, ChevronDown, CloudSun, Code, FileText, Hexagon, Layout, LineChart, Mail, MessageCircle, Navigation, Palette, Presentation, Search, Send, TrendingDown, TrendingUp, Video } from '../../components/icons.jsx';
+import { BookOpen, Building2, ChevronDown, CloudSun, Code, FileText, Hexagon, Layout, LineChart, Mail, MessageCircle, Navigation, Package, Palette, Presentation, Search, Send, TrendingDown, TrendingUp, Video } from '../../components/icons.jsx';
+import { SCHEDULED_TASK_CREATE_TOOL, SCHEDULED_TASK_DELETE_TOOL, SCHEDULED_TASK_LIST_TOOL, SCHEDULED_TASK_UPDATE_TOOL, scheduledTaskCreateSummary, scheduledTaskDeleteSummary, scheduledTaskListSummary, scheduledTaskUpdateSummary } from './scheduled-task-tool-logic.js';
+import { builtinToolShortName, MODE_CONTROLLED_BUILTIN_SKILL_IDS } from './builtin-plugin-logic.js';
 import { bridge } from '../../hooks/useBridge.js';
 import { _ARTIFACT_FMT, _artifactKind } from '../../shared/artifact-utils.js';
 import { can, isWeb } from '../../shared/platform.js';
 import { pathBasename } from '../../shared/path-utils.js';
 import { parseUnifiedDiff, diffStats } from './unified-diff-parser.js';
-import { dict } from '../../shared/i18n.js';
+import { isShellExecutionTool } from '../../shared/shell-tools.mjs';
+import { zhDict } from '../../shared/i18n.js';
 
 // 调用方尚未下发 t 时回退中文词典（与现状一致），接入 t 后自动多语。
-const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
+// Accepts both the sectioned copy (t.uiToolCommon) and the flat shape the
+// node fixtures pass; the zh fallback rides the tolerant accessor (the
+// lazy-load window yields undefined and the flat shape wins).
+const tc = (t) => (t && t.uiToolCommon) || zhDict().uiToolCommon || t || {};
     // 设计稿专用图标（逐字照搬 前端-产物卡片.txt，含其独有 strokeWidth）。
     const AcShieldCheck = ({ className }) => <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>;
     const AcSparkles = ({ className }) => <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>;
@@ -181,17 +187,32 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
           return args.pattern ? '"' + args.pattern + '"' : '';
         case 'file_search':
           return args.query ? '"' + args.query + '"' : '';
-        case 'bash':
-        case 'exec_shell':
-        case 'task_shell_start':
-        case 'shell':
-        case 'Bash':
-          return typeof args.command === 'string' ? args.command.replaceAll(/\s+/g, ' ').trim() : '';
+        default:
+          break;
+      }
+      // Shell tools (including the wait-style names) share the command-line
+      // summary; keeping the check on the shared set prevents the case list
+      // from drifting again when a new shell tool name is added.
+      if (isShellExecutionTool(name)) {
+        return typeof args.command === 'string' ? args.command.replaceAll(/\s+/g, ' ').trim() : '';
+      }
+      switch (name) {
         case 'checklist_update':
         case 'todo_update':
           return args.status === 'completed' ? t.tsDone
             : args.status === 'in_progress' ? t.tsInProgress
             : args.status === 'pending' ? t.tsPending : '';
+        // app-automations (scheduled tasks): create summary = task name +
+        // rrule; update = target id + changed fields; delete = target id;
+        // list = the localized verb plus the requested limit.
+        case SCHEDULED_TASK_CREATE_TOOL:
+          return scheduledTaskCreateSummary(args, t.uiScheduledTaskTool.nameQuote);
+        case SCHEDULED_TASK_UPDATE_TOOL:
+          return scheduledTaskUpdateSummary(args);
+        case SCHEDULED_TASK_DELETE_TOOL:
+          return scheduledTaskDeleteSummary(args);
+        case SCHEDULED_TASK_LIST_TOOL:
+          return scheduledTaskListSummary(args, t.uiScheduledTaskTool.listLabel, t.uiScheduledTaskTool.limitSuffix);
         default:
           return '';
       }
@@ -351,10 +372,11 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
       const T = tc(t);
 
       return (
-        // 根节点不用 overflow-hidden class:vendor/tailwind.js 运行时把生成的
-        // .overflow-hidden 注入到 base.css 之后,会盖掉 .tool-card-output 的
-        // overflow-y:auto,导致 diff 被 200px max-height 裁剪且无法滚动(e2e 实测)。
-        // 内联样式优先级最高:显式 y 滚动 + x 裁剪(保圆角),expanded 时放开 max-height。
+        // The root avoids the overflow-hidden class: Tailwind utilities come after
+        // base.css and would override .tool-card-output's overflow-y:auto, clipping
+        // the diff at the 200px max-height with no way to scroll (verified in e2e).
+        // Inline styles win: explicit y scrolling + x clipping (keeps the rounded
+        // corners); max-height is lifted when expanded.
         <div
           data-testid="diff-view"
           className={`${outBox()} p-0`}
@@ -507,10 +529,10 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
       { id: 5, backendId: null, title: '乐享文档连接器', subtitle: '企业知识文档全量检索', category: 'docs', type: 'Webhook/API', version: 'v1.1.0', latency: '<80ms', desc: '支持通过 API 搜索、创建和管理乐享知识库中的文档。支持批量导入 Markdown、按标签整理内容、实时订阅团队文档的更新动态。', icon: Hexagon, color: 'bg-gradient-to-b from-blue-400 to-blue-600', installed: false, authRequired: true },
       { id: 6, backendId: 'tencent-docs', mcpServer: true, title: '腾讯文档 MCP', subtitle: '官方远程 MCP：在线文档/表格/幻灯片读写与协作', category: 'docs', type: 'MCP Server', version: 'v1.0.41', latency: '云端', desc: '接入腾讯文档官方远程 MCP（通用文档 + PPT/Word/Excel 精细编辑四个服务）：以你的账号创建、读取、编辑在线文档、表格、幻灯片、思维导图、智能表格，管理知识库空间与文件，支持网页剪藏与本地文件上云；安装时自动配官方技能（场景路由 + 工具 API 参考）。需要腾讯文档个人 Token（官方页面 QQ/微信扫码获取），密钥只写入本机系统凭据。', icon: FileText, color: 'bg-gradient-to-b from-blue-500 to-indigo-600', installed: false, authRequired: true, configTitle: '连接腾讯文档', configDescription: 'Token 只保存在本机系统凭据，不写入 mcp.json，也不会进入对话。', configDocUrl: 'https://docs.qq.com/scenario/open-claw.html?nlc=1', configDocLabel: '去获取腾讯文档 Token', configFields: [{ key: 'TENCENT_DOCS_TOKEN', label: '个人 Token', required: true, target: 'bearer', secret: true, placeholder: '粘贴腾讯文档个人 Token', helpText: '打开授权页用 QQ 或微信扫码登录后复制 Token；请勿添加 Bearer 前缀。' }], welcomeQueries: ['列出我最近的腾讯文档', '把这份周报写成腾讯智能文档', '新建一个在线表格记录收支', '读取这个腾讯文档表格并分析'] },
       { id: 8, backendId: 'wecom-bot', mcpServer: true, title: '企微群机器人', subtitle: '向企业微信群推送消息与通知', category: 'collab', type: 'MCP Server', version: 'v1.0.0', latency: '云端', desc: '接入企业微信官方群机器人 webhook（消息推送 API）：让 AI 向绑定的群推送文本（可@成员）、Markdown、图文、图片和文件。需要填写你自己的群机器人 Webhook Key，密钥只写入本机系统凭据。数据经企业微信服务器（可选联网功能，opt-in）。', icon: MessageCircle, color: 'bg-gradient-to-b from-cyan-400 to-blue-500', installed: false, authRequired: true, configTitle: '企微群机器人 Key', configDescription: 'Key 只保存在本机凭据，不写入 mcp.json。', configDocUrl: 'https://developer.work.weixin.qq.com/document/path/91770', configDocLabel: '查看官方群机器人文档', configFields: [{ key: 'WECOM_BOT_KEY', label: 'Webhook Key', required: true, target: 'env', secret: true, placeholder: '粘贴群机器人 key 或完整 webhook 地址', helpText: '企业微信群里右上角「…」→ 群机器人 → 添加机器人，复制 webhook 地址即可。' }], welcomeQueries: ['往群里发一条今日天气播报', '把这份周报整理成 Markdown 发到企微群', '@所有人：下午三点例会别忘了', '把这个文件发到企微群'] },
-      { id: 9, backendId: 'feishu', feishuCli: true, title: '飞书（Lark）', subtitle: '以你本人身份操作飞书文档/日历/表格/消息', category: 'collab', type: 'CLI + 官方技能', version: 'v1.0.95', latency: '云端', desc: '接入飞书官方 CLI + 官方域技能（MIT）：让 AI 以你本人身份读写云文档、查改日历、操作多维表格（Base）与电子表格、收发消息、管理知识库与任务。点「连接飞书」浏览器一键授权，全程不填 key。数据经飞书云 OpenAPI（可选联网功能，opt-in）。', icon: Send, color: 'bg-gradient-to-b from-teal-400 to-emerald-500', installed: false, authRequired: true, configFields: [], welcomeQueries: ['读飞书文档帮我做一份 PPT', '把飞书文档整理成摘要', '查我今天的飞书日历', '看看我飞书里的待办任务'] },
-      { id: 22, backendId: 'tmeet', tmeetCli: true, title: '腾讯会议', subtitle: '以你本人身份管理会议/录制/纪要/参会报告', category: 'collab', type: 'CLI + 官方技能', version: 'v1.0.18', latency: '云端', desc: '接入腾讯会议官方 CLI（@tencentcloud/tmeet）+ 官方技能：让 AI 以你本人身份创建、查询、修改和取消腾讯会议，查询受邀人、参会报告、录制、转写与智能纪要，并支持会中呼叫成员入会。点「连接」打开腾讯会议授权页扫码登录，全程不填 key。', icon: Video, color: 'bg-gradient-to-b from-sky-400 to-blue-600', installed: false, authRequired: true, configFields: [], welcomeQueries: ['帮我创建一个腾讯会议', '查一下我的腾讯会议录制', '看看最近会议的智能纪要', '查询这场腾讯会议的参会人'] },
-      { id: 99, backendId: 'wecom', wecomCli: true, title: '企业微信', subtitle: '以你本人身份操作企微消息/邮件/文档/会议/日程', category: 'collab', type: 'CLI + 官方技能', version: 'v1.2.1', latency: '云端', desc: '接入企业微信官方 CLI（@wecom/cli，MIT）+ 官方域技能：让 AI 以你本人身份收发消息、收发邮件、读写文档/智能表格/在线表格/智能文档、管理微盘文件、创建/查询会议与日程、管理待办、查询通讯录。点「连接」用企业微信 App 扫码授权，全程不填 key。数据经企业微信云（可选联网功能，opt-in）。', icon: MessageCircle, color: 'bg-gradient-to-b from-cyan-400 to-blue-500', installed: false, authRequired: true, configFields: [], welcomeQueries: ['把这段内容写成企微智能文档', '读一下我企微某篇文档的内容', '在企微智能表格里新建一张子表', '查一下企微智能表格里的数据'] },
-      { id: 10, backendId: 'dingtalk', dingtalkCli: true, title: '钉钉', subtitle: '以你本人身份操作钉钉文档/日历/表格/消息', category: 'collab', type: 'CLI + 官方技能', version: 'v1.0.61', latency: '云端', desc: '接入钉钉官方 DingTalk Workspace CLI（dws，Apache-2.0）+ 官方技能：让 AI 以你本人身份读写钉钉文档、查改日历、操作 AI 表格/在线表格、收发群聊消息、处理待办/审批/日志/邮箱等。点「连接」用钉钉 App 扫码授权，全程不填 key。', icon: Navigation, color: 'bg-gradient-to-b from-blue-400 to-indigo-500', installed: false, authRequired: true, configFields: [], welcomeQueries: ['读一下我的钉钉文档', '查我今天的钉钉日程', '在钉钉 AI 表格里查数据', '看看我的钉钉待办'] },
+      { id: 9, backendId: 'feishu', feishuCli: true, title: '飞书（Lark）', subtitle: '以你本人身份操作飞书文档/日历/表格/消息', category: 'collab', type: 'CLI + 官方技能', version: 'v1.0.98', latency: '云端', desc: '接入飞书官方 CLI + 官方域技能（MIT）：让 AI 以你本人身份读写云文档、查改日历、操作多维表格（Base）与电子表格、收发消息、管理知识库与任务。点「连接飞书」浏览器一键授权，全程不填 key。数据经飞书云 OpenAPI（可选联网功能，opt-in）。', icon: Send, color: 'bg-gradient-to-b from-teal-400 to-emerald-500', installed: false, authRequired: true, configFields: [], welcomeQueries: ['读飞书文档帮我做一份 PPT', '把飞书文档整理成摘要', '查我今天的飞书日历', '看看我飞书里的待办任务'] },
+      { id: 22, backendId: 'tmeet', tmeetCli: true, title: '腾讯会议', subtitle: '以你本人身份管理会议/录制/纪要/参会报告', category: 'collab', type: 'CLI + 官方技能', version: 'v1.0.19', latency: '云端', desc: '接入腾讯会议官方 CLI（@tencentcloud/tmeet）+ 官方技能：让 AI 以你本人身份创建、查询、修改和取消腾讯会议，查询受邀人、参会报告、录制、转写与智能纪要，并支持会中呼叫成员入会。点「连接」打开腾讯会议授权页扫码登录，全程不填 key。', icon: Video, color: 'bg-gradient-to-b from-sky-400 to-blue-600', installed: false, authRequired: true, configFields: [], welcomeQueries: ['帮我创建一个腾讯会议', '查一下我的腾讯会议录制', '看看最近会议的智能纪要', '查询这场腾讯会议的参会人'] },
+      { id: 99, backendId: 'wecom', wecomCli: true, title: '企业微信', subtitle: '以你本人身份操作企微消息/邮件/文档/会议/日程', category: 'collab', type: 'CLI + 官方技能', version: 'v1.3.4', latency: '云端', desc: '接入企业微信官方 CLI（@wecom/cli，MIT）+ 官方域技能：让 AI 以你本人身份收发消息、收发邮件、读写文档/智能表格/在线表格/智能文档、管理微盘文件、制作演示文稿、创建/查询会议与日程、管理待办、查询通讯录。点「连接」用企业微信 App 扫码授权，全程不填 key。数据经企业微信云（可选联网功能，opt-in）。', icon: MessageCircle, color: 'bg-gradient-to-b from-cyan-400 to-blue-500', installed: false, authRequired: true, configFields: [], welcomeQueries: ['把这段内容写成企微智能文档', '读一下我企微某篇文档的内容', '在企微智能表格里新建一张子表', '查一下企微智能表格里的数据'] },
+      { id: 10, backendId: 'dingtalk', dingtalkCli: true, title: '钉钉', subtitle: '以你本人身份操作钉钉文档/日历/表格/消息', category: 'collab', type: 'CLI + 官方技能', version: 'v1.0.65', latency: '云端', desc: '接入钉钉官方 DingTalk Workspace CLI（dws，Apache-2.0）+ 官方技能：让 AI 以你本人身份读写钉钉文档、查改日历、操作 AI 表格/在线表格、收发群聊消息、处理待办/审批/日志/邮箱等。点「连接」用钉钉 App 扫码授权，全程不填 key。', icon: Navigation, color: 'bg-gradient-to-b from-blue-400 to-indigo-500', installed: false, authRequired: true, configFields: [], welcomeQueries: ['读一下我的钉钉文档', '查我今天的钉钉日程', '在钉钉 AI 表格里查数据', '看看我的钉钉待办'] },
       { id: 11, backendId: null, title: 'TAPD 敏捷研发', subtitle: '缺陷与迭代的自动化追踪', category: 'dev', type: 'Action Skill', version: 'v2.8.0', latency: '<60ms', desc: '研发管理核心工具。允许 AI 查询项目迭代进度、自动拆分需求条目、更新缺陷状态，实现从需求到发布的研发全生命周期数字化。', icon: Layout, color: 'bg-gradient-to-b from-violet-500 to-fuchsia-600', installed: false, authRequired: true },
       { id: 12, backendId: null, title: 'CNB 云原生管线', subtitle: '代码仓库与 CI/CD 调度', category: 'dev', type: 'MCP Server', version: 'v1.0.0', latency: '<40ms', desc: '将云原生开发能力赋予大模型。支持通过自然语言进行代码仓库检索、提交 Issue、审查 PR、触发并监控流水线部署等极客操作。', icon: Code, color: 'bg-gradient-to-b from-orange-400 to-rose-500', installed: false, authRequired: true },
       { id: 13, backendId: 'qcc', oauthMcp: true, oauthServerName: 'qcc-company', title: '企查查', subtitle: '企业工商数据授权查询', category: 'finance', type: 'Remote MCP', version: 'v1.0.0', latency: '云端', desc: '接入企查查智能体数据平台 qcc-company 远程 MCP。点「连接」默认通过企查查账号 OAuth 授权；如有企查查 API Key 也可选填，密钥只写入本机系统凭据。', icon: Building2, color: 'bg-gradient-to-br from-blue-600 to-cyan-500', installed: false, authRequired: true, configTitle: '企查查 API Key（可选）', configDescription: 'API Key 只保存在本机系统凭据，不写入 mcp.json。留空则直接使用 OAuth 授权。', configFields: [{ key: 'QCC_API_KEY', label: '企查查 API Key', required: false, target: 'bearer', secret: true, placeholder: '粘贴企查查 API Key（可留空）', helpText: '可选。默认使用 OAuth 授权；如需以 API Key 方式接入再填写。' }], welcomeQueries: ['查一下华为的工商信息', '腾讯的工商登记信息', '比亚迪有哪些对外投资', '阿里巴巴的股东结构'] },
@@ -715,7 +737,11 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
     // 注:pptx 不在此——它是「PPT 生成」MCP 的同名 companion 技能,卡片由后端
     // list_marketplace_skills 数据合成(见 ToolStoreView 的 companionSkillCards)。
     const tsSkillsData = [
-      { id: 's5', title: '视觉设计', subtitle: '设计系统直出网页 / banner / 海报 / 简历', category: 'other', type: 'Skill', version: '内置', latency: '本地', desc: '内置自动技能:模型按需自动加载,以设计系统级审美直出网页 / banner / 海报 / 简历等。无需安装、随时可用。', icon: Palette, color: 'bg-gradient-to-b from-pink-400 to-fuchsia-600', installed: true, authRequired: false, builtin: true },
+      { id: 's5', title: '视觉设计', subtitle: '设计系统直出网页 / banner / 海报 / 简历', category: 'other', type: 'Skill', version: '内置', latency: '本地', desc: '内置自动技能:模型按需自动加载,以设计系统级审美直出网页 / banner / 海报 / 简历等。无需安装、随时可用。', icon: Palette, color: 'bg-gradient-to-b from-pink-400 to-fuchsia-600', installed: true, authRequired: false, builtin: true,
+      // The audit badge keys mode control off backendId: this legacy entry's
+      // real backend skill id (visual-design) must reach the builtin page so
+      // its badge agrees with the store card (review round-5 M3).
+      backendId: 'visual-design' },
     ];
 
     // 后端合成技能卡的补充展示数据(按 backendId 取):
@@ -767,6 +793,7 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
     const TsActionBtn = ({ tool, busy, onAction, onUpdate, onEditDisplay, size = 'sm', t }) => {
       const T = tc(t);
       const isLg = size === 'lg';
+      const connectorLike = tool.feishuCli || tool.wecomCli || tool.dingtalkCli || tool.tmeetCli || tool.imaOpenapi || tool.oauthMcp;
       const actionAttrs = {
         'data-testid': 'tool-store-action',
         'data-tool-id': tool.backendId || '',
@@ -779,14 +806,14 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
       }
       if (!tool.backendId) {
         return (
-          <button type="button" {...actionAttrs} disabled className={`${isLg ? 'px-10 py-2.5 text-[15px]' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold bg-slate-100 dark:bg-[#1C1C1E] border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed`}>
+          <button type="button" {...actionAttrs} disabled className={`${isLg ? 'px-10 py-2.5 text-[15px]' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold bg-slate-100 dark:bg-[#1C1C1E] border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed`}>
             {T.comingSoon}
           </button>
         );
       }
       if (busy) {
         return (
-          <button type="button" {...actionAttrs} disabled className={`${isLg ? 'px-10 py-2.5 text-[15px]' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold opacity-50 cursor-wait bg-slate-100 dark:bg-[#1C1C1E] border border-slate-200 dark:border-slate-700 text-slate-500`}>
+          <button type="button" {...actionAttrs} disabled className={`${isLg ? 'px-10 py-2.5 text-[15px]' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold opacity-50 cursor-wait bg-slate-100 dark:bg-[#1C1C1E] border border-slate-200 dark:border-slate-700 text-slate-500`}>
             ...
           </button>
         );
@@ -798,8 +825,8 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
       // 同样回退旧分支 —— 回退分支 Phase 3 清理。
       if (Array.isArray(tool.actions)) {
         const btnCls = {
-          primary: `${isLg ? 'px-10 py-2.5 text-[15px] shadow-md shadow-blue-500/20' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold transition-all active:scale-95 bg-blue-600 hover:bg-blue-700 text-white`,
-          danger: `${isLg ? 'px-10 py-2.5 text-[15px]' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold transition-all active:scale-95 bg-slate-100 dark:bg-[#2C2C2E] border border-slate-200 dark:border-slate-700 text-[#FF3B30] dark:text-[#FF453A] hover:bg-slate-200 dark:hover:bg-[#3A3A3C]`,
+          primary: `${isLg ? 'px-10 py-2.5 text-[15px] shadow-md shadow-blue-500/20' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold transition-all active:scale-95 bg-blue-600 hover:bg-blue-700 text-white`,
+          danger: `${isLg ? 'px-10 py-2.5 text-[15px]' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold transition-all active:scale-95 bg-slate-100 dark:bg-[#2C2C2E] border border-slate-200 dark:border-slate-700 text-[#FF3B30] dark:text-[#FF453A] hover:bg-slate-200 dark:hover:bg-[#3A3A3C]`,
           outline: `${isLg ? 'px-6 py-2.5 text-[15px]' : 'px-4 py-1.5 text-[13px]'} rounded-full font-bold transition-all active:scale-95 bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/30 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-500/20 whitespace-nowrap`,
         };
         const specs = {
@@ -848,9 +875,9 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
           <button type="button"
             {...actionAttrs}
             onClick={(e) => { e.stopPropagation(); onAction(tool.backendId, true); }}
-            className={`${isLg ? 'px-10 py-2.5 text-[15px]' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold transition-all active:scale-95 bg-slate-100 dark:bg-[#2C2C2E] border border-slate-200 dark:border-slate-700 text-[#FF3B30] dark:text-[#FF453A] hover:bg-slate-200 dark:hover:bg-[#3A3A3C]`}
+            className={`${isLg ? 'px-10 py-2.5 text-[15px]' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold transition-all active:scale-95 bg-slate-100 dark:bg-[#2C2C2E] border border-slate-200 dark:border-slate-700 text-[#FF3B30] dark:text-[#FF453A] hover:bg-slate-200 dark:hover:bg-[#3A3A3C]`}
           >
-            {(tool.feishuCli || tool.wecomCli || tool.dingtalkCli || tool.tmeetCli || tool.imaOpenapi || tool.oauthMcp) ? T.disconnect : T.uninstall}
+            {connectorLike ? T.disconnect : T.uninstall}
           </button>
         );
         // 预置技能内容落后于商店版本(App 升级带入新版)时,并列给出"更新"入口;
@@ -877,7 +904,7 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
           <button type="button"
             {...actionAttrs}
             onClick={(e) => { e.stopPropagation(); onAction(tool.backendId, false); }}
-            className={`${isLg ? 'px-10 py-2.5 text-[15px] shadow-md shadow-blue-500/20' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold transition-all active:scale-95 bg-blue-600 hover:bg-blue-700 text-white`}
+            className={`${isLg ? 'px-10 py-2.5 text-[15px] shadow-md shadow-blue-500/20' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold transition-all active:scale-95 bg-blue-600 hover:bg-blue-700 text-white`}
           >
             {retry ? T.reauthorize : T.connect}
           </button>
@@ -888,11 +915,91 @@ const tc = (t) => (t && t.uiToolCommon) || dict.zh.uiToolCommon;
         <button type="button"
           {...actionAttrs}
           onClick={(e) => { e.stopPropagation(); onAction(tool.backendId, false); }}
-          className={`${isLg ? 'px-10 py-2.5 text-[15px] shadow-md shadow-blue-500/20' : 'w-20 py-1.5 text-[14px]'} rounded-full font-bold transition-all active:scale-95 bg-blue-600 hover:bg-blue-700 text-white`}
+          className={`${isLg ? 'px-10 py-2.5 text-[15px] shadow-md shadow-blue-500/20' : 'min-w-20 px-3 py-1.5 text-[14px] whitespace-nowrap'} rounded-full font-bold transition-all active:scale-95 bg-blue-600 hover:bg-blue-700 text-white`}
         >
-          {(tool.feishuCli || tool.wecomCli || tool.dingtalkCli || tool.tmeetCli || tool.imaOpenapi || tool.oauthMcp) ? (hasConfig ? T.configure : T.connect) : (hasConfig ? T.configure : T.install)}
+          {connectorLike ? (hasConfig ? T.configure : T.connect) : (hasConfig ? T.configure : T.install)}
         </button>
       );
     };
 
-export { AcShieldCheck, AcSparkles, ArtifactCard, isQuietTool, toolSummary, isReceipt, ReceiptBlock, tryParseJson, tryTailJson, unwrapMcpTextEnvelope, looksDiff, TODO_TOOLS, OutputPre, OutputError, ListDirView, GrepView, DiffView, ShellView, ShellTextView, TodoView, tsToolsData, tsToolWelcomeData, localizeTool, mergeConfigFields, WeatherCard, isWeatherTool, isStockQuoteTool, StockQuoteCard, tsSkillsData, tsSkillIconByName, tsCategories, TOOL_TYPE_GROUPS, getToolTypeGroup, TOOL_BUSINESS_GROUPS, getToolBusinessGroup, TsActionBtn };
+
+    // Read-only builtin plugin card (docs/builtin-toolset-contract.md §3.1
+    // transparency/audit window): shows the tool list, security level, version
+    // and data access scopes; no action buttons at all (no uninstall, no
+    // toggle). The read-only badge reuses PlatformToolAction's Web read-only
+    // degraded styling. All copy goes through uiBuiltinPlugins, falling back to
+    // the zh dictionary per the tc precedent when copy is not passed; unknown
+    // data-access scope keys render as-is.
+    // Builtin skills (e.g. visual design) reuse this card: no tool list /
+    // security level / data access (a pure prompt skill does not touch data
+    // directly) — they declare facts with a kindLabel (type) row and a
+    // versionText ("Built-in") row.
+    const BuiltinPluginCard = ({ tool, copy }) => {
+      const C = copy || zhDict().uiBuiltinPlugins;
+      const Icon = tool.icon || Package;
+      const mcpTools = Array.isArray(tool.mcpTools) ? tool.mcpTools : [];
+      const dataAccess = Array.isArray(tool.dataAccess) ? tool.dataAccess : [];
+      const levelDesc = (tool.securityLevel && C.levels) ? C.levels[tool.securityLevel] : null;
+      const rowCls = 'flex items-start gap-2 text-[12px]';
+      const labelCls = 'shrink-0 w-[72px] font-semibold text-slate-400 dark:text-slate-500 leading-5';
+      return (
+        <div data-testid="builtin-plugin-card" data-tool-id={tool.backendId || ''}
+          className="flex items-start gap-4 py-3 px-3 border-b border-slate-100 dark:border-white/5 last:border-0">
+          <div className={`h-16 w-16 flex-shrink-0 rounded-[16px] border border-black/5 shadow-sm dark:border-white/5 flex items-center justify-center text-white ${tool.color || 'bg-gradient-to-b from-slate-400 to-slate-600'}`}>
+            <Icon size={30} strokeWidth={1.5} />
+          </div>
+          <div className="flex-1 min-w-0 flex flex-col gap-1.5 py-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-[17px] font-semibold text-slate-900 dark:text-white truncate tracking-tight">{tool.title}</h2>
+              <span className="px-3 py-1 text-[12px] rounded-full font-bold bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 whitespace-nowrap">{MODE_CONTROLLED_BUILTIN_SKILL_IDS.includes(tool.backendId) ? C.readonlyModeBadge : C.readonlyBadge}</span>
+            </div>
+            {tool.subtitle && <p className="text-[13px] text-slate-500 dark:text-slate-400 font-medium">{tool.subtitle}</p>}
+            {tool.desc && <p className="text-[12px] text-slate-500 dark:text-slate-400 leading-relaxed">{tool.desc}</p>}
+            {tool.kindLabel && (
+              <div className={rowCls}>
+                <span className={labelCls}>{C.kindLabel}</span>
+                <span className="leading-5 text-slate-600 dark:text-slate-300">{tool.kindLabel}</span>
+              </div>
+            )}
+            {mcpTools.length > 0 && (
+              <div className={rowCls}>
+                <span className={labelCls}>{C.toolsLabel}</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {mcpTools.map(name => (
+                    <span key={name} title={name} className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">{builtinToolShortName(name, tool.backendId)}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {tool.securityLevel && (
+              <div className={rowCls}>
+                <span className={labelCls}>{C.securityLabel}</span>
+                <span className="inline-flex items-center gap-1.5 leading-5">
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wide bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400" title={levelDesc || undefined}>{tool.securityLevel}</span>
+                  {levelDesc && <span className="text-slate-500 dark:text-slate-400">{levelDesc}</span>}
+                </span>
+              </div>
+            )}
+            {(tool.bundleVersion || tool.versionText) && (
+              <div className={rowCls}>
+                <span className={labelCls}>{C.versionLabel}</span>
+                <span className="leading-5 text-slate-600 dark:text-slate-300">{tool.bundleVersion ? `v${tool.bundleVersion}` : tool.versionText}<span className="ml-1.5 text-slate-400 dark:text-slate-500">{C.versionNote}</span></span>
+              </div>
+            )}
+            {dataAccess.length > 0 && (
+              <div className={rowCls}>
+                <span className={labelCls}>{C.dataAccessLabel}</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {dataAccess.map(scope => (
+                    <span key={scope} title={scope} className="text-[11px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">{(C.dataAccess && C.dataAccess[scope]) || scope}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    };
+
+
+export { AcShieldCheck, AcSparkles, ArtifactCard, isQuietTool, toolSummary, isReceipt, ReceiptBlock, tryParseJson, tryTailJson, unwrapMcpTextEnvelope, looksDiff, TODO_TOOLS, OutputPre, OutputError, ListDirView, GrepView, DiffView, ShellView, ShellTextView, TodoView, tsToolsData, tsToolWelcomeData, localizeTool, mergeConfigFields, WeatherCard, isWeatherTool, isStockQuoteTool, StockQuoteCard, tsSkillsData, tsSkillIconByName, tsCategories, TOOL_TYPE_GROUPS, getToolTypeGroup, TOOL_BUSINESS_GROUPS, getToolBusinessGroup, TsActionBtn, BuiltinPluginCard };

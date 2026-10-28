@@ -1,18 +1,22 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, lazy as mentionLazy, useMemo, useRef, useState, Suspense as MentionSuspense, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import {
   invokeObservedPanelSelection,
   isSubagentPanelPublicationCurrent,
 } from './subagent-panel-publication.mjs';
-import { AlertTriangle, ArrowLeft, BarChart2, Brain, Briefcase, Check, ChevronDown, ChevronRight, ClipboardList, Copy, Edit2, FileText, FolderOpen, Globe, ImageIcon, Monitor, Package, Paperclip, PinIcon, Presentation, Send, Sparkles, StopCircle, Terminal, Upload, X, Zap } from '../../components/icons.jsx';
+import { sceneStatusKey } from './scene_status_key.js';
+import { AlertTriangle, ArrowLeft, BarChart2, Brain, Briefcase, Check, ChevronDown, ChevronRight, ClipboardList, Copy, Edit2, FileText, Globe, ImageIcon, MessageSquare, Monitor, Package, Paperclip, PinIcon, Presentation, Send, Sparkles, StopCircle, Terminal, Trash2, Upload, X, Zap } from '../../components/icons.jsx';
 import { bridge } from '../../hooks/useBridge.js';
 import { useCopyFlash } from '../../hooks/useCopyFlash.js';
+import { boundDraftNoticeMode as boundDraftNoticeModeOf } from './bound-draft-mode.js';
 import { useAutoResizeTextarea } from '../../hooks/useAutoResizeTextarea.js';
 import { can, isWeb } from '../../shared/platform.js';
 import { isImeComposing } from '../../shared/ime-guard.mjs';
 import { formatCompactCount } from '../../shared/format-number.js';
 import { getSyntaxHighlightVersion, subscribeSyntaxHighlight } from '../../shared/syntax-highlighter.js';
 import { renderMarkdown } from '../../shared/markdown-renderer.js';
+import { describeKeychain, workspaceNoticeTone } from '../projects/workspacePickerState.js';
+import { interpretFolderEnsureOutcomes } from '../projects/folderEnsure.js';
 import { createWeakCache } from '../../shared/weak-cache.js';
 import { AppIcon, DEPT_ORDER, deptLabelFor, personaText } from '../personas/persona-shared.jsx';
 import { ComposerModelSelector, ComposerToolMenu } from '../settings/composer-shared.jsx';
@@ -21,15 +25,26 @@ import { PinvouLogo } from '../../components/PinvouLogo.jsx';
 import { ViewErrorBoundary } from '../../shared/ViewErrorBoundary.jsx';
 import { ArtifactCard, localizeTool, tsToolsData, tsToolWelcomeData } from '../tools/tool-common.jsx';
 import { RightDockPanel, useRightDockOcclusion } from '../../components/layout/RightDock.jsx';
-import { CarefulBlockedCard, PlanCard, PlanStuckCard, ToolCard, UserInputCard, cardBtnCls } from '../tools/tool-renderers.jsx';
+import { CarefulBlockedCard, PlanCard, PlanStuckCard, ToolCard, UserInputCard } from '../tools/tool-renderers.jsx';
+import { cardBtnCls } from '../../shared/card-buttons.mjs';
 import { annotateAgentSpawnGroups } from '../multiagent/spawn-aggregation.mjs';
 import { RunningAgentsOverlay } from '../multiagent/RunningAgentsOverlay.jsx';
 import { ComputerUseBanner, ComputerUseDialogs } from '../computer-use/ComputerUseConsent.jsx';
 import {
   ConversationTimeline,
   LiveConversationActivityIndicator,
-  useConversationSecondClock,
 } from '../conversation/ConversationTimeline.jsx';
+import { useConversationSecondClock } from '../../hooks/useConversationSecondClock.js';
+import { AuxQuoteSelection } from '../aux-chat/AuxQuoteSelection.jsx';
+import { shouldVirtualizeConversationTurns } from '../conversation/conversation-virtualization.js';
+import {
+  codeBlockCopyLabels,
+  copyCodeBlockFromButton,
+  ensureCodeCopyButtons,
+  findCodeCopyButton,
+  observeCodeCopyButtons,
+} from '../conversation/code-block-copy.js';
+import { applyStreamFade } from '../conversation/stream-fade.js';
 import { HomeModeSwitcher } from '../conversation/HomeModeSwitcher.jsx';
 import {
   conversationItemsForMode,
@@ -47,12 +62,44 @@ import {
   restoreConversationScrollPosition,
 } from '../conversation/conversation-model.js';
 import { AttachmentChips } from '../attachments/AttachmentChips.jsx';
-import { collectClipboardImages, readPasteImageAsBytes } from '../attachments/paste-image.js';
+import {
+  collectClipboardImages,
+  pasteEventNeedsClipboardFallback,
+  pasteImageClipboardFallbackAvailable,
+  readPasteImageAsBytes,
+} from '../attachments/paste-image.js';
 import { formatAttachmentLimitError } from '../attachments/attachment-limit-errors.js';
 import { ComposerAttachmentDropOverlay } from '../attachments/ComposerAttachmentDropOverlay.jsx';
+// #627 session messaging: block split/join helpers (static — plain functions,
+// no component payload; the message card itself stays lazy via CHAT_PANEL_LOADERS).
+import { buildSessionMessageBlock, splitSessionMessageBlock } from './session-message-block.js';
+// Startup-budget (round-41 merge with #586): the mention controls split
+// into their own chunk — the feature is flag-gated and off by default.
+const SessionMentionChips = mentionLazy(() =>
+  import('./SessionMentionControls.jsx').then((m) => ({ default: m.SessionMentionChips })));
+const SessionMentionMenu = mentionLazy(() =>
+  import('./SessionMentionControls.jsx').then((m) => ({ default: m.SessionMentionMenu })));
+const SessionMentionCards = mentionLazy(() =>
+  import('./SessionMentionControls.jsx').then((m) => ({ default: m.SessionMentionCards })));
+import { PROJECT_SESSION_DRAG_TYPE, resolveSessionProjectId } from '../projects/projectGrouping.js';
+import {
+  buildSessionMentionBlock,
+  splitSessionMentionBlock,
+  sessionMentionTriggerAt,
+  filterSessionMentionCandidates,
+  dedupeSessionRefs,
+  isSessionMentionEnabled,
+  stashSessionMentionDraft,
+  restoreSessionMentionDraft,
+  recordDraftMaterialization,
+  resolveMaterializedDraftKey,
+  materializationCarry,
+  clearDraftMaterialization,
+  MAX_SESSION_REFS,
+} from './session-mention.js';
 import { ConversationAttachmentBubble } from '../attachments/ConversationAttachmentBubble.jsx';
 import { splitAttachmentLine } from '../attachments/attachment-message.js';
-import { CHAT_INPUT_MAX_LENGTH, constrainChatInput } from './chat-input-limit.js';
+import { CHAT_INPUT_MAX_LENGTH, constrainChatInput } from '../../shared/chat-input-limit.js';
 import { deriveRunningShellTasks, tailOutputLines } from './background-tasks.js';
 import { formatElapsedMs } from '../../shared/format-utils.mjs';
 import { useShellTaskCancel } from './shell-task-cancel.js';
@@ -80,9 +127,19 @@ import { AssistantMessageActions, AssistantMessageFooter } from '../conversation
 const CHAT_PANEL_LOADERS = Object.freeze({
   artifacts: () => import('../artifacts/ArtifactsPanel.jsx'),
   subagent: () => import('../multiagent/SubagentTranscriptPanel.jsx'),
+  auxChat: () => import('../aux-chat/AuxChatPanel.jsx'),
+  // Round-18: the sender card is deferred out of the main entry — its static
+  // copy pushed the web main entry past the then-500 kB budget (the enforced
+  // gate is the per-mode entry ceiling in vite.config.mjs), and entry policy
+  // requires new entry work to be split or lazy-loaded.
+  // Prefetched on mount below, so delivered messages render without a
+  // visible delay.
+  sessionMessageCard: () => import('./SessionMessageCard.jsx'),
 });
 const LazyArtifactsPanel = React.lazy(() => CHAT_PANEL_LOADERS.artifacts().then((m) => ({ default: m.ArtifactsPanel })));
 const LazySubagentTranscriptPanel = React.lazy(() => CHAT_PANEL_LOADERS.subagent().then((m) => ({ default: m.SubagentTranscriptPanel })));
+const LazyAuxChatPanel = React.lazy(() => CHAT_PANEL_LOADERS.auxChat().then((m) => ({ default: m.AuxChatPanel })));
+const LazySessionMessageCard = React.lazy(() => CHAT_PANEL_LOADERS.sessionMessageCard().then((m) => ({ default: m.SessionMessageCard })));
 const prefetchChatPanel = (key) => {
   const loader = CHAT_PANEL_LOADERS[key];
   if (loader) loader().catch(() => {});
@@ -133,7 +190,6 @@ import {
   shouldUsePptDesignScene,
 } from './work-scene-routes.js';
 import {
-  PERSONAL_WORKBENCH_SCENE_KEY,
   PERSONAL_WORKBENCH_TEMPLATES,
   createPersonalWorkbenchMessageMeta,
   findPersonalWorkbenchTemplateDraft,
@@ -145,12 +201,14 @@ import {
 import {
   DATA_VISUALIZATION_SCENE_KEY,
   DOCUMENT_WRITING_SCENE_KEY,
+  PERSONAL_WORKBENCH_SCENE_KEY,
   PINVOU_SCENE_KEYS,
   PPT_DESIGN_SCENE_KEY,
   POSTER_SCENE_KEY,
   pinvouSceneTag,
 } from './scene-registry.js';
 import { canPrepareSceneCapabilities, prepareSceneCapabilities, requiredCapabilitiesForMeta } from './scene-capabilities.js';
+import { consumeWelcomeOptIn, resolveSendCapabilityStatus, runSharedWelcomeOptIn } from './welcome-optin.js';
 import { invokeTauri } from '../../platform/tauri/client.js';
 import {
   COMPOSER_ICON_BUTTON_CLASS,
@@ -162,7 +220,7 @@ import { ComposerWorkspaceSelector } from './ComposerWorkspaceSelector.jsx';
 import { YoloConfirmCard } from '../../shared/yolo-confirm-card.jsx';
 import { needsYoloConfirmation } from '../codex/code-permission-state.js';
 import { CHAT_YOLO_GATE_UNKNOWN_BINDING, chatYoloGateApplies, shouldShowWorkspaceBindingChip } from './chat-workspace-binding.js';
-import { workspaceName } from '../../shared/workspace-recents.js';
+import { WorkspaceKeychainChip } from '../projects/WorkspaceKeychainChip.jsx';
 import {
   VoiceComposerButton,
   VoiceEditPreview,
@@ -190,10 +248,216 @@ const COMPUTER_USE_ENABLED = can('computerUse');
 // and must not also trigger submit — otherwise one Enter both commits and sends. Matches PetWindow.
 const isPlainEnter = (e) => e.key === 'Enter' && !e.shiftKey && !isImeComposing(e);
 
-// Unified scene table after the design lane was merged into work: a scene
-// only expresses "the professional context of this message" and is
-// lane-independent; scene cards render below the empty-state greeting
-// (scene-cards.jsx).
+// Chips that survive a truly-accepted send: exactly the refs the send
+// serialized are consumed; chips picked during the send await were never sent
+// and stay armed (mirroring the failure path's merge). When the feature gate
+// suppressed the block, stale pre-toggle chips are cleared instead — they can
+// never ride a send while the feature is off (round-9: the previous
+// setSessionRefs([]) wiped mid-await picks on every accepted send).
+// Caret-anchored commit (round-23 asto minor 6): the mention trigger token
+// is end-of-text anchored, so Enter/Tab may only commit a candidate while
+// the caret sits inside that trailing token — with the caret moved elsewhere
+// the panel is stale for the edit position and a commit would rewrite the
+// tail. An unreadable caret (no element) keeps the legacy commit behavior.
+const mentionCaretInTriggerToken = (composerRef, trigger) => {
+  const el = composerRef.current;
+  const caret = el && typeof el.selectionStart === 'number' ? el.selectionStart : null;
+  return caret === null || caret >= trigger.start;
+};
+const refsSurvivingAcceptance = (refsAtSend, currentRefs, featureOn) => {
+  if (!featureOn) return [];
+  const sentIds = new Set(refsAtSend.map((ref) => ref && ref.sessionId));
+  return currentRefs.filter((ref) => ref && !sentIds.has(ref.sessionId));
+};
+
+// Single-sourced verdict/ledger tail for every send lane (round-19 M3):
+// rounds 12-18 fixed this logic four times in four copies — this factory is
+// the one place the acceptance/failure semantics live now; the lanes keep
+// only their own glue (text restore, voice ownership, in-flight draft-key
+// registration). Module-scope so the behavioral tests execute the same
+// code the component runs.
+const makeSettleSessionRefSend = ({ mentionDraftKeyRef, sessionMentionEnabledRef, setSessionRefs }) =>
+  (refsAtSend, draftKeyAtSend, verdict) => {
+    // Round-28 asto MAJOR: an entry with no bridge report behind it is the
+    // scope effect's plain-navigation misrecord (any in-flight send made a
+    // draft:→session: transition look like its own materialization). A
+    // failure/throw with no report means no materialization EVER happened —
+    // the draft is still alive, so the 'restored' arm's protection applies:
+    // consume the stale entry there instead of arming the chips live in the
+    // navigated session. Sound because every committed materialization
+    // reports before any later failure exit (chat.js: the write precedes the
+    // false/throw paths), so "no report + failure" always implies stale
+    // navigation.
+    if (verdict !== true && materializationCarry(draftKeyAtSend)?.reported === false) {
+      verdict = 'restored';
+    }
+    // Settle-time feature state (round-19 minor 2): the send closures
+    // capture the dispatch-time render value, but a mid-await re-enable
+    // plus a fresh pick must not be wiped by the stale OFF gate.
+    const featureOn = sessionMentionEnabledRef.current;
+    const carry = materializationCarry(draftKeyAtSend);
+    if (verdict === true) {
+      // Acceptance consumes exactly the serialized set; the carry (mid-await
+      // picks that followed a REAL materialization into the ledger) was
+      // never sent, so they survive acceptance — kept live in the
+      // materialized scope AND in its stash (round-26 asto MAJOR 1: the live
+      // setter alone no-ops while the view is unmounted, and the ledger
+      // clear below would then destroy the carry — the stash write rescues
+      // it; mounted, the next scope cleanup overwrites the stash with the
+      // live snapshot, the established pattern). Cap priority: the surviving
+      // computation consumes refsAtSend first, the carry rides after. The
+      // carry is filtered by the serialized ids (round-26 asto m5): a
+      // mid-await re-pick of an already-sent ref must not ride the carry
+      // past acceptance — exactly the serialized set is consumed, per
+      // refsSurvivingAcceptance's contract. (The former
+      // `carry.target === resolveMaterializedDraftKey(draftKeyAtSend)`
+      // compare was tautological — both sides read the same ledger entry.)
+      const sentIds = new Set(refsAtSend.map((ref) => ref && ref.sessionId));
+      const carriedKept = featureOn && carry
+        ? carry.carriedRefs.filter((ref) => ref && !sentIds.has(ref.sessionId))
+        : [];
+      const acceptanceStashKey = resolveMaterializedDraftKey(draftKeyAtSend);
+      // Round-27 asto m10: with the feature OFF the merged set is empty by
+      // construction, and writing it would DELETE the resolved scope's whole
+      // stash — mid-await picks and pre-existing chips of a scope the user
+      // may not even be looking at. OFF is a toggle, not a delete: leave the
+      // stash; the live clear (refsSurvivingAcceptance → []) already keeps
+      // off-state chips unsendable, and re-enable restores them.
+      if (featureOn) {
+        stashSessionMentionDraft(acceptanceStashKey, dedupeSessionRefs([
+          ...carriedKept,
+          ...refsSurvivingAcceptance(refsAtSend, dedupeSessionRefs([...carriedKept, ...restoreSessionMentionDraft(acceptanceStashKey)]), featureOn),
+        ]));
+      } else if (carry) {
+        // Round-28 asto should-fix 1: an OFF acceptance must not DESTROY the
+        // carry either — carriedKept is force-empty under the gate and the
+        // ledger clear below would delete the picks outright. Park the carry
+        // in the resolved scope's stash: the toggle hides the chips, it does
+        // not delete them (they return on re-enable, like the stash).
+        stashSessionMentionDraft(acceptanceStashKey, dedupeSessionRefs([
+          ...carry.carriedRefs,
+          ...restoreSessionMentionDraft(acceptanceStashKey),
+        ]));
+      }
+      const onDispatchScope = resolveMaterializedDraftKey(mentionDraftKeyRef.current)
+        === acceptanceStashKey;
+      if (onDispatchScope) {
+        setSessionRefs(current => {
+          // Round-27 asto m1: carry-first here too — the stash write below
+          // and the failure tail are carry-first, and a >5 combined set kept
+          // different refs alive vs stashed between the mounted and
+          // unmounted outcomes.
+          const next = dedupeSessionRefs([
+            ...carriedKept,
+            ...refsSurvivingAcceptance(refsAtSend, current, featureOn),
+          ]);
+          // Round-26 asto m7: a plain accepted send with nothing surviving
+          // must not schedule an extra render — return the same reference
+          // when the merged set is unchanged.
+          const unchanged = next.length === current.length
+            && next.every((ref, index) => ref.sessionId === current[index].sessionId);
+          return unchanged ? current : next;
+        });
+      }
+      if (carry) clearDraftMaterialization(draftKeyAtSend);
+      return;
+    }
+    let stashKey;
+    let carriedRefs = [];
+    if (verdict === 'restored') {
+      // Aborted materialization (round-16 MAJOR-2 + rounds 19/20/22): the
+      // carry returns to the still-alive draft — the ledger holds it
+      // ownership-separated, so the misread target was never touched.
+      stashKey = draftKeyAtSend;
+      carriedRefs = carry ? carry.carriedRefs : [];
+      if (mentionDraftKeyRef.current === draftKeyAtSend) {
+        // Still on the aborted scope (the ordinary "restored" shape, or the
+        // user navigated back to the draft): restore the snapshot live,
+        // carry first (round-20 asto MAJOR-1 — stash-only would be
+        // overwritten by the next scope cleanup's live snapshot).
+        setSessionRefs(current => dedupeSessionRefs([...carriedRefs, ...refsAtSend, ...current]));
+      }
+    } else {
+      // Failure / non-dispatch after a REAL materialization — including the
+      // round-25 asto MAJOR 3 shape: a textful abandonToOwnSession AFTER the
+      // commit resolves "restored-materialized" (text already in the
+      // materialized session's buffer, draft epoch dead), so its chips route
+      // here too. The snapshot restores through the ledger-resolved session
+      // key, the carry merges alongside it (cap priority: the carry first —
+      // it has no other recovery path; refsAtSend ride with the restored
+      // text).
+      stashKey = resolveMaterializedDraftKey(draftKeyAtSend);
+      // (round-26 asto m5: the former `carry.target === stashKey` compare was
+      // tautological — both sides read the same ledger entry — a plain
+      // existence check is the honest shape.)
+      carriedRefs = carry ? carry.carriedRefs : [];
+    }
+    // Live restore when the current scope resolves to the same key —
+    // including the user having navigated BACK to the draft while the
+    // mapping was still recorded (round-19 M2's discriminating race; the
+    // restored arm already live-merged above, and its re-scoped stashKey
+    // cannot match the mapping-resolved current). The ledger entry stays
+    // live until AFTER this guard and the stash write: clearing earlier
+    // would unresolve the current scope mid-race.
+    if (verdict !== 'restored' && resolveMaterializedDraftKey(mentionDraftKeyRef.current) === stashKey) {
+      // Carry-first priority here too (round-23 zhuowp): refsAtSend-first in
+      // the live merge dropped the carry at the cap, and the next scope
+      // cleanup then overwrote the (correct, carry-first) stash with the
+      // live snapshot — the carry vanished after navigation.
+      setSessionRefs(current => dedupeSessionRefs([...carriedRefs, ...refsAtSend, ...current]));
+    }
+    stashSessionMentionDraft(stashKey, dedupeSessionRefs(
+      [...carriedRefs, ...refsAtSend, ...restoreSessionMentionDraft(stashKey)]));
+    if (carry) clearDraftMaterialization(draftKeyAtSend);
+  };
+
+// Round-24 MAJOR (both reviewers' independent probe): the scope effect is the
+// ledger's only production writer, and it can only observe a materialization
+// while ChatView is MOUNTED with the draft key in its ref (a fresh mount
+// starts at null and with an empty component-local pending set). A send from
+// draft:N whose materialization commits while the view is unmounted (Settings
+// open, send promise still running) therefore resolves its failure snapshot
+// through the DEAD draft key and the chips are orphaned. The bridge reports
+// the committed materialization through the caller-owned meta object; this
+// helper runs in the send closure (unmount-proof) right after the await, so
+// the settle tail below resolves its stash key through the ledger either way.
+// The mounted scope effect's own recording wins when it already happened (it
+// carries the mid-await picks read at the transition): never clobber it.
+const recordSendMaterialization = (draftKey, meta) => {
+  const sessionId = meta && meta.materializedSessionId;
+  if (!sessionId || !draftKey || !draftKey.startsWith('draft:')) return;
+  const target = `session:${sessionId}`;
+  const existing = materializationCarry(draftKey);
+  if (existing) {
+    // Round-27 asto MAJOR 1: the mounted scope effect may have recorded the
+    // NAVIGATION target — the user clicked an existing session while this
+    // send's own create was still in flight, and commit-then-navigate then
+    // committed the created session anyway. An existence-only guard kept
+    // that stale entry and the settle armed the chips LIVE in the unrelated
+    // session. A wrong-target entry is stale: re-record with the
+    // bridge-reported target while PRESERVING the carriedRefs (the effect
+    // read them from the draft stash before draining it — the stash is empty
+    // now, so a naive overwrite would drop the mid-await picks).
+    if (existing.target === target) {
+      // The effect happened to record the true target: the report confirms
+      // the entry (the settle's stale-navigation discriminator keys on this).
+      recordDraftMaterialization(draftKey, target, existing.carriedRefs, true);
+      return;
+    }
+    recordDraftMaterialization(draftKey, target, existing.carriedRefs, true);
+    return;
+  }
+  // Same carry semantics as the effect at the same logical moment: whatever
+  // the draft scope's stash still holds (mid-await picks while the transition
+  // render is pending; nothing once the cleanup ran — the unmounted shape).
+  const carried = restoreSessionMentionDraft(draftKey);
+  recordDraftMaterialization(draftKey, target, carried, true);
+  // Mirror the effect's post-record clear (round-25 asto minor 11): the
+  // carried chips live in the ledger entry now; drain the dead draft key's
+  // stash entry so nothing double-holds them.
+  if (carried.length) stashSessionMentionDraft(draftKey, []);
+};
+
 // Presentation for the canonical scene registry (scene-registry.js owns the
 // key order and the lane tags); this table only adds the UI label key + icon.
 const SCENE_TAB_PRESENTATION = {
@@ -301,7 +565,10 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                   </span>
-                  {t.uiChat.ready}
+                  {/* The install path deliberately keeps the switch off (DenyAll
+                      convergence), so "Ready" would be a lie; describe it truthfully
+                      and complete the opt-in on the first question (review #455 R7-M4). */}
+                  {t.uiChat.installedReady}
                 </div>
               </div>
             </div>
@@ -628,7 +895,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
     };
 
     // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy main view: session/mode/artifact/browser state is highly cohesive; split refactor tracked separately
-    const ChatView = ({ theme, t, bs, prefill, prefillAppend = false, focusComposerTick = 0, onPrefillConsumed, onOpenEditor, justInstalledTool, setJustInstalledTool, onGotoSettings, onGotoModelSettings, onGotoTools, onBackScheduledRun, codeModeAvailable = false, onSwitchHomeMode, browserDockAvailable = false, browserDockOpen = false, rightDockActivePanelId = null, onRightDockPanelSelectionChange, onOpenBrowserDock }) => {
+    const ChatView = ({ theme, t, bs, prefill, prefillAppend = false, focusComposerTick = 0, onPrefillConsumed, onOpenEditor, justInstalledTool, setJustInstalledTool, onGotoSettings, onGotoModelSettings, onGotoTools, onBackScheduledRun, codeModeAvailable = false, onSwitchHomeMode, browserDockAvailable = false, browserDockOpen = false, rightDockActivePanelId = null, onRightDockPanelSelectionChange, onOpenBrowserDock, onOpenWorkspacePicker, onNotify, onSwitchSession = null }) => {
       const chatCopy = t.uiChat;
       const chatViewCopy = t.uiChatView;
       const sceneCopy = chatCopy.sceneModes;
@@ -670,6 +937,12 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       const [designCommand, setDesignCommand] = useState(null);
       const [designAiState, setDesignAiState] = useState({ text: '', status: 'idle', lastPrompt: '', pendingPath: '', startedAt: 0 });
       const [sceneCapabilityStatus, setSceneCapabilityStatus] = useState(null);
+      // Round-32 minor 10 (review #455): per-toast epoch — the session key
+      // above discriminates sessions/drafts, not two sends in ONE session, so
+      // a stale auto-clear timeout could shorten a newer send's ready toast.
+      // Each ready toast stamps the next epoch; its closer only clears the
+      // exact epoch it scheduled.
+      const sceneReadyToastEpochRef = useRef(0);
       const designAiSessionRef = useRef(null);
       const updateDesignAiState = useCallback((valueOrUpdater) => {
         setDesignAiState((prev) => {
@@ -682,6 +955,12 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           }
           return merged;
         });
+      }, []);
+      // Warm the deferred sender-card chunk at view entry: delivered messages
+      // render it above the body, and the mount-time prefetch keeps the lazy
+      // split (entry-budget policy) free of visible first-render delay.
+      useEffect(() => {
+        prefetchChatPanel('sessionMessageCard');
       }, []);
       const scrollRef = useRef(null);
       const conversationContentRef = useRef(null);
@@ -771,7 +1050,19 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       // state operation), so during the async refresh window the old session's consent
       // dialogs are no longer clickable.
       useEffect(() => {
-        if (!COMPUTER_USE_ENABLED || !bridge.available || !bridge.computerUse || !activeSessionId) return;
+        if (!COMPUTER_USE_ENABLED || !bridge.available || !bridge.computerUse) return;
+        // Leaving to the draft screen must run the session-less refresh:
+        // createNewSession/leaveSessionView/applyDeletedSession all null
+        // activeSessionId without touching the computer-use slice, so a
+        // granted session's control banner (and any unanswered consent
+        // dialog) used to stay rendered on the welcome composer — the
+        // r2/r3 session-less branch fixed the state but had no production
+        // caller on this transition. Switching back re-serves the real
+        // state from the server truth via the mount refresh below.
+        if (!activeSessionId) {
+          bridge.computerUse.refreshStatus(null).catch(() => {});
+          return;
+        }
         bridge.computerUse.refreshStatus(activeSessionId).catch(() => {});
         // Missed-event fallback: if grant/stop events were missed by the frontend (e.g. a
         // refresh or a backgrounded window), the banner would drift from the real
@@ -995,6 +1286,11 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       }, [setInputText]);
       const handleComposerInputChange = useCallback((value) => {
         setInputText(value);
+        // Emptying the composer cancels a pending voice result: the transcription must
+        // not land later in a draft the user already cleared.
+        if (!String(value || '').trim() && bridge.voice && typeof bridge.voice.abandonVoiceResult === 'function') {
+          bridge.voice.abandonVoiceResult();
+        }
         const currentTemplate = getPersonalWorkbenchTemplateById(personalWorkbenchTemplateIdRef.current);
         if (!currentTemplate) return;
         if (!isPersonalWorkbenchTemplateDraftForTemplate(value, currentTemplate)) {
@@ -1002,6 +1298,124 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           setPersonalWorkbenchTemplateId(null);
         }
       }, [setInputText]);
+      // Picking an @ panel candidate: drop the trailing @token from the composer;
+      // the reference lands in the chip strip (serialized into the injection block
+      // on send). When the feature is off (docs/builtin-toolset-contract.md §3.3
+      // layer 1) nothing can be added (the @ panel and drag-drop share this add path).
+      // session-mention feature switch (the judgement source for the §3.3
+      // four-layer cascade): on by default; the registry read is exposed on
+      // both lanes (the web bridge proxies list_builtin_features to the same
+      // desktop host), so a host-side switch-off reaches browser clients too.
+      // A query failure keeps the LAST-KNOWN state (sticky after a successful
+      // OFF read — never a false "disabled"; the pre-query default is
+      // enabled, matching the backend's missing-state-file semantics). Switch
+      // changes are broadcast via remote_control:tools_changed →
+      // pinvou:tools-changed (chat-events.js); this subscription refetches to
+      // hot-update the UI. Web lane: a browser that loads while the desktop
+      // host is down/negotiating would otherwise keep the fail-open default
+      // for the whole session — re-read once the connection reports the
+      // desktop back online (round-13 minor 3; mirrors useBridge's listener).
+      const [sessionMentionEnabled, setSessionMentionEnabled] = useState(true);
+      // Settle-time feature state (round-19 minor 2): the send closures
+      // capture the dispatch-time render value, but a mid-await re-enable
+      // plus a fresh pick must not be wiped by the stale OFF gate — the
+      // settle tail reads the CURRENT state through this ref.
+      const sessionMentionEnabledRef = useRef(sessionMentionEnabled);
+      sessionMentionEnabledRef.current = sessionMentionEnabled;
+      useEffect(() => {
+        let alive = true;
+        // Round-27 asto m5: reads have no natural ordering — a pre-toggle
+        // read resolving after a post-toggle one would reinstate stale state
+        // until the next event; only the newest read may commit.
+        let readSeq = 0;
+        const refresh = async () => {
+          if (!bridge.available || !bridge.settings || typeof bridge.settings.listBuiltinFeatures !== 'function') return;
+          const mySeq = ++readSeq;
+          try {
+            const features = await bridge.settings.listBuiltinFeatures();
+            if (alive && mySeq === readSeq) setSessionMentionEnabled(isSessionMentionEnabled(features));
+          } catch { /* fail-open: keep the current enabled state */ }
+        };
+        const refreshOnWebConnection = (event) => {
+          const detail = event && event.detail;
+          if (!detail || detail.desktop_online !== false) refresh();
+        };
+        refresh();
+        window.addEventListener('pinvou:tools-changed', refresh);
+        window.addEventListener('pinvou:web-connection', refreshOnWebConnection);
+        return () => {
+          alive = false;
+          window.removeEventListener('pinvou:tools-changed', refresh);
+          window.removeEventListener('pinvou:web-connection', refreshOnWebConnection);
+        };
+      }, []);
+      const handleRemoveMentionRef = useCallback((sessionId) => {
+        setSessionRefs(current => current.filter(ref => ref.sessionId !== sessionId));
+      }, []);
+      // Reference-card navigation in sent messages: reuse the session switch handed down by the main frame (with view routing).
+      const handleOpenMentionSession = useCallback((sessionId) => {
+        if (onSwitchSession) onSwitchSession(sessionId);
+      }, [onSwitchSession]);
+      // Dragging a sidebar session row (the "move to project" drag gesture, the
+      // application/x-pinvou-session payload from #462) into the composer area =
+      // referencing that session, reusing the same add path as the @ panel;
+      // attachment drop only accepts Files (attachment-drop-controller hasFiles)
+      // and a session drag carries no Files, so the two never conflict.
+      const sessionDropDepthRef = useRef(0);
+      const [sessionDropActive, setSessionDropActive] = useState(false);
+      const isSessionRowDrag = (e) => {
+        const types = (e.dataTransfer && e.dataTransfer.types) || [];
+        // eslint-disable-next-line unicorn/prefer-spread -- Safari 14's dataTransfer.types is a DOMStringList (not iterable; Array.from only); Chromium's new frozen array works the same way
+        return Array.from(types).includes(PROJECT_SESSION_DRAG_TYPE);
+      };
+      const handleComposerSessionDragEnter = (e) => {
+        // When the feature is off (§3.3 layer 1), a dropped session does not land as a chip and no drop hint appears.
+        // A full chip strip is equally undroppable (round-18 MAJOR-3): the
+        // cap is component state known before the drop, so gate the hint
+        // here instead of flashing a drop affordance the drop swallows.
+        if (!isSessionRowDrag(e) || !sessionMentionEnabled) return;
+        if (sessionRefs.length >= MAX_SESSION_REFS) return;
+        sessionDropDepthRef.current += 1;
+        setSessionDropActive(true);
+      };
+      const handleComposerSessionDragLeave = (e) => {
+        if (!isSessionRowDrag(e)) return;
+        sessionDropDepthRef.current = Math.max(0, sessionDropDepthRef.current - 1);
+        if (sessionDropDepthRef.current === 0) setSessionDropActive(false);
+      };
+      const handleComposerSessionDragOver = (e) => {
+        // Gate mirrors dragEnter (round-8 minor 3): with the feature off the
+        // drop can never land, so offering the droppable cursor only to
+        // no-op the drop was a false affordance. The cap gate likewise
+        // keeps the cursor honest for a full strip (round-18 MAJOR-3); the
+        // id-dependent cases (duplicate/self/unknown) are only decidable at
+        // drop time — the drop rejects those silently by design.
+        if (!isSessionRowDrag(e) || !sessionMentionEnabled) return;
+        if (sessionRefs.length >= MAX_SESSION_REFS) return;
+        e.preventDefault(); // allow the drop
+      };
+      const handleComposerSessionDrop = (e) => {
+        if (!isSessionRowDrag(e)) return;
+        e.preventDefault();
+        sessionDropDepthRef.current = 0;
+        setSessionDropActive(false);
+        const sessionId = e.dataTransfer.getData(PROJECT_SESSION_DRAG_TYPE);
+        if (!sessionId || sessionId === activeSessionId) return;
+        // Codex/ACP sidebar rows put their session id on the same drag type
+        // but never appear in bs.sessions (round-8 M4): a chip built from one
+        // renders a dead "Session deleted" card that read_session can never
+        // resolve. Knownness plus the choke point's own acceptance decide:
+        // a pick the @ panel would never offer (isolated prefix, oversized
+        // id — knownSessionMentionIds includes archived sessions) is
+        // rejected here at drop time (the id is unreadable before the
+        // drop); the cap is gated earlier, at dragEnter/dragOver
+        // (round-18 MAJOR-3).
+        if (!knownSessionMentionIds.has(sessionId)) return;
+        if (sessionRefs.some(ref => ref.sessionId === sessionId)) return;
+        if (sessionRefs.length >= MAX_SESSION_REFS) return;
+        const title = ((((bs && bs.sessions) || []).find(s => s.id === sessionId)) || {}).title || '';
+        handleSelectMentionCandidate({ sessionId, title });
+      };
       const handleDesignElementSelected = useCallback((element) => {
         setSelectedDesignElement(element || null);
       }, []);
@@ -1234,7 +1648,11 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         if (!el) return;
         autoScrollRef.current = true;
         setShowScrollBottom(false);
-        el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+        // Smooth gliding through a virtualized document mounts and unmounts
+        // rows for its whole duration while estimates go stale; jump instead
+        // (same decision as the overflowAnchor gate above).
+        const virtualized = shouldVirtualizeConversationTurns(conversationProjection.turns.length, scrollRef);
+        el.scrollTo({ top: el.scrollHeight, behavior: virtualized ? 'auto' : 'smooth' });
       }
 
       // Auto-scroll：只在原本贴底时滚内部容器到底（绝不动外层窗口，避免浏览历史时被拉回底部）
@@ -1335,6 +1753,15 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       // 顶掉「你好」欢迎语(该 tool 无 welcomeQueries 时 ToolWelcomeCard 渲染 null → 整块空白)。
       // 设置与清空收进同一 effect,按 justInstalledTool 优先,避免多 effect 同帧竞态。
       const [welcomeToolId, setWelcomeToolId] = useState(null);
+      // sendChatMessage's useCallback must not depend on welcomeToolId (avoids
+      // identity-churn rebuilds); the free-input path consumes the current
+      // welcome pack through this ref (review #455 R8-2).
+      const welcomeToolIdRef = useRef(null);
+      // Round-16 minor 13: in-flight welcome opt-in attempt ({ toolId,
+      // promise } | null) shared across concurrent sends — a send arriving
+      // during the first enable's await window joins it instead of no-op'ing
+      // and later clearing the first send's failure banner.
+      const welcomeOptInAttemptRef = useRef(null);
       const welcomeSessionKeyRef = useRef(null);
       // Web 只读判定：多智能体是桌面专属能力（ADR-0006），Web 端只读呈现。
       // modeState.multiAgent 经 get_mode_state 双端同步（开关已持久化）。
@@ -1390,8 +1817,42 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       // detail -> list -> same parent card a new selection even when agentId is unchanged.
       const [subagentPanel, setSubagentPanel] = useState(null);
       const subagentPanelRequestRef = useRef(0);
+      // The aux chat panel's mount state is declared early: the scroll-restore
+      // useLayoutEffect below depends on it (opening/closing the panel changes
+      // the right dock layout, so the main conversation scroll position must
+      // be restored, same as in CodexAcpView).
+      const [auxChatPanel, setAuxChatPanel] = useState(null);
+      // The panel's real visibility in the dock (same mechanism as
+      // CodexAcpView's auxChatDockActive): when another dock panel covers the
+      // aux panel the entry pill does not highlight, and clicking it again
+      // brings the panel to the front via the openTick bump.
+      const [auxChatDockActive, setAuxChatDockActive] = useState(false);
+      const auxChatPanelRequestRef = useRef(0);
       // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously close the sub-agent panel on session switch
       useEffect(() => { setSubagentPanel(null); }, [activeSessionId]);
+      // When the mount condition drops (sched-/agentic_ session / no active
+      // session / bridge or auxChat domain unavailable), the panel unmounts
+      // outright and RightDockPanel's onActiveChange has no unmount cleanup,
+      // so the highlight would linger; reset it here and let the re-mounted
+      // panel report its real visibility again. The conjuncts mirror the
+      // entry button and the mount gate exactly (round-26 minor M4).
+      useEffect(() => {
+        if (auxChatPanel && activeSessionId && !activeSessionId.startsWith('sched-')
+          && !activeSessionId.toLowerCase().startsWith('agentic_')
+          && bridge.available && bridge.auxChat) return;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously reset dock highlight when the panel unmounts; one-shot mirror, same pattern as CodexAcpView
+        setAuxChatDockActive(false);
+      }, [auxChatPanel, activeSessionId]);
+      // The panel stays mounted across main-session switches (it rebinds), but
+      // the recorded dock-restore target must not: it was captured against the
+      // PREVIOUS task's dock context, so applying it to the new task pops a
+      // stale panel (the native browser webview included) over whatever the
+      // user is on (round-30 D3). The subagent panel gets the same reset by
+      // closing outright on the switch.
+      useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot reset of the restore target on session switch; the subagent panel's close-on-switch is the same mirror
+        setAuxChatPanel((current) => (current ? { ...current, restorePanelId: null } : current));
+      }, [activeSessionId]);
       const rememberScrollBeforeSubagentPanelChange = useCallback(() => {
         subagentPanelScrollRef.current = captureConversationScrollPosition(
           scrollRef.current,
@@ -1443,7 +1904,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           autoScrollRef.current = true;
           setShowScrollBottom(false);
         }
-      }, [subagentPanel]);
+      }, [subagentPanel, auxChatPanel]);
       useEffect(() => {
         if (typeof window === 'undefined') return;
         const onOpen = (event) => {
@@ -1497,6 +1958,82 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         rememberScrollBeforeSubagentPanelChange,
         rightDockActivePanelId,
       ]);
+      // Aux chat panel (an independent Q&A-only conversation in the right
+      // dock, outside the sub-agent system). Unlike subagentPanel: it does
+      // **not** close on main-session switch; the new sessionId is passed in
+      // to rebind. Before opening/closing, record the main conversation
+      // scroll position (subagentPanelScrollRef); the restore useLayoutEffect
+      // above replays it uniformly, matching the aux entry behavior in
+      // CodexAcpView.
+      const openAuxChatPanel = useCallback(() => {
+        const requestedSessionId = activeSessionId;
+        if (!requestedSessionId) return;
+        const requestId = auxChatPanelRequestRef.current + 1;
+        auxChatPanelRequestRef.current = requestId;
+        prefetchChatPanel('auxChat');
+        const publishOpen = ({ isCurrent = () => true } = {}) => {
+          if (!isSubagentPanelPublicationCurrent({
+            transitionCurrent: isCurrent(),
+            requestId,
+            currentRequestId: auxChatPanelRequestRef.current,
+            sessionId: requestedSessionId,
+            currentSessionId: activeSessionIdRef.current,
+          })) return false;
+          rememberScrollBeforeSubagentPanelChange();
+          setAuxChatPanel((current) => ({
+            openTick: (current?.openTick || 0) + 1,
+            // Remember the dock panel active at first open and jump back to
+            // it on close (same pattern as the subagent panel; repeat opens
+            // must keep the first record, or the restore target would be
+            // overwritten by the panel itself).
+            restorePanelId: current
+              ? current.restorePanelId
+              : browserDockOpen ? rightDockActivePanelId : null,
+          }));
+          return true;
+        };
+        if (onRightDockPanelSelectionChange) {
+          void invokeObservedPanelSelection(
+            onRightDockPanelSelectionChange,
+            ['aux-chat', requestedSessionId, publishOpen],
+            reportRightDockSelectionFailure,
+          );
+        } else {
+          publishOpen();
+        }
+      }, [activeSessionId, browserDockOpen, onRightDockPanelSelectionChange, rememberScrollBeforeSubagentPanelChange, rightDockActivePanelId]);
+      const closeAuxChatPanel = useCallback(() => {
+        const requestId = auxChatPanelRequestRef.current + 1;
+        auxChatPanelRequestRef.current = requestId;
+        const requestedSessionId = activeSessionId;
+        const restorePanelId = auxChatPanel?.restorePanelId || null;
+        // Publish with the same currency guard as closeSubagentPanel
+        // (round-26 minor M5): the dock restore below is async, so a rapid
+        // close→open could settle out of order — the stale close's restore
+        // would land after the open's publication and leave the dock on the
+        // restore panel with the aux panel mounted but occluded. The
+        // requestId/session currency check makes the stale publication inert.
+        const publishClose = ({ isCurrent = () => true } = {}) => {
+          if (!isSubagentPanelPublicationCurrent({
+            transitionCurrent: isCurrent(),
+            requestId,
+            currentRequestId: auxChatPanelRequestRef.current,
+            sessionId: requestedSessionId,
+            currentSessionId: activeSessionIdRef.current,
+          })) return false;
+          rememberScrollBeforeSubagentPanelChange();
+          setAuxChatPanel(null);
+          return true;
+        };
+        if (browserDockOpen && restorePanelId && onRightDockPanelSelectionChange) {
+          return invokeObservedPanelSelection(
+            onRightDockPanelSelectionChange,
+            [restorePanelId, requestedSessionId, publishClose],
+            reportRightDockSelectionFailure,
+          );
+        }
+        return publishClose();
+      }, [activeSessionId, auxChatPanel, browserDockOpen, onRightDockPanelSelectionChange, rememberScrollBeforeSubagentPanelChange]);
       const handlePreviewArtifact = useCallback((artifact) => {
         setActiveArtifactPath(artifact && artifact.path ? artifact.path : null);
         setArtifactDockActivation((value) => value + 1);
@@ -1526,34 +2063,248 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         return () => window.removeEventListener('pinvou:present-artifact', onPresentArtifact);
       }, [activeSessionId, showArtifactsPreview]);
       const draftEpoch = bs ? bs.draftEpoch : 0;
+      // Round-31 m5 (review #455): the async send-flow guards compare the
+      // CURRENT draft epoch at write time; the callback closure would go
+      // stale, so mirror the epoch in a ref (same pattern as
+      // activeSessionIdRef above).
+      // Capability preparation and first-turn materialization can outlive the
+      // originating voice composer; the dispatch guard compares the live epoch
+      // at await boundaries (a ref, not the render value).
+      const draftEpochRef = useRef(draftEpoch);
+      draftEpochRef.current = draftEpoch;
+      const [sessionRefs, setSessionRefs] = useState([]);
+      const [mentionDismissedToken, setMentionDismissedToken] = useState(null);
+      const [mentionSelection, setMentionSelection] = useState({ token: null, index: 0 });
+      // Latest committed chips for the draft-stash cleanup below (the cleanup
+      // runs before the switch-time restore commits, so it must read a ref).
+      const sessionRefsRef = useRef([]);
+      const mentionDraftKeyRef = useRef(null);
+      // Draft keys with an in-flight send (round-15 B1/m1): the bridge
+      // materializes a draft into a real session inside sendChatMessage, so
+      // a draft:→session: scope transition while the key is in this set is
+      // THE send's own materialization (chips follow the composer text),
+      // not plain navigation (chips stay scoped to the draft). Lanes add
+      // their draft key at dispatch and remove it when the send settles.
+      const mentionPendingDraftSendsRef = useRef(new Set());
+      useEffect(() => {
+        sessionRefsRef.current = sessionRefs;
+      }, [sessionRefs]);
       // 切换 session / 新建草稿会话时读取各自 working set 里的未发送内容。
       // 从设置、工具商店等页面返回时 ChatView 会重新挂载，初始 state 也从
       // 同一份内存草稿恢复。
+      /* eslint-disable react-hooks/set-state-in-effect -- deliberate per-session draft restore: this effect restores the composer text and resets mention chips/dismissal/selection on session switch in one batch, not drifting out of sync via render-time derivation */
       useEffect(() => {
         const restored = bridge.available && bridge.chat && bridge.chat.getComposerDraft
           ? bridge.chat.getComposerDraft()
           : ((bs && bs.composerDraft) || '');
         setInputText(restored);
+        // Mention chips are part of the per-session draft (same in-memory,
+        // per-session lifetime as the composer working set): restore the refs
+        // picked in this scope; the effect cleanup stashes the outgoing
+        // scope's refs (and the unmounted scope's), so switching away and
+        // back never silently wipes them, while refs picked in session A
+        // still never leak into session B (the injection block binds to the
+        // send context). The menu dismissal/keyboard selection reset on the
+        // same scope change.
+        const key = activeSessionId ? `session:${activeSessionId}` : `draft:${draftEpoch}`;
+        // Draft materialization (draft:N → session:ID) kills the old key
+        // forever — epochs are monotonic, nothing will read draft:N again.
+        // The composer text moves with the working set, so the chips must
+        // follow. Materialization is distinguished from plain navigation by
+        // the in-flight send ledger (a send dispatched from draft:N is what
+        // makes the bridge materialize it): navigation must NOT carry the
+        // draft's chips into the unrelated session (round-15 m1), while
+        // materialization must — and because the dispatch already cleared
+        // the chips, the cleanup below stashes [] before this migration can
+        // carry anything, so the supersession is ALWAYS recorded in the
+        // ledger and the send lanes' settle tails resolve their stash key
+        // through it (round-15 B1: a failure snapshot taken under draft:N
+        // must land under the materialized session key, not a dead key).
+        const previousKey = mentionDraftKeyRef.current;
+        if (previousKey && previousKey !== key
+          && previousKey.startsWith('draft:') && key.startsWith('session:')
+          && mentionPendingDraftSendsRef.current.has(previousKey)) {
+          // Round-24 MAJOR: when the send closure's unmount-proof recording
+          // already took this transition (recorded.target === key), keep ITS
+          // carry — it read the draft stash while the mid-await picks were
+          // still in it; re-recording here would overwrite them with the
+          // post-cleanup empty stash.
+          const recorded = materializationCarry(previousKey);
+          if (!recorded || recorded.target !== key) {
+            const carried = restoreSessionMentionDraft(previousKey);
+            // Ownership-separated carry (round-20 zhuowp follow-up): the
+            // carried chips live in the ledger entry, NOT in the target's
+            // stash — the target's own picks (and their cap slots) stay
+            // untouched, and the settle tails are the only consumers.
+            recordDraftMaterialization(previousKey, key, carried);
+            if (carried.length) stashSessionMentionDraft(previousKey, []);
+          }
+        }
+        mentionDraftKeyRef.current = key;
+        setSessionRefs(restoreSessionMentionDraft(key));
+        setMentionDismissedToken(null);
+        setMentionSelection({ token: null, index: 0 });
+        return () => {
+          stashSessionMentionDraft(key, sessionRefsRef.current);
+        };
+      /* eslint-enable react-hooks/set-state-in-effect */
       // eslint-disable-next-line react-hooks/exhaustive-deps -- deps reviewed manually: restore only on session and draft epoch; adding bs would reread the draft on every backend snapshot change, overwriting in-progress input
       }, [activeSessionId, draftEpoch, setInputText]);
+      const handleSelectMentionCandidate = useCallback((candidate) => {
+        if (!candidate || !sessionMentionEnabled) return;
+        // A rejected pick (duplicate, isolated prefix, or over the cap) stays
+        // a no-op: the typed @query is only consumed when the chip lands.
+        if (dedupeSessionRefs([...sessionRefs, candidate]).length <= sessionRefs.length) return;
+        setSessionRefs(current => dedupeSessionRefs([...current, candidate]));
+        setMentionDismissedToken(null);
+        setInputText((current) => {
+          const trigger = sessionMentionTriggerAt(current);
+          return trigger ? current.slice(0, trigger.start) : current;
+        });
+        window.requestAnimationFrame(() => {
+          if (composerRef.current) {
+            composerRef.current.focus();
+            composerRef.current.selectionStart = composerRef.current.value.length;
+            composerRef.current.selectionEnd = composerRef.current.value.length;
+          }
+        });
+      }, [sessionMentionEnabled, sessionRefs, setInputText]);
       const voiceInput = (bs && bs.voiceInput) || { status: 'idle' };
       const voiceMode = normalizeVoiceMode(voiceInput.mode);
       const voiceActive = isVoiceActive(voiceInput);
       const voiceBusy = isVoiceBusy(voiceInput);
       const hasDraftText = inputText.trim().length > 0;
       const hasReadyAttachment = attachments.some(a => a.status === 'ready');
+      // With the feature off, unsent chips no longer make the composer sendable (the send path stops injecting the block too).
+      const hasSessionRefs = sessionMentionEnabled && sessionRefs.length > 0;
+      // Session mention: a trailing @token in the composer drives the candidate
+      // panel; after Escape the panel stays closed for the same token (a token
+      // change = the user kept typing, so the panel reappears).
+      // When the feature is off (§3.3 layer 1) the @ trigger yields no
+      // session group / candidates.
+      const mentionTrigger = sessionMentionTriggerAt(inputText, sessionMentionEnabled);
+      // Round-27 asto m8: the Escape dismissal is sticky per token; once the
+      // trigger itself is gone (a send cleared the composer, the text was
+      // deleted), retyping the identical @token is a fresh intent — reset the
+      // dismissal so the panel reopens instead of flickering closed.
+      const mentionTriggerToken = mentionTrigger ? mentionTrigger.token : null;
+      /* eslint-disable react-hooks/set-state-in-effect -- deliberate one-shot reset: the dismissal token is per-token sticky and only this effect observes the trigger's disappearance (send cleared the composer / text deleted), so the reset must run when that happens, not drift via render-time derivation */
+      useEffect(() => {
+        if (mentionTriggerToken === null && mentionDismissedToken !== null) {
+          setMentionDismissedToken(null);
+        }
+      }, [mentionTriggerToken, mentionDismissedToken]);
+      /* eslint-enable react-hooks/set-state-in-effect */
+      // At the ref cap the panel does not open at all: with candidates forced
+      // empty it would render a false "no matching sessions" instead of cap
+      // feedback.
+      const mentionMenuOpen = !!mentionTrigger && mentionTrigger.token !== mentionDismissedToken &&
+        sessionRefs.length < MAX_SESSION_REFS;
+      // At the ref cap the panel stays empty: a pick there could only be a
+      // silent no-op, so typing @ no longer opens it (the already-maxed chips
+      // strip stays the only feedback surface). Memoized (round-16 m6): the
+      // scan is O(sessions) and this render body re-runs on every streaming
+      // delta — keying on the inputs that actually affect it keeps the
+      // closed-panel cost at the trigger check instead of a full scan.
+      const mentionSessionSource = (bs && bs.sessions) || [];
+      const mentionExcludeKey = `${activeSessionId || ''}|${sessionRefs.map(ref => ref.sessionId).join(',')}`;
+      // Key on the PRIMITIVE token/query (round-18 m8): the trigger object
+      // is fresh per render, so keying on it defeated the memo whenever a
+      // trailing @token existed — exactly the streaming-delta path the memo
+      // exists to protect.
+      const mentionQueryKey = mentionTrigger ? `${mentionTrigger.token}::${mentionTrigger.query}` : '';
+      const mentionCandidates = useMemo(() => (
+        sessionRefs.length >= MAX_SESSION_REFS ? [] : filterSessionMentionCandidates(mentionSessionSource, {
+          query: mentionTrigger ? mentionTrigger.query : '',
+          excludeIds: [activeSessionId, ...sessionRefs.map(ref => ref.sessionId)].filter(Boolean),
+          limit: 8,
+        })
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- the exclude ids are keyed by their string form (a fresh array each render would defeat the memo); the session source is the bridge's structurally-shared snapshot
+      ), [mentionQueryKey, mentionSessionSource, mentionExcludeKey, sessionRefs.length]);
+      // Keyboard highlight: resets to 0 when the token changes (new trigger / kept typing); purely derived, no effect.
+      const mentionIndex = mentionSelection.token === (mentionTrigger && mentionTrigger.token)
+        ? Math.min(mentionSelection.index, Math.max(0, mentionCandidates.length - 1))
+        : 0;
+      const knownSessionMentionIds = useMemo(
+        // Archived sessions are still alive and openable (the card jumps to
+        // them; the switch does NOT auto-un-archive — that stays a manual
+        // sidebar action), so they count as known; only a truly deleted
+        // session renders the unavailable state.
+        () => new Set(
+          [...((bs && bs.sessions) || []), ...((bs && bs.archivedSessions) || [])]
+            .map(session => session.id),
+        ),
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- depends only on the session-list slices of the snapshot (stable references), not on other bs fields
+        [bs && bs.sessions, bs && bs.archivedSessions],
+      );
       const firstTurnPending = !activeSessionId && chatItems.some(item => (
         item && item.type === 'user' && !!item.deliveryState
       ));
       const canSend = !isMultiAgentReadOnly
         && !firstTurnPending
-        && (hasDraftText || hasReadyAttachment);
+        && (hasDraftText || hasReadyAttachment || hasSessionRefs);
       const sceneCapabilityPreparing = sceneCapabilityStatus && sceneCapabilityStatus.kind === 'preparing';
       // eslint-disable-next-line sonarjs/cognitive-complexity -- scene-capability preflight and send orchestration are cohesive in a single callback; split refactor tracked separately
-      const sendChatMessage = useCallback(async (text) => {
+      const dispatchChatMessage = useCallback(async (text, voiceMeta, voiceOwner) => {
         if (!bridge.available) return false;
+        // Round-29 m8 (review #455): this flow awaits IPC between status
+        // writes — a slow welcome enable settling after a session switch
+        // must not render its banner (or ready toast) on the wrong
+        // session's composer. Capture the session at send start and let
+        // only same-session writes through; the switch effect clears the
+        // slot outright. Round-31 m5: the key is the FULL session identity
+        // (`session:draftEpoch`, the exact key the welcome-card reset
+        // builds) — drafts are both `null` for activeSessionId, so a send
+        // in flight from draft D1 could otherwise still paint into fresh
+        // draft D2 (a new-chat click bumps the epoch while the session id
+        // stays null→null).
+        const sceneStatusSession = sceneStatusKey(activeSessionIdRef.current, draftEpochRef.current);
+        const sceneStatusKeyNow = () =>
+          sceneStatusKey(activeSessionIdRef.current, draftEpochRef.current);
+        const setSceneStatusForSession = (status) => {
+          if (sceneStatusKeyNow() === sceneStatusSession) {
+            setSceneCapabilityStatus(status);
+          }
+        };
+        // Both welcome-card send paths (sample-question click / free input)
+        // complete the opt-in here (review #455 R8-2; logic extracted into
+        // welcome-optin.js for direct testing): failure must not block the
+        // send but must stay fail-visible — banner notice + console trace
+        // (review #455 R9-M4); the tool's absence is likewise visible in the reply.
+        const welcomeOptIn = await runSharedWelcomeOptIn(welcomeOptInAttemptRef, {
+          toolId: welcomeToolIdRef.current,
+          run: () => consumeWelcomeOptIn({
+            getToolId: () => welcomeToolIdRef.current,
+            consume: () => {
+              welcomeToolIdRef.current = null;
+              setWelcomeToolId(null);
+            },
+            invoke: invokeTauri,
+          }),
+        });
+        if (welcomeOptIn.failed) {
+          console.warn("[pinvou3][chat-ui] welcome-card opt-in failed:", welcomeOptIn.error);
+        }
+        if (welcomeOptIn.blocked && welcomeOptIn.blocked.length) {
+          // The welcome pack was explicitly switched off by the user: abort the
+          // send with guidance (same contract as the scene blocked path,
+          // round-10 Major 2) instead of sending a reply without the tool.
+          setSceneStatusForSession({
+            kind: 'error',
+            text: t.uiChatScenes.switchedOffPacks(welcomeOptIn.blocked.join(', ')),
+          });
+          return false;
+        }
         const outgoing = String(text || '').trim();
-        const matchedPersonalWorkbenchDraft = findPersonalWorkbenchTemplateDraft(outgoing);
+        // The mention injection block is a machine contract, not user body
+        // text: scene template auto-detection (a startsWith match) and the
+        // scene meta embedding run on the stripped body. The block itself is
+        // re-prepended onto pinvouPayloadText below, so a scene send keeps
+        // the read_session contract at the head of the model payload instead
+        // of sandwiching it inside the scene boilerplate.
+        const mentionSplit = splitSessionMentionBlock(outgoing);
+        const sceneBody = mentionSplit.text.trim();
+        const matchedPersonalWorkbenchDraft = findPersonalWorkbenchTemplateDraft(sceneBody);
         const templateId = personalWorkbenchTemplateIdRef.current
           || (matchedPersonalWorkbenchDraft && matchedPersonalWorkbenchDraft.template
             ? matchedPersonalWorkbenchDraft.template.id
@@ -1561,49 +2312,116 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         const visibleOutgoing = outgoing;
         let meta;
         if (visibleOutgoing || hasReadyAttachment) {
-          const scenePrompt = outgoing || t.uiChatScenes.attachmentPrompt;
+          const scenePrompt = sceneBody || t.uiChatScenes.attachmentPrompt;
           if (visualPosterSceneActive) meta = createVisualPosterMessageMeta(scenePrompt);
           else if (documentWritingSceneActive) meta = createDocumentWritingMessageMeta(scenePrompt);
           else if (personalWorkbenchSceneActive) meta = createPersonalWorkbenchMessageMeta(scenePrompt, templateId);
           else if (dataVisualizationSceneActive) meta = createDataVisualizationMessageMeta(scenePrompt);
           else if (pptDesignSceneActive) meta = createPptDesignMessageMeta(scenePrompt);
+          // Same §3.3 layer-2 gate as the other send paths: with the feature
+          // off, a hand-pasted byte-valid block in a scene send is plain text —
+          // it must not be re-canonicalized onto the payload head (round-9 M1).
+          if (sessionMentionEnabled && meta && meta.pinvouPayloadText && mentionSplit.refs.length) {
+            meta = {
+              ...meta,
+              // dedupe + cap: a hand-forged block in history can carry far more
+              // refs than the composer allows into a live chip strip.
+              pinvouPayloadText: buildSessionMentionBlock(dedupeSessionRefs(mentionSplit.refs)) + meta.pinvouPayloadText,
+            };
+          }
         }
+        // The voice task lane hands its operation id in alongside the text; it
+        // must ride on meta or the bridge's submission gate never sees it and
+        // a dispatched send can never settle its operation as accepted.
+        if (voiceMeta && voiceMeta.voiceOperationId != null) meta = Object.assign({}, meta, voiceMeta);
         const requirements = requiredCapabilitiesForMeta(meta);
+        // The scene block resolves its status into a local; the single
+        // setSceneCapabilityStatus below combines it with the welcome opt-in
+        // result — an earlier welcome-error set would be batched away by any
+        // later synchronous set in the same run (round-10 Major 1).
+        let sceneStatus = null;
+        let readyAutoClear = false;
         if (requirements) {
           const sceneCopy = t.uiChatScenes[requirements.key];
           if (canPrepareSceneCapabilities({ isWebHost: isWeb, dependencyInstallAvailable: can('dependencyInstall') })) {
-            setSceneCapabilityStatus({ kind: 'preparing', text: sceneCopy.preparing });
+            setSceneStatusForSession({ kind: 'preparing', text: sceneCopy.preparing });
             try {
               const prepared = await prepareSceneCapabilities(meta, invokeTauri);
               if (!prepared.ok) {
-                const missing = prepared.missing && prepared.missing.length
-                  ? t.uiChatScenes.missingCapabilities(prepared.missing.join(', '))
-                  : '';
-                throw new Error(missing || sceneCopy.failure);
+                // Round-11 m8: the banner carries translated copy only — raw
+                // backend/IPC error strings are diagnostics, traced to the
+                // console instead of rendered untranslated to the user.
+                if (prepared.error) {
+                  console.warn('[pinvou3][chat-ui] scene capability prepare failed:', prepared.error);
+                }
+                // Round-16 minor 13: notApplied (installed but matched no
+                // expansion entry) gets its own retry-inviting copy — the
+                // missingCapabilities branch would invite a reinstall that
+                // cannot help.
+                const detail = prepared.blocked && prepared.blocked.length
+                  ? t.uiChatScenes.switchedOffPacks(prepared.blocked.join(', '))
+                  : (prepared.notApplied && prepared.notApplied.length
+                    ? t.uiChatScenes.notAppliedPacks(prepared.notApplied.join(', '))
+                    : (prepared.missing && prepared.missing.length
+                      ? t.uiChatScenes.missingCapabilities(prepared.missing.join(', '))
+                      : ''));
+                // Round-13 m2: the welcome card is one-shot — if its opt-in
+                // failed, a later resend never re-attempts it, so the welcome
+                // failure must win over the scene failure copy here (the
+                // scene preflight re-runs and resurfaces on the next send;
+                // the welcome failure otherwise never surfaces at all).
+                setSceneStatusForSession({
+                  kind: 'error',
+                  text: welcomeOptIn.failed
+                    ? t.uiChat.welcomeOptInFailed
+                    : (detail || sceneCopy.failure),
+                });
+                return false;
               }
-              // 自动安装与自动就地开启（隐藏/禁用 → 可用）都是对用户治理状态
-              // 的变更：必须给 ready 提示，不得静默改写。
-              if (prepared.installed || prepared.reEnabled) {
-                setSceneCapabilityStatus({ kind: 'ready', text: sceneCopy.ready });
-                window.setTimeout(() => setSceneCapabilityStatus((current) => (
-                  current && current.kind === 'ready' ? null : current
-                )), 1800);
-              } else {
-                setSceneCapabilityStatus(null);
+              // Post-DenyAll, ready means installed or explicitly opted back
+              // in: a pack gated off by default completes its opt-in here and
+              // gets the same enabled toast (#455 R5-B3).
+              if (prepared.installed || prepared.optedIn) {
+                sceneReadyToastEpochRef.current += 1;
+                sceneStatus = {
+                  kind: 'ready',
+                  text: sceneCopy.ready,
+                  toastEpoch: sceneReadyToastEpochRef.current,
+                };
+                readyAutoClear = true;
               }
+              // else: leave the local null — nothing to show.
             } catch (error) {
-              const message = error && error.message ? error.message : String(error || '');
-              setSceneCapabilityStatus({
+              // Unexpected invoke/transport failure: same rule (m8) — the raw
+              // error goes to the console, the banner gets translated copy.
+              // Round-13 m2: welcome failure wins here too (same rationale as
+              // the prepared-not-ok branch above).
+              console.warn('[pinvou3][chat-ui] scene capability prepare raised:', error);
+              setSceneStatusForSession({
                 kind: 'error',
-                text: message ? `${sceneCopy.failure} ${message}` : sceneCopy.failure,
+                text: welcomeOptIn.failed
+                  ? t.uiChat.welcomeOptInFailed
+                  : sceneCopy.failure,
               });
               return false;
             }
-          } else {
-            setSceneCapabilityStatus(null);
           }
-        } else {
-          setSceneCapabilityStatus(null);
+        }
+        setSceneStatusForSession(resolveSendCapabilityStatus({
+          welcomeFailed: welcomeOptIn.failed,
+          welcomeText: t.uiChat.welcomeOptInFailed,
+          sceneStatus,
+        }));
+        if (readyAutoClear) {
+          // The session guard inside the timeout keeps this stale closer
+          // from clearing a NEWER session's fresh ready toast.
+          window.setTimeout(() => setSceneCapabilityStatus((current) => (
+            current && current.kind === 'ready'
+              && current.toastEpoch === sceneStatus.toastEpoch
+              && sceneStatusKeyNow() === sceneStatusSession
+              ? null
+              : current
+          )), 1800);
         }
         if (!activeSessionId) {
           pendingModeScopeMigrationRef.current = {
@@ -1611,12 +2429,37 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             state: pinvouModeStateRef.current,
           };
         }
+        // Capability preparation can outlive the originating voice composer.
+        // Do not let the bridge resolve its current active session as our owner.
+        if (voiceOwner && ((activeSessionIdRef.current || null) !== voiceOwner.sessionId
+          || (!voiceOwner.sessionId && Number(draftEpochRef.current || 0) !== voiceOwner.draftEpoch))) {
+          // Mirror the catch path: a refused dispatch must not leave the
+          // stale mode-scope migration payload installed for a later session.
+          pendingModeScopeMigrationRef.current = null;
+          return false;
+        }
         let dispatchResult;
+        // Round-25 asto MAJOR 1: on the plain (non-scene, non-voice) lane `meta`
+        // is still undefined here — the scene branches above are its only
+        // assignments and the voice merge never fires with a null operation id
+        // — so the bridge's materialization report had nowhere to land and the
+        // round-24 closure leg was dead code on the default send path. Always
+        // hand the bridge a real out-param object.
+        meta = meta || {};
         try {
-          dispatchResult = await bridge.chat.sendMessage(visibleOutgoing, meta);
+          dispatchResult = await bridge.chat.sendMessage(visibleOutgoing, meta, voiceOwner);
         } catch (error) {
           pendingModeScopeMigrationRef.current = null;
           throw error;
+        } finally {
+          // Round-24 MAJOR: the bridge reports a committed draft materialization
+          // on the meta object it received (out-param); meta here is built
+          // locally, so hand the report back on the caller-owned object the
+          // send closure holds — it records the ledger mapping the scope
+          // effect would have recorded had the view stayed mounted.
+          if (meta.materializedSessionId && voiceMeta) {
+            voiceMeta.materializedSessionId = meta.materializedSessionId;
+          }
         }
         // sendMessage resolves true only when something was actually
         // dispatched (sent / steered / queued). false marks notice-only early
@@ -1626,9 +2469,103 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         // empty-vs-typed restore instead of silently dropping the draft
         // (#406). "restored" marks paths that already returned the text to the
         // composer (first-turn materialization abort, session switch);
-        // restoring again would duplicate it.
-        return dispatchResult !== false;
-      }, [activeSessionId, dataVisualizationSceneActive, documentWritingSceneActive, hasReadyAttachment, personalWorkbenchSceneActive, pptDesignSceneActive, t, visualPosterSceneActive]);
+        // restoring again would duplicate it. The three-state value is kept
+        // as-is: the voice task lane needs to tell "restored" apart from
+        // accepted, while ordinary sends treat both as not-false.
+        return dispatchResult;
+      }, [activeSessionId, dataVisualizationSceneActive, documentWritingSceneActive, hasReadyAttachment, personalWorkbenchSceneActive, pptDesignSceneActive, sessionMentionEnabled, t, visualPosterSceneActive]);
+
+      const sendChatMessage = useCallback(async (text, voiceContext) => {
+        const operationId = voiceContext?.operationId
+          || (bridge.voice?.getVoiceOperationId
+            ? bridge.voice.getVoiceOperationId(activeSessionId || null, 'chat')
+            : null);
+        if (operationId && bridge.voice?.beginVoiceSubmission) bridge.voice.beginVoiceSubmission(operationId);
+        // Caller-owned out-param plus the dispatch-time scope key: the
+        // recording below is the unmount-proof leg of the materialization
+        // ledger (round-24 MAJOR) — this closure outlives the view.
+        const meta = { voiceOperationId: operationId };
+        const draftKeyAtDispatch = mentionDraftKeyRef.current;
+        try {
+          const dispatched = await dispatchChatMessage(text, meta, voiceContext?.draftOwner);
+          recordSendMaterialization(draftKeyAtDispatch, meta);
+          // Round-25 asto MAJOR 3: "restored" after a COMMITTED materialization
+          // (the textful abandonToOwnSession window during the attachment-
+          // adoption await) hands the text to the materialized session's
+          // buffer — the draft epoch is dead, so the chips must route through
+          // the ledger like any real-materialization non-dispatch instead of
+          // staying on the restored arm's dead draft key. The meta report
+          // distinguishes this from the aborted-materialization "restored"
+          // (draft still alive, mapping provisional, must be cleared).
+          const accepted = dispatched === 'restored' && meta.materializedSessionId
+            ? 'restored-materialized' : dispatched;
+          if ([false, 'restored', 'restored-materialized'].includes(accepted) && operationId
+            && bridge.voice?.completeVoiceSubmission) {
+            bridge.voice.completeVoiceSubmission(operationId, null, false);
+          }
+          // Preserve "restored"/"restored-materialized": ordinary sends must
+          // not restore the text again (the bridge already placed it), while
+          // voice task delivery must treat both as not accepted.
+          return accepted;
+        } catch (error) {
+          recordSendMaterialization(draftKeyAtDispatch, meta);
+          if (operationId && bridge.voice?.completeVoiceSubmission) {
+            bridge.voice.completeVoiceSubmission(operationId, null, false);
+          }
+          throw error;
+        }
+      }, [activeSessionId, dispatchChatMessage]);
+      // Single-sourced verdict/ledger tail for every send lane (round-19
+      // M3): rounds 12-18 fixed this logic four times in four copies — this
+      // is the one place the acceptance/failure semantics live now. The
+      // lanes keep only their own glue (text restore, voice ownership,
+      // registration of the in-flight draft key). The factory is
+      // module-scope so the behavioral tests execute the same code.
+      const settleSessionRefSend = useMemo(() => makeSettleSessionRefSend({
+        mentionDraftKeyRef,
+        sessionMentionEnabledRef,
+        setSessionRefs,
+      }), [setSessionRefs]);
+      // Secondary send surfaces (welcome-card queries, plan-card option
+      // answers) share the composer's mention semantics: picked refs ride the
+      // message as the prepended injection block and are consumed once the
+      // send is truly accepted — otherwise refs picked before such a send
+      // would go out unreferenced yet stay armed for the next plain composer
+      // send (the same bug class the design lane fixed). Never rejects: the
+      // bridge surfaces failures itself (notice + restore).
+      const sendWithSessionRefs = useCallback((text) => {
+        const body = String(text || '');
+        const refsAtSend = sessionMentionEnabled ? sessionRefs : [];
+        const mentionBlock = refsAtSend.length ? buildSessionMentionBlock(refsAtSend) : '';
+        const outgoingText = mentionBlock ? mentionBlock + body : body;
+        const draftKeyAtSend = mentionDraftKeyRef.current;
+        // Clear at dispatch, not post-await — the same two protections
+        // handleSend has (round-12 R4): an unmount mid-send must not let the
+        // scope cleanup stash the still-armed refs whose block already went
+        // out (they would resurrect onto the next unrelated composer send),
+        // and canSend staying true via hasSessionRefs must not re-dispatch
+        // the same armed refs as a duplicate queued message.
+        if (refsAtSend.length) setSessionRefs([]);
+        if (draftKeyAtSend.startsWith('draft:')) mentionPendingDraftSendsRef.current.add(draftKeyAtSend);
+        const settlePendingDraftSend = () => {
+          mentionPendingDraftSendsRef.current.delete(draftKeyAtSend);
+        };
+        // The verdict/ledger tail lives in the shared settle helper
+        // (round-19 M3): acceptance consumes exactly the serialized set,
+        // failure/"restored" re-scope through the materialization ledger
+        // (an aborted materialization also rolls the mid-await carry back
+        // into the draft). Never rejects.
+        return Promise.resolve(sendChatMessage(outgoingText)).then((accepted) => {
+          settleSessionRefSend(refsAtSend, draftKeyAtSend, accepted);
+          settlePendingDraftSend();
+          return accepted;
+        }, (error) => {
+          console.warn('[pinvou3][chat-ui] referenced send failed', error);
+          settleSessionRefSend(refsAtSend, draftKeyAtSend);
+          settlePendingDraftSend();
+          return false;
+        });
+      }, [sessionMentionEnabled, sessionRefs, sendChatMessage, settleSessionRefSend]);
       // ConversationTimeline render-callback stabilization: ConversationTurn is React.memoized, so a
       // per-render callback identity would make every turn fully re-render each time. Callbacks only
       // rebuild identity when their inputs change; the latestArtifactIds Set is a fresh reference on
@@ -1637,6 +2574,9 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       // which point the ref already points at the committed projection result).
       const latestArtifactIdsRef = useRef(latestArtifactIds);
       latestArtifactIdsRef.current = latestArtifactIds;
+      // Detached windows intentionally own one view and pass no switcher —
+      // a null onOpenSessionMention renders the cards' non-interactive state
+      // instead of an announced button that does nothing (round-14 minor 2).
       const handleTimelineRenderUser = useCallback((item) => (
         <ChatBubble
           item={item}
@@ -1645,8 +2585,11 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           t={t}
           editable={!busy && !isMultiAgentReadOnly && item.id === lastUserId}
           conversationVariant="unified"
+          onOpenSessionMention={onSwitchSession ? handleOpenMentionSession : null}
+          knownSessionMentionIds={knownSessionMentionIds}
+          sessionMentionDisabled={!sessionMentionEnabled}
         />
-      ), [activeSessionId, busy, isMultiAgentReadOnly, lastUserId, t, theme]);
+      ), [activeSessionId, busy, handleOpenMentionSession, isMultiAgentReadOnly, knownSessionMentionIds, lastUserId, onSwitchSession, sessionMentionEnabled, t, theme]);
       const handleTimelineRenderItem = useCallback((item) => {
         // reasoning items are handled by ConversationTimeline's ReasoningItem and must not be handed to
         // the legacy ChatBubble; the latter does not know the type and would return null, silently
@@ -1660,7 +2603,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             theme={theme}
             t={t}
             onPrefill={setInputText}
-            onSend={sendChatMessage}
+            onSend={sendWithSessionRefs}
             onOpenEditor={onOpenEditor}
             onPlanStuckGo={handlePlanStuckGo}
             isLatestArtifact={latestArtifactIdsRef.current.has(item.legacyItem.id)}
@@ -1668,7 +2611,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           />
         );
       // eslint-disable-next-line react-hooks/exhaustive-deps -- latestArtifactIdsKey is an intentional extra dep: a content-keyed proxy for the artifact-id Set (read fresh via latestArtifactIdsRef) so the callback identity only changes when the set contents change
-      }, [activeSessionId, isScheduledTaskCreationChat, latestArtifactIdsKey, onOpenEditor, sendChatMessage, setInputText, t, theme, handlePlanStuckGo]);
+      }, [activeSessionId, isScheduledTaskCreationChat, latestArtifactIdsKey, onOpenEditor, sendWithSessionRefs, setInputText, t, theme, handlePlanStuckGo]);
       const handleTimelineRenderToolItem = useCallback((item) => (item.legacyItem
         && !isSearchTool(item.tool)
         && !isFetchTool(item.tool)
@@ -1679,6 +2622,13 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             variant="timeline"
           />
         : undefined), [activeSessionId, t]);
+      const retryLastTurn = useCallback((turn) => {
+        // Regenerate: re-send the last user turn verbatim. The timeline only
+        // hands us the newest turn; skip while a reply is streaming.
+        if (!busy && turn && turn.userText && bridge.available) {
+          bridge.interaction.editLastTurn(turn.userText);
+        }
+      }, [busy]);
       const timelineAssistantAvatar = useMemo(() => (
         <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center">
           <PinvouLogo className="h-5 w-5" title={chatViewCopy.agentName} />
@@ -1694,9 +2644,15 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         const scopedText = selectedDesignElement
           ? chatViewCopy.designAdjustSelected(elementLabel || chatViewCopy.designElementFallback, raw)
           : raw;
-        sendChatMessage(scopedText);
+        // The design lane IS the secondary sender (round-19 M3): its former
+        // hand-maintained copy of the dispatch/settle tail differed from
+        // sendWithSessionRefs only in a variable name, an await, and a warn
+        // tag — every fix wave had to be applied twice and drifted once.
+        // Delegating keeps one source; failures inside the sender never
+        // reject (its rejection arm resolves false).
+        void sendWithSessionRefs(scopedText);
       // eslint-disable-next-line react-hooks/exhaustive-deps -- deps reviewed manually: chatViewCopy only participates in copy concatenation; adding it would just rebuild the callback frequently
-      }, [selectedDesignElement, sendChatMessage]);
+      }, [selectedDesignElement, sendWithSessionRefs]);
       const primaryVoiceDisabled = !bridge.available || voiceBusy;
       const voiceAsrSetup = (bs && bs.voiceAsrSetup) || { open: false };
       const voiceAsrSetupPublicationReady = useRightDockOcclusion(
@@ -1743,22 +2699,46 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       // via useOutsidePointerClose (passed in via onCloseAsrPopover); the view no longer
       // attaches duplicate listeners.
       useEffect(() => {
-        const sessionKey = `${activeSessionId || 'draft'}:${draftEpoch}`;
+        const sessionKey = sceneStatusKey(activeSessionId, draftEpoch);
         if (justInstalledTool) {
           // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot apply of the welcome-card state after tool install
           setWelcomeToolId(justInstalledTool);
+          welcomeToolIdRef.current = justInstalledTool;
           welcomeSessionKeyRef.current = sessionKey;
           if (setJustInstalledTool) setJustInstalledTool(null);
         } else if (welcomeSessionKeyRef.current && welcomeSessionKeyRef.current !== sessionKey) {
           setWelcomeToolId(null);
+          welcomeToolIdRef.current = null;
           welcomeSessionKeyRef.current = null;
+          // Round-2 review: drop any in-flight opt-in attempt slot from the
+          // previous session — a send in a new card-less session must never
+          // join it (it would inherit the previous pack's failure banner).
+          welcomeOptInAttemptRef.current = null;
         }
-        // justInstalledTool 故意不放进依赖:否则上面 setJustInstalledTool(null) 清掉它会二次触发
-        // 本 effect → 这次走 else 把刚显示的欢迎卡又清空(表现为"装完工具欢迎卡一闪即消失")。
-        // 依赖 activeSessionId(切会话)+ draftEpoch(每次点「新建对话」自增):后者保证即便已在草稿态
-        // 再点「新建对话」(activeSessionId 不变 null→null)也能重新求值,否则残留工具卡顶掉「你好」。
+        // justInstalledTool stays in the deps (a one-shot directive; parent
+        // rerenders do not retrigger: the effect clears it immediately via
+        // setJustInstalledTool(null), and re-entry takes the else branch, which
+        // only clears the card on session-key change). Deps: activeSessionId
+        // (session switch) + draftEpoch (incremented per "New chat" click) — the
+        // latter forces re-evaluation even when "New chat" is clicked again
+        // while already in draft state (activeSessionId stays null→null);
+        // otherwise a leftover tool card would displace the "Hello" greeting.
       // eslint-disable-next-line react-hooks/exhaustive-deps -- deps reviewed manually: setJustInstalledTool is a parent one-shot directive callback; adding it would retrigger clearing on parent rerenders
       }, [justInstalledTool, activeSessionId, draftEpoch]);
+
+      // Round-29 m8 + round-30 m8 (review #455): clear the per-send
+      // scene-capability banner/toast on session switch AND on "New chat"
+      // while already in draft (draftEpoch increments on the click while
+      // activeSessionId stays null→null — the exact case the welcome-card
+      // reset above documents), so a settled banner never bleeds into the
+      // next conversation or the fresh draft. Async writers are additionally
+      // suppressed by their send-start session guard inside sendChatMessage
+      // (a slow welcome enable settling after the switch would otherwise
+      // re-render here).
+      useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronously clear the per-send banner/toast when the session or draft epoch changes (same reset family as the design-element and back-to-bottom resets)
+        setSceneCapabilityStatus(null);
+      }, [activeSessionId, draftEpoch]);
 
 
       // chip 显示当前会话绑定的模型:切会话/草稿时刷新 currentSessionModelId
@@ -1944,6 +2924,61 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         }
         return true;
       }
+      // Recents channel (§9.9 folder-channel parity): picking a recent
+      // directory is the same explicit folder choice as the picker's browse
+      // channel, so it goes through the same ensure (anchor reuse /
+      // materialize) and stages the anchored project id — without it the
+      // session has no tier-1 assignment and tier-2 nested grouping adopts it
+      // into a broader project whose root covers the folder (e.g. a
+      // Desktop-rooted project), the "group only on an exact primary-root
+      // match" regression.
+      async function handleSelectRecentWorkspace(path) {
+        if (!path) { bridge.sessions.setDraftWorkspace(null); return; }
+        if (bridge.projects && typeof bridge.projects.ensureFolderProjects === 'function') {
+          let interpreted;
+          try {
+            interpreted = interpretFolderEnsureOutcomes(await bridge.projects.ensureFolderProjects([path]));
+          } catch (error) {
+            // IPC-level failure: same promise as the browse channel — the
+            // conversation still starts at the picked folder, as a plain one.
+            console.warn('ensure folder project failed', error);
+            if (bridge.sessions.setDraftWorkspace(path) === false) {
+              // The staging no-op rides an IPC failure; keep the original as
+              // the cause instead of discarding it (preserve-caught-error).
+              throw new Error(t.uiProjects.opFailed, { cause: error });
+            }
+            return;
+          }
+          if (!interpreted.materialized && interpreted.failed) {
+            // A backend refusal (nesting conflict etc.) is not the exclusion
+            // list: staging a plain folder would let tier-2 adopt it into a
+            // broader project. Surface the failure (selector pickError) and
+            // do not stage.
+            throw new Error(t.uiProjects.opFailed);
+          }
+          // Excluded folders (no outcome) stage plain with projectId null.
+          // The boolean return is honored on every staging site (review #484
+          // round-10 m12): false = an active session owns the composer and
+          // nothing was staged — surfacing beats a silently ignored pick.
+          if (bridge.sessions.setDraftWorkspace(path, { projectId: interpreted.projectId, workspaceRoots: [path] }) === false) {
+            throw new Error(t.uiProjects.opFailed);
+          }
+          return;
+        }
+        if (bridge.sessions.setDraftWorkspace(path) === false) {
+          throw new Error(t.uiProjects.opFailed);
+        }
+      }
+      // Grant-notice mode for the chat lane's workspace surfaces (review #484
+      // round-11 M6): the notice must describe the posture the draft takes
+      // ONCE the pick binds it — the bridge resolves a bound draft to the
+      // code lane's default (fallback plan), matching the composer chip that
+      // flips to exactly that mode when the pick lands. The snapshot still
+      // shows the unbound draft's mode at notice time. Older hosts without
+      // the query keep the previous snapshot read.
+      // round-47 M5: the resolver body lives in features/chat/bound-draft-mode.js
+      // (shared with main.jsx's chatLaneGrantMode) — one body, no drift twin.
+      const boundDraftNoticeMode = () => boundDraftNoticeModeOf(bridge, bs);
       async function handleModeChipSwitch(target, { isPlan }) {
         if (!bridge.available || !bridge.interaction) return;
         if (target === 'plan' && !isPlan) {
@@ -2069,6 +3104,14 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           return;
         }
         const text = constrained.text;
+        // Mention chips serialize into a prepended injection block (sessionId +
+        // title + contract only, no contents). Chips survive until the send is
+        // truly accepted — on failure / non-dispatch the text is restored and
+        // the chips naturally stay. When the feature is off
+        // (docs/builtin-toolset-contract.md §3.3 layer 2) the block is not sent;
+        // blocks already present in history are untouched.
+        const mentionBlock = sessionMentionEnabled ? buildSessionMentionBlock(sessionRefs) : '';
+        const outgoingText = mentionBlock ? mentionBlock + text : text;
         // Clear the composer the moment the button is clicked (before the
         // await returns); on failure (reserve conflict etc.) or a notice-only
         // not-dispatched resolution (attachments still parsing, remote-turn
@@ -2082,13 +3125,34 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         // append-style prefill (newline separator, re-review #4) that does not
         // interrupt typing.
         setInputText('');
+        // Refs-only double-send race (round-8 M5): canSend stays true through
+        // the send await via hasSessionRefs, so a second Enter inside the
+        // window re-dispatched the same refs as a second, body-empty message.
+        // Clear the chips at dispatch, not post-await; non-acceptance puts the
+        // snapshot back (merged with any chips picked meanwhile). This also
+        // fixes the unmount-mid-send resurrect (round-8 minor 2): the scope
+        // cleanup stashes the post-dispatch (empty) refs instead of the
+        // pre-send ones whose block already went out.
+        const refsAtSend = sessionMentionEnabled ? sessionRefs : [];
+        if (refsAtSend.length) setSessionRefs([]);
+        // Scope guard for the chip restore below: switching sessions mid-send
+        // must not wipe the target scope's freshly picked chips.
+        const draftKeyAtSend = mentionDraftKeyRef.current;
+        if (draftKeyAtSend.startsWith('draft:')) mentionPendingDraftSendsRef.current.add(draftKeyAtSend);
+        // The verdict/ledger tail lives in the shared settle helper
+        // (round-19 M3); this lane keeps only its text-restore glue.
         try {
-          const accepted = await sendChatMessage(text);
+          const accepted = await sendChatMessage(outgoingText);
+          settleSessionRefSend(refsAtSend, draftKeyAtSend, accepted);
           if (!accepted) {
             if (inputTextRef.current === '') setInputText(text);
             else if (text) bridge.chat.prefillComposer(text, true);
           }
         } catch (error) {
+          // A throw is a post-dispatch failure (the aborted-materialization
+          // outcome resolves "restored", never throws), so the provisional
+          // ledger entry stands.
+          settleSessionRefSend(refsAtSend, draftKeyAtSend);
           if (inputTextRef.current === '') setInputText(text);
           else if (text) bridge.chat.prefillComposer(text, true);
           // Swallow here: the bridge already surfaced the failure (notice +
@@ -2096,6 +3160,8 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           // no catch of their own — a rethrow would only produce an
           // unhandledrejection next to the visible recovery.
           console.warn("[pinvou3][chat-ui] send failed", error);
+        } finally {
+          mentionPendingDraftSendsRef.current.delete(draftKeyAtSend);
         }
         personalWorkbenchTemplateIdRef.current = null;
         setPersonalWorkbenchTemplateId(null);
@@ -2168,13 +3234,20 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         const editSessionId = activeSessionId;
         if (!editSessionId) return;
         const nextText = String(queuedEdit.text || '').trim();
-        if (!nextText && !(item.attachments || []).length) {
+        const mentionRefs = Array.isArray(queuedEdit.mentionRefs) ? queuedEdit.mentionRefs : [];
+        if (!nextText && !mentionRefs.length && !(item.attachments || []).length) {
           flashQueuedNotice(editSessionId, { queuedId: item.id, text: t.queuedEmpty });
           return;
         }
         if (!bridge.chat || typeof bridge.chat.editQueued !== 'function') return;
+        // Rebuild the injection block from the refs parsed when the edit
+        // started (same edit-resend gate as UserBubble.commit: with the
+        // feature off only the body is saved, the block is never re-injected).
+        const outgoing = sessionMentionEnabled && mentionRefs.length
+          ? buildSessionMentionBlock(mentionRefs) + nextText
+          : nextText;
         const completed = await runQueuedAction(item.id, () => (
-          bridge.chat.editQueued(editSessionId, item.id, nextText)
+          bridge.chat.editQueued(editSessionId, item.id, outgoing)
         ));
         if (completed) {
           setQueuedEdits(current => {
@@ -2196,6 +3269,45 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           if (isPlainEnter(e)) {
             e.preventDefault();
             chatVoice.applyVoiceEditPreview({ send: e.ctrlKey || e.metaKey });
+            return;
+          }
+        }
+        if (mentionMenuOpen) {
+          // IME composition (a CJK IME candidate window uses ArrowUp/ArrowDown/
+          // Escape/Tab itself): those keys belong to the IME, so bail out before
+          // any preventDefault — Enter is already covered by isPlainEnter.
+          if (isImeComposing(e)) return;
+          // Caret/panel desync (round-26 asto m6): the panel is text-derived
+          // and can stay visibly open after the caret moved out of the
+          // trailing token — sending the literal `hello @se` with the
+          // candidate list on screen reads as a misfire. Consume the Enter to
+          // dismiss the panel first; the next Enter sends.
+          if (isPlainEnter(e) && !mentionCaretInTriggerToken(composerRef, mentionTrigger)) {
+            e.preventDefault();
+            setMentionDismissedToken(mentionTrigger.token);
+            return;
+          }
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            const count = mentionCandidates.length;
+            if (count > 0) {
+              const delta = e.key === 'ArrowDown' ? 1 : -1;
+              setMentionSelection({
+                token: mentionTrigger.token,
+                index: (mentionIndex + delta + count) % count,
+              });
+            }
+            return;
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            setMentionDismissedToken(mentionTrigger.token);
+            return;
+          }
+          if ((isPlainEnter(e) || e.key === 'Tab') && mentionCandidates.length > 0
+            && mentionCaretInTriggerToken(composerRef, mentionTrigger)) {
+            e.preventDefault();
+            handleSelectMentionCandidate(mentionCandidates[mentionIndex] || mentionCandidates[0]);
             return;
           }
         }
@@ -2254,7 +3366,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           pendingVoiceAfterIntroRef.current = null;
           return requestVoiceShortcutIntroAfterAsr(context && context.mode);
         },
-        sendTask: async outgoing => {
+        sendTask: async (outgoing, context) => {
           // Direct voice task send passes the same length gate: on overflow, truncate and write
           // back into the input box without sending (same policy as handleSend).
           const constrained = constrainChatInput(outgoing);
@@ -2262,19 +3374,61 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             setInputText(constrained.text);
             return false;
           }
+          if (context?.diagnostic?.task_send_blocked) return false;
+          // Consume only the exact draft this task owns. The bridge's #406
+          // restored path may then append it once without duplicating writeback.
+          if (inputTextRef.current !== constrained.text) return false;
+          const owner = {
+            sessionId: (activeSessionIdRef && activeSessionIdRef.current) || null,
+            draftEpoch: Number(draftEpoch || 0),
+            operationId: context?.operationId,
+            restored: false,
+          };
+          setInputText('');
+          // Same mention semantics as handleSend: picked refs serialize into
+          // the prepended injection block (suppressed when the feature is off)
+          // — a voice send must not drop refs the user explicitly picked. The
+          // chips clear at dispatch and go back on non-acceptance, mirroring
+          // handleSend's double-send/resurrect protections.
+          const refsAtSend = sessionMentionEnabled ? sessionRefs : [];
+          if (refsAtSend.length) setSessionRefs([]);
+          const mentionBlock = refsAtSend.length ? buildSessionMentionBlock(refsAtSend) : '';
+          const outgoingText = mentionBlock ? mentionBlock + constrained.text : constrained.text;
+          // Scope guard: a session switch during the await moves the draft key;
+          // the new scope's chips must not be wiped by this send's cleanup.
+          const draftKeyAtSend = mentionDraftKeyRef.current;
+          if (draftKeyAtSend.startsWith('draft:')) mentionPendingDraftSendsRef.current.add(draftKeyAtSend);
+          // The verdict/ledger tail lives in the shared settle helper
+          // (round-19 M3); this lane keeps its voice-ownership glue and
+          // passes the RAW result (before the "restored"→false mapping) so
+          // the aborted-materialization rollback can key on it.
           try {
-            return await sendChatMessage(constrained.text);
+            const result = await sendChatMessage(outgoingText, { ...context, draftOwner: owner });
+            if (result === true) {
+              // The composer was cleared before the await, so deliverVoiceTask's
+              // draftUntouched check can never fire onTaskAccepted; its one
+              // non-redundant duty — dropping the pinned personal-workbench
+              // template so the next send re-matches — moves here. Any text the
+              // user typed during the await is newer input and stays.
+              personalWorkbenchTemplateIdRef.current = null;
+              setPersonalWorkbenchTemplateId(null);
+            }
+            settleSessionRefSend(refsAtSend, draftKeyAtSend, result);
+            if (result === false && bridge.chat.restoreTaskDraft) {
+              bridge.chat.restoreTaskDraft(constrained.text, owner);
+            }
+            // Voice task delivery treats "restored" and "restored-materialized"
+            // as not accepted (the text is back somewhere, not sent); ordinary
+            // callers map them through to false.
+            return result === 'restored' || result === 'restored-materialized' ? false : result;
           } catch (error) {
+            settleSessionRefSend(refsAtSend, draftKeyAtSend);
+            if (bridge.chat.restoreTaskDraft) bridge.chat.restoreTaskDraft(constrained.text, owner);
             console.warn('[voice-input] task send failed after writeback', error);
             return false;
+          } finally {
+            mentionPendingDraftSendsRef.current.delete(draftKeyAtSend);
           }
-        },
-        onTaskAccepted: (sentText) => {
-          // The user may have typed new content during the await send window; clear only when
-          // the draft was not modified.
-          setInputText(prev => (prev === sentText ? '' : prev));
-          personalWorkbenchTemplateIdRef.current = null;
-          setPersonalWorkbenchTemplateId(null);
         },
       });
       const handleVoiceTrigger = chatVoice.triggerVoice;
@@ -2297,6 +3451,18 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
         return new Promise((resolve) => {
           voiceIntroResolveRef.current = resolve;
         });
+      }
+
+      // One-click draft clear: hidden while the composer is empty, disabled while a
+      // voice capture/rewrite is in flight or an edit rewrite preview is armed
+      // (clearing mid-capture would race the write-back; clearing with a pending
+      // preview would strand a stale card). Declared after the voice hook so the
+      // preview flag is in scope.
+      const canClearInput = hasDraftText && !voiceActive && !chatVoice.editPreview;
+      function handleClearInput() {
+        if (!canClearInput) return;
+        handleComposerInputChange('');
+        composerRef.current?.focus();
       }
 
       function resolveVoiceShortcutIntro(value) {
@@ -2365,27 +3531,39 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
       }
 
       function handleVoiceClose() {
-        chatVoice.closeVoice();
+        // Hiding the notice dismisses without ending the unsent operation
+        // (an in-flight recording still cancels); closeVoice would abandon it.
+        chatVoice.dismissVoice();
       }
 
       async function handlePaste(e) {
         if (isWeb) return;
         // WebKit-compatible image filtering + FileReader byte reads (incl. jpeg→jpg normalization) live in the shared module.
         const images = collectClipboardImages(e);
-        if (!images.length) return;
-        e.preventDefault();
-        for (const file of images) {
-          try {
-            const { bytes, ext } = await readPasteImageAsBytes(file);
-            if (bridge.available) {
-              bridge.attachments.addPasteImage(
-                `paste-${Date.now()}.${ext}`,
-                bytes,
-                formatAttachmentError,
-              );
-            }
-          } catch { /* A single failed read is silently dropped, as before; the rest of the pasted images proceed */ }
+        if (images.length) {
+          e.preventDefault();
+          for (const file of images) {
+            try {
+              const { bytes, ext } = await readPasteImageAsBytes(file);
+              if (bridge.available) {
+                bridge.attachments.addPasteImage(
+                  `paste-${Date.now()}.${ext}`,
+                  bytes,
+                  formatAttachmentError,
+                );
+              }
+            } catch { /* A single failed read is silently dropped, as before; the rest of the pasted images proceed */ }
+          }
+          return;
         }
+        // Linux WebKitGTK never exposes image clipboard data through the paste event
+        // (an image clipboard surfaces as an empty clipboardData, swallowing text too).
+        // Swallow that shape and let the native layer read the clipboard instead;
+        // text pastes keep their clipboardData and the default path stays untouched.
+        if (!pasteImageClipboardFallbackAvailable(bs && bs.platformCapabilities)) return;
+        if (!pasteEventNeedsClipboardFallback(e)) return;
+        e.preventDefault();
+        if (bridge.available) await bridge.attachments.addPasteImageFromClipboard(formatAttachmentError);
       }
 
       const responsiveGutterStyle = {
@@ -2442,6 +3620,31 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
               )}
             </div>
             <div className="flex items-center gap-2">
+              {activeSessionId && !activeSessionId.startsWith('sched-')
+                && !activeSessionId.toLowerCase().startsWith('agentic_')
+                && bridge.available && bridge.auxChat && (
+                <button
+                  type="button"
+                  data-testid="aux-chat-open"
+                  aria-label={t.uiAuxChat.openLabel}
+                  title={t.uiAuxChat.openLabel}
+                  onMouseEnter={() => prefetchChatPanel('auxChat')}
+                  onFocus={() => prefetchChatPanel('auxChat')}
+                  onClick={openAuxChatPanel}
+                  className={`pointer-events-auto flex h-10 shrink-0 items-center gap-2 rounded-full border px-3 text-[14px] font-medium shadow-sm transition-colors ${
+                    auxChatPanel && auxChatDockActive
+                      ? theme === 'dark'
+                        ? 'border-blue-400/30 bg-blue-500/15 text-blue-300'
+                        : 'border-blue-500/20 bg-blue-500/10 text-blue-600'
+                      : theme === 'dark'
+                        ? 'border-white/10 bg-[#1E1F20] text-[#E3E3E3] hover:bg-[#333537]'
+                        : 'border-black/10 bg-white text-[#1F1F1F] hover:bg-[#F0F4F9]'
+                  }`}
+                >
+                  <MessageSquare size={16} />
+                  <span className="max-sm:hidden">{t.uiAuxChat.openLabel}</span>
+                </button>
+              )}
               {activeSessionId && (
                 <RunningAgentsOverlay
                   sessionId={activeSessionId}
@@ -2474,6 +3677,10 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
           <div ref={scrollRef} data-testid="chat-scroll"
             style={{
               ...responsiveGutterStyle,
+              // Native scroll anchoring fights the virtualizer's absolute rows,
+              // but normal-flow timelines keep it so content-visibility estimate
+              // swaps stay compensated. Must match the timeline's own decision.
+              overflowAnchor: shouldVirtualizeConversationTurns(conversationProjection.turns.length, scrollRef) ? 'none' : undefined,
               ...(hasMessages ? {} : { paddingBottom: (composerH ? composerH + 48 : 160) + 'px' }),
             }}
             className={`flex-1 min-h-0 min-w-0 overflow-y-auto custom-scrollbar flex flex-col pt-20 max-sm:pt-16 ${hasMessages ? 'justify-start' : 'items-center justify-center'}`}>
@@ -2508,23 +3715,33 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                   toolId={welcomeToolId}
                   t={t}
                   onSend={(q) => {
-                    setWelcomeToolId(null);
-                    // sendChatMessage's failure path re-throws (the current
-                    // implementation never rejects, but stay consistent with
-                    // handleSend's defense so it cannot become a floating
-                    // rejection later).
-                    Promise.resolve(sendChatMessage(q)).catch((err) => {
-                      console.warn("[pinvou3][chat-ui] welcome-card send failed", err);
-                    });
+                    // Lifecycle ownership stays with sendChatMessage: its
+                    // consumeWelcomeOptIn machinery consumes the one-shot
+                    // welcome state at attempt start, so this handler must
+                    // not pre-clear it. References picked in the composer
+                    // ride welcome-card sends too; sendWithSessionRefs never
+                    // rejects (its internal rejection arm surfaces failures
+                    // with main's console.warn intent), so a bare call is
+                    // enough (round-10 welcome-card resolution).
+                    void sendWithSessionRefs(q);
                   }}
                 />
               </div>
             )}
 
             {hasMessages && (
-              <div ref={conversationContentRef} className="max-w-[800px] w-full min-w-0 mx-auto space-y-4">
+              // relative: the AuxQuoteSelection chip is absolutely positioned inside this column, clamped to its rect.
+              <div ref={conversationContentRef} className="relative max-w-[800px] w-full min-w-0 mx-auto space-y-4">
+                {/* Keep this explicit 16px value aligned with space-y-4 so
+                    crossing the virtualization threshold does not change spacing. */}
                 <ConversationTimeline
                     turns={conversationProjection.turns}
+                    sessionId={activeSessionId}
+                    scrollElementRef={scrollRef}
+                    busy={busy}
+                    turnGapPx={16}
+                    followOutputRef={autoScrollRef}
+                    onRetry={isMultiAgentReadOnly ? undefined : retryLastTurn}
                     copy={t.uiConversation}
                     agentLabel={chatViewCopy.agentName}
                     assistantAvatar={(timelineAssistantAvatar)}
@@ -2533,6 +3750,22 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                     renderToolItem={handleTimelineRenderToolItem}
                     onOpenExternal={openChatExternalUrl}
                   />
+                {/* Selection quotes: select text in the main conversation
+                    timeline → stage it as a quote of this task's aux chat and
+                    open the panel. Availability matches the header entry
+                    (sched-/agentic_ sessions have no aux chat). */}
+                <AuxQuoteSelection
+                  containerRef={conversationContentRef}
+                  sessionId={
+                    activeSessionId && !activeSessionId.startsWith('sched-')
+                      && !activeSessionId.toLowerCase().startsWith('agentic_')
+                      && bridge.available && bridge.auxChat
+                      ? activeSessionId
+                      : null
+                  }
+                  copy={t.uiAuxChat}
+                  onQuote={openAuxChatPanel}
+                />
                 {/* 实体占位必须覆盖输入框和其上方渐变区，保证滚到底时最后一张卡
                     完整停在渐变之外，而不是虽然能滚到却被遮罩淡化。 */}
                 <div data-testid="chat-bottom-spacer" aria-hidden="true" className="w-full shrink-0"
@@ -2569,7 +3802,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                   .slice(-2)
                   .map((item) => (
                     <div key={item.id} className="pointer-events-auto w-full flex justify-end">
-                      <ChatBubble item={item} sessionId={activeSessionId} theme={theme} t={t} onPrefill={setInputText} onSend={sendChatMessage} editable={false} onOpenEditor={onOpenEditor} onPlanStuckGo={handlePlanStuckGo} isLatestArtifact={false} />
+                      <ChatBubble item={item} sessionId={activeSessionId} theme={theme} t={t} onPrefill={setInputText} onSend={sendWithSessionRefs} editable={false} onOpenEditor={onOpenEditor} onPlanStuckGo={handlePlanStuckGo} isLatestArtifact={false} />
                     </div>
                 ))}
               </div>
@@ -2587,13 +3820,18 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
             <ComputerUseDialogs slice={computerUseSlice} copy={computerUseCopy} />
           )}
           {/* Floating Input Area */}
+          {/* biome-ignore lint/a11y/noStaticElementInteractions: session-row drag-drop hot zone; the keyboard-equivalent path is the composer @ mention panel */}
           <div
             ref={composerWrapRef}
             data-testid="chat-composer-wrap"
+            onDragEnter={handleComposerSessionDragEnter}
+            onDragLeave={handleComposerSessionDragLeave}
+            onDragOver={handleComposerSessionDragOver}
+            onDrop={handleComposerSessionDrop}
             className={`absolute ${isWeb ? 'bottom-2 sm:bottom-8' : 'bottom-8'} inset-x-0 z-20`}
             style={responsiveGutterStyle}
           >
-            <div className="max-w-[800px] w-full mx-auto">
+            <div className="max-w-[800px] w-full mx-auto" data-testid="chat-composer-box">
               {COMPUTER_USE_ENABLED && (
                 <ComputerUseBanner slice={computerUseSlice} copy={computerUseCopy} />
               )}
@@ -2644,7 +3882,16 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                         className="flex-1 min-w-0 resize-none rounded-lg border border-black/10 bg-white/80 px-2 py-1 outline-none focus:border-blue-500 dark:border-white/15 dark:bg-white/5"
                       />
                     ) : (
-                      <span className="flex-1 min-w-0 truncate">{q.displayText}</span>
+                      // A queued chip shows only the body: the mention injection
+                      // block (prepended at send) takes no line; a refs-only
+                      // message falls back to the referenced session titles
+                      // (data, not UI copy). Refs pass the shared choke point so
+                      // dirty history cannot flood the chip.
+                      <span className="flex-1 min-w-0 truncate">{(() => {
+                        const split = splitSessionMentionBlock(q.displayText);
+                        const body = split.text.trim();
+                        return body || dedupeSessionRefs(split.refs).map(ref => ref.title || ref.sessionId).join(', ') || q.displayText;
+                      })()}</span>
                     )}
                     {queuedEdit && queuedEdit.id === q.id ? (
                       <>
@@ -2681,9 +3928,16 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                             delete next[activeSessionId];
                             return next;
                           });
+                          // Same editing contract as the UserBubble editor: the
+                          // textarea holds only the body; the mention injection
+                          // block is parsed out into refs and rebuilt on save,
+                          // so editing never exposes (or silently drops) the
+                          // JSON contract line.
+                          const split = splitSessionMentionBlock(q.text);
+                          const body = split.text;
                           setQueuedEdits(current => ({
                             ...current,
-                            [activeSessionId]: { id: q.id, text: String(q.text || ''), initial: String(q.text || '') },
+                            [activeSessionId]: { id: q.id, text: body, initial: body, mentionRefs: dedupeSessionRefs(split.refs) },
                           }));
                         }}
                           data-testid={`queued-message-edit-action-${q.id}`}
@@ -2730,6 +3984,19 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
               formatError={formatAttachmentError}
               className="mb-2 px-2"
             />
+            {sessionDropActive && (
+              <div data-testid="session-mention-drop-hint"
+                className="mb-2 px-3 py-2 rounded-2xl text-[12px] leading-5 bg-[#E8F0FE] text-[#1967D2] dark:bg-[#1F3A5F] dark:text-[#A8C7FA]">
+                {t.uiSessionMention.dropHint}
+              </div>
+            )}
+            <MentionSuspense fallback={null}><SessionMentionChips
+              refs={sessionRefs}
+              onRemove={handleRemoveMentionRef}
+              copy={t.uiSessionMention}
+              disabled={!sessionMentionEnabled}
+              disabledNotice={t.uiSessionMention.disabledNotice}
+            /></MentionSuspense>
             {imageInputWarning && (
               <div data-testid="image-capability-warning"
                 className="flex items-center gap-2 mb-2 px-3 py-2 rounded-2xl text-[12px] leading-5 bg-amber-500/10 text-amber-700 dark:text-amber-300">
@@ -2843,7 +4110,9 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                         ? 'bg-[#34A853]'
                         : 'bg-[#1A73E8] animate-pulse'
                   }`} />
-                  <span className="min-w-0 truncate">{sceneCapabilityStatus.text}</span>
+                  {/* Round-11 m14: no truncate — blocked id lists must stay
+                      fully readable (the actionable part was ellipsized). */}
+                  <span className="min-w-0 break-words">{sceneCapabilityStatus.text}</span>
                 </div>
               )}
               {!scheduledRunContext && !conversationStarted && activeScene && (
@@ -2879,6 +4148,24 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                 onApplyAndSend={() => chatVoice.applyVoiceEditPreview({ send: true })}
                 onCancel={chatVoice.cancelVoiceEditPreview}
               />
+              <div className="relative">
+                <ComposerPopover
+                  open={mentionMenuOpen}
+                  onClose={() => setMentionDismissedToken(mentionTrigger ? mentionTrigger.token : null)}
+                  triggerRef={composerRef}
+                  compact={composerCompact}
+                  desktopClassName={`absolute bottom-full left-0 mb-2 z-50 w-[320px] max-w-[calc(100vw-24px)] max-h-[320px] overflow-y-auto ${POPOVER_SURFACE}`}
+                >
+                  <MentionSuspense fallback={null}><SessionMentionMenu
+                    candidates={mentionCandidates}
+                    selectedIndex={mentionIndex}
+                    onSelect={handleSelectMentionCandidate}
+                    onHover={(index) => setMentionSelection({ token: mentionTrigger && mentionTrigger.token, index })}
+                    copy={t.uiSessionMention}
+                  /></MentionSuspense>
+                </ComposerPopover>
+              </div>
+              {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: the composer carries the @-mention listbox popup semantics (aria-haspopup/expanded/activedescendant), same contract as the ScheduledTasksView read-only input */}
               <textarea
                 ref={composerRef}
                 data-testid="chat-composer-input"
@@ -2889,6 +4176,15 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                 maxLength={CHAT_INPUT_MAX_LENGTH}
                 placeholder={composerPlaceholder}
                 rows={1}
+                role="combobox"
+                aria-haspopup="listbox"
+                aria-expanded={mentionMenuOpen}
+                aria-controls="session-mention-listbox"
+                aria-activedescendant={
+                  mentionMenuOpen && mentionCandidates.length > 0
+                    ? `session-mention-option-${mentionCandidates[mentionIndex].sessionId}`
+                    : undefined
+                }
                 className="w-full bg-transparent resize-none outline-none text-gray-800 dark:text-gray-100 text-[16px] leading-relaxed min-h-[48px] overflow-y-auto hide-scrollbar placeholder:text-gray-400 dark:placeholder:text-gray-500"
               />
               <TextareaContextMenu inputRef={composerRef} setValue={setInputText} t={t} />
@@ -2910,24 +4206,84 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                     <ComposerWorkspaceSelector
                       copy={t.uiChatWorkspace}
                       draftWorkspacePath={(bs && bs.draftWorkspacePath) || null}
-                      onPickWorkspace={() => bridge.sessions.pickDraftWorkspace()}
-                      onSelectWorkspace={path => bridge.sessions.setDraftWorkspace(path)}
+                      onPickWorkspace={() => {
+                        // Single entry (§2): the in-app "choose workspace"
+                        // picker; the system directory dialog is folded into the
+                        // picker's "browse for another folder" channel. Hosts
+                        // without the picker wired fall back to the old behavior
+                        // (test stubs / old hosts). Both branches return a
+                        // promise — the selector refreshes recents from the
+                        // resolved path (review #484 round-6).
+                        if (onOpenWorkspacePicker) {
+                          onOpenWorkspacePicker({ lane: 'chat', mode: boundDraftNoticeMode() });
+                          return Promise.resolve(null);
+                        }
+                        return bridge.sessions.pickDraftWorkspace();
+                      }}
+                      onSelectWorkspace={handleSelectRecentWorkspace}
+                      // Grant notice parity (§9.4): the recents channel grants
+                      // the picked folder directly (single root), the same
+                      // notice weight as the in-app picker rows.
+                      grantNotice={workspaceNoticeTone(boundDraftNoticeMode()) === 'restricted'
+                        ? t.uiWorkspacePicker.noticeRestricted(1)
+                        : t.uiWorkspacePicker.noticeVisibility(1)}
                     />
                   )}
                   {/* Workspace binding indicator for the active session (read-only
                       chip: directory name + full path in title); bound sessions
                       match the code mode safety posture, styled like the draft-mode
                       selector. */}
-                  {shouldShowWorkspaceBindingChip({ activeSessionId, sessionBinding: sessionWorkspaceBinding }) && (
-                    <span
-                      data-testid="chat-workspace-binding"
-                      title={sessionWorkspaceBinding}
-                      className="h-7 max-w-[180px] rounded-lg px-2 inline-flex items-center gap-1.5 text-[11px] text-gray-500 dark:text-gray-400"
-                    >
-                      <FolderOpen size={13} className="shrink-0" />
-                      <span className="truncate">{workspaceName(sessionWorkspaceBinding, t.uiChatWorkspace.unknownDirectory)}</span>
-                    </span>
-                  )}
+                  {shouldShowWorkspaceBindingChip({ activeSessionId, sessionBinding: sessionWorkspaceBinding }) && (() => {
+                    const activeItem = ((bs && bs.sessions) || []).find(s => s.id === activeSessionId);
+                    const keychain = describeKeychain(activeItem && activeItem.workspace_roots);
+                    const projectsData = (bs && bs.projectsList) || {};
+                    const owningProjectId = resolveSessionProjectId(
+                      { id: activeSessionId, workspaceKind: 'bound', workspacePath: sessionWorkspaceBinding },
+                      projectsData.projects || [],
+                      projectsData.assignments || {},
+                    );
+                    // Align to project (§9.7): the chat lane goes through the
+                    // projects bridge domain; typed ALIGN_* markers map to copy
+                    // (codex lane parity). busy is the session's real turn flag.
+                    const align = async () => {
+                      try {
+                        const outcome = await bridge.projects.alignSessionToProject(activeSessionId);
+                        // live_push_failed: the stores are written but the
+                        // live engine kept the previous (possibly wider) root
+                        // set — over-grant must not be silent (review #484
+                        // round-9 N2).
+                        // Round-10 M2: surface a stale sidecar copy like the
+                        // deferred live push (over-grant window, not success).
+                        if (outcome && outcome.applied) onNotify && onNotify(outcome.sidecar_stale
+                          ? t.uiKeychain.alignSidecarStale
+                          : (outcome.live_push_failed ? t.uiKeychain.alignPushDeferred : t.uiKeychain.alignDone));
+                        else if (outcome && outcome.reason === 'no_change') onNotify && onNotify(t.uiKeychain.alignNoChange);
+                        else if (outcome && outcome.reason === 'write_skipped') onNotify && onNotify(t.uiKeychain.alignWriteSkipped);
+                        else if (outcome && outcome.reason === 'no_project') onNotify && onNotify(t.uiKeychain.alignNoProject);
+                        // Any other non-applied outcome is unexpected; surface it
+                        // instead of failing silently (codex lane parity).
+                        else if (onNotify) onNotify(t.uiKeychain.alignFailed);
+                      } catch (error) {
+                        const message = String((error && error.message) || error || '');
+                        if (onNotify) {
+                          onNotify(message.startsWith('ALIGN_BUSY') ? t.uiKeychain.alignBusy
+                            : (message.startsWith('ALIGN_NO_WORKSPACE') ? t.uiKeychain.alignNoWorkspace : t.uiKeychain.alignFailed));
+                        }
+                      }
+                    };
+                    return (
+                      <WorkspaceKeychainChip
+                        key={activeSessionId}
+                        copy={t.uiKeychain}
+                        primary={keychain.primary || sessionWorkspaceBinding}
+                        additionalCount={keychain.primary ? keychain.additional : 0}
+                        roots={keychain.primary ? keychain.roots : [sessionWorkspaceBinding]}
+                        canAlign={!!owningProjectId && !!bridge.projects}
+                        busy={busy}
+                        onAlign={align}
+                      />
+                    );
+                  })()}
                   <ComposerModeChip t={t} bs={bs} compact={composerCompact} onSwitch={handleModeChipSwitch} />
                   {/* Scheduled run conversations expose no swarm toggle:
                       the backend's swarm_mode_available excludes them (the
@@ -2937,6 +4293,16 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                   <ComposerToolMenu t={t} onGotoTools={onGotoTools} compact={composerCompact} activeSkill={bs && bs.activeSkill} />
                   <ComposerKbSelector t={t} bs={bs} compact={composerCompact} />
                 </div>
+                {hasDraftText && (
+                  <button type="button" data-testid="chat-clear-input" onClick={handleClearInput} disabled={!canClearInput} aria-label={t.clearInput} title={t.clearInput}
+                    className={`w-9 h-9 shrink-0 rounded-full flex items-center justify-center transition-colors ${
+                      canClearInput
+                        ? 'text-[#5F6368] hover:bg-black/5 dark:text-[#C4C7C5] dark:hover:bg-white/10'
+                        : 'text-gray-400 cursor-not-allowed opacity-60'
+                    }`}>
+                    <Trash2 size={18} />
+                  </button>
+                )}
                 <VoiceComposerButton
                   refProp={voiceAsrPopoverRef}
                   voiceInput={voiceInput}
@@ -2977,7 +4343,7 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
                           <StopCircle size={20} />
                         </button>
                       )}
-                      {(!busy || hasDraftText || hasReadyAttachment) && (
+                      {(!busy || hasDraftText || hasReadyAttachment || hasSessionRefs) && (
                         <button type="button" onClick={handleSend} disabled={!ready}
                           aria-label={busy ? t.queueMsg : t.sendMsg}
                           title={busy ? (can('interruptSend') ? t.queueMsgTip : t.queueMsg) : t.sendMsg}
@@ -3068,6 +4434,32 @@ const ToolWelcomeCard = ({ toolId, t, onSend }) => {
               language={modelServiceLanguage}
               modelServiceState={chatModelServiceState}
               onClose={closeSubagentPanel}
+            />
+            </PanelSuspense>
+            </ViewErrorBoundary>
+          )}
+          {/* sched-/agentic_ sessions have no aux chat (the entry button is
+              hidden too): switching to one unmounts the panel with the mount
+              condition, and switching back to a normal session re-mounts it
+              and re-runs ensure automatically. The bridge conjuncts match the
+              entry button exactly (round-26 minor M4): the auxChat-domain
+              conjunct keeps the panel unreachable on hosts that serve no
+              auxChat surface at all (a stale relay host predating the
+              domain, or the unavailable-bridge pet window) even if state
+              somehow lingers — the web lane itself implements the domain
+              fully these days. */}
+          {auxChatPanel && activeSessionId && !activeSessionId.startsWith('sched-')
+            && !activeSessionId.toLowerCase().startsWith('agentic_')
+            && bridge.available && bridge.auxChat && (
+            <ViewErrorBoundary t={t} variant="panel">
+            <PanelSuspense>
+            <LazyAuxChatPanel
+              sessionId={activeSessionId}
+              activationKey={auxChatPanel.openTick}
+              onActiveChange={setAuxChatDockActive}
+              t={t}
+              theme={theme}
+              onClose={closeAuxChatPanel}
             />
             </PanelSuspense>
             </ViewErrorBoundary>
@@ -3308,17 +4700,64 @@ const TextareaContextMenu = ({ inputRef, setValue, t }) => {
       ), document.body);
     };
 
-const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
+const UserBubble = ({ item, sessionId, editable, t, conversationVariant, onOpenSessionMention = null, knownSessionMentionIds = null, sessionMentionDisabled = false }) => {
+  // The mention injection block (prepended at send, see session-mention.js) is
+  // stripped into reference cards + body at render time; the editor holds the
+  // body without the block and commit rebuilds it from the original refs, so
+  // users cannot accidentally edit the JSON contract line. Parsed refs pass
+  // the shared choke point — dirty history (e.g. thousands of refs) must not
+  // blow up the cards UI or the edit-resend rebuild.
+  // A delivered cross-session message (features/messaging) carries the
+  // sender header block; parse it first to render the sender card above
+  // the text — the body itself is then rendered verbatim (round-4 A2:
+  // sender-controlled content must not feed the mention/attachment
+  // parsers).
+  const messageSplit = splitSessionMessageBlock(item.text);
+  // A delivered body is sender-controlled content (round-4 A2): feeding it
+  // into the mention/attachment parsers would render attacker-forged
+  // reference cards and attachment chips as first-party UI, and an
+  // edit-resend would re-serialize them into the receiver's own injection
+  // block. A delivered message renders its body verbatim — no mention
+  // parsing, no attachment splitting; the titler-side chaining is
+  // strip-only and stays correct either way.
+  const delivered = Boolean(messageSplit.sender);
+  const mentionSplit = delivered
+    ? { refs: [], text: messageSplit.text }
+    : splitSessionMentionBlock(messageSplit.text);
+  const mentionRefs = delivered ? [] : dedupeSessionRefs(mentionSplit.refs);
       const unified = conversationVariant === 'unified';
       const deliveryState = item.deliveryState || '';
       const sceneDisplay = pinvouSceneDisplay(item.pinvouScene, t.uiChat.sceneModes);
       const SceneIcon = sceneDisplay && sceneDisplay.Icon;
       const [editing, setEditing] = useState(false);
-      const [val, setVal] = useState(item.text);
-      const [copied, copyToClipboard] = useCopyFlash(1200);
-      function commit() { const tx = val.trim(); setEditing(false); if (tx && bridge.available) bridge.interaction.editLastTurn(tx); }
+      const [val, setVal] = useState(mentionSplit.text);
+      const [copied, copyToClipboard] = useCopyFlash();
+      // Edit-resend keeps layer 2 of the feature gate: with the feature off
+      // only the body is resent — the injection block is never re-injected.
+      function commit() {
+        const tx = val.trim();
+        setEditing(false);
+        if (!tx || !bridge.available) return;
+        // Round-6 R1: a delivered message's replacement turn PRESERVES the
+        // sender-header provenance — re-prepend the original header so the
+        // edited turn re-parses as delivered and its body keeps rendering
+        // verbatim (no parser re-arming for ANY shape: leading mention
+        // blocks, attachment-marker tails, or nested sender headers are all
+        // inert once the delivered branch stays engaged). Stripping shapes
+        // one by one was the round-5 approach and missed two of them.
+        const outgoing = !sessionMentionDisabled && mentionRefs.length
+          ? buildSessionMentionBlock(mentionRefs) + tx
+          : delivered && messageSplit.sender
+            ? buildSessionMessageBlock(messageSplit.sender, tx)
+            : tx;
+        bridge.interaction.editLastTurn(outgoing);
+      }
       function copyText() {
-        copyToClipboard('user-bubble', item.text || '');
+        // Copy the body for the user: strip the mention injection block (a
+        // machine contract, not human-written content); useCopyFlash is the
+        // upstream-unified copy feedback hook (#539 series), replacing the
+        // original hand-rolled setCopied.
+        copyToClipboard('user-bubble', mentionSplit.text || '');
       }
       function retryDelivery() {
         if (!item.clientMessageId || !bridge.available || !bridge.chat.retryFirstTurn) return;
@@ -3331,14 +4770,14 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
               {/* biome-ignore lint/a11y/noAutofocus: focus the editor immediately on entering message-edit mode; focus is the edit intent */}
               <textarea autoFocus value={val} onChange={e => setVal(e.target.value)}
                 rows={Math.min(6, Math.max(1, val.split('\n').length))}
-                onKeyDown={e => { if (isPlainEnter(e)) { e.preventDefault(); commit(); } else if (e.key === 'Escape') { setEditing(false); setVal(item.text); } }}
+                onKeyDown={e => { if (isPlainEnter(e)) { e.preventDefault(); commit(); } else if (e.key === 'Escape') { setEditing(false); setVal(mentionSplit.text); } }}
                 className={`w-full min-w-0 max-w-full break-words [overflow-wrap:anywhere] rounded-[16px] px-4 py-2 text-[15px] outline-none ${
                   unified
                     ? 'bg-[#E9EEF6] text-[#1F1F1F] dark:bg-[#2A2B2E] dark:text-[#E3E3E3]'
                     : 'bg-[#D3E3FD] text-[#1F1F1F] dark:bg-[#004A77] dark:text-[#E3E3E3]'
                 }`} />
               <div className="flex gap-2 justify-end mt-1">
-                <button type="button" className={cardBtnCls()} onClick={() => { setEditing(false); setVal(item.text); }}>{t.cpCancel}</button>
+                <button type="button" className={cardBtnCls()} onClick={() => { setEditing(false); setVal(mentionSplit.text); }}>{t.cpCancel}</button>
                 <button type="button" className={cardBtnCls('primary')} onClick={commit}>{t.resend}</button>
               </div>
             </div>
@@ -3366,10 +4805,38 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
       }
       const actBtn = 'text-[#9AA0A6] hover:text-[#444746] hover:bg-black/[0.06] dark:text-[#8E8E8E] dark:hover:text-[#E3E3E3] dark:hover:bg-white/10';
       // 附件行拆出正文,附件以独立小气泡显示在正文气泡上方(纯附件消息只显示附件气泡)
-      const { text: bodyText, attachments: attachmentNames } = splitAttachmentLine(item.text);
+      const { text: bodyText, attachments: attachmentNames } = delivered
+        ? { text: mentionSplit.text, attachments: [] }
+        : splitAttachmentLine(mentionSplit.text);
       return (
         <div className="flex justify-end group min-w-0 max-w-full">
           <div className="flex flex-col items-end max-w-[85%] min-w-0 max-w-full">
+            {messageSplit.sender && (
+              // Legacy-timeline render-item paths pass no onOpenSession: the
+              // card deliberately renders its non-interactive (alive) arm
+              // there instead of a dead-looking pill. Wire the callback into
+              // that path only after confirming user turns reach it.
+              <ViewErrorBoundary t={t} variant="panel">
+                <React.Suspense fallback={null}>
+                  <LazySessionMessageCard
+                    sender={messageSplit.sender}
+                    knownSessionIds={knownSessionMentionIds}
+                    onOpenSession={onOpenSessionMention}
+                    copy={t.uiSessionMessage}
+                  />
+                </React.Suspense>
+              </ViewErrorBoundary>
+            )}
+
+
+            <MentionSuspense fallback={null}><SessionMentionCards
+              refs={mentionRefs}
+              knownSessionIds={knownSessionMentionIds}
+              onOpenSession={onOpenSessionMention}
+              copy={t.uiSessionMention}
+              disabled={sessionMentionDisabled}
+              disabledNotice={t.uiSessionMention.disabledNotice}
+            /></MentionSuspense>
             {attachmentNames.length > 0 && (
               <div className={`flex max-w-full flex-wrap justify-end gap-1.5 ${bodyText ? 'mb-1.5' : ''}`}>
                 {attachmentNames.map((name, index) => {
@@ -3445,7 +4912,7 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
                 {copied ? <Check size={14} className="text-[#34C759]" /> : <Copy size={14} />}
               </button>
               {editable && !deliveryState && (
-                <button type="button" title={t.editResend} onClick={() => { setVal(item.text); setEditing(true); }}
+                <button type="button" title={t.editResend} onClick={() => { setVal(mentionSplit.text); setEditing(true); }}
                   className={`w-7 h-7 rounded-lg flex items-center justify-center transition-colors ${actBtn}`}>
                   <Edit2 size={14} />
                 </button>
@@ -3509,7 +4976,11 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
         } catch { /* 非 JSON 块,跳过 */ }
         if (!payload) continue;
         if (tagged) { chosen = m[0]; chosenPayload = payload; break; } // tagged block wins
-        if (!chosenPayload) { chosen = m[0]; chosenPayload = payload; }
+        if (chosenPayload) {
+          continue;
+        }
+
+        chosen = m[0]; chosenPayload = payload;
       }
       if (!chosenPayload) return miss;
       return { payload: chosenPayload, html: html.replace(chosen, '') };
@@ -3558,7 +5029,7 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
     }
 
     // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy bubble dispatches rendering by message type; split refactor tracked separately
-    const ChatBubble = React.memo(function ChatBubble({ item, sessionId, theme, onPrefill, onSend, editable, onOpenEditor, t, isLatestArtifact, allowScheduledTaskDraft, conversationVariant, showAssistantActions = true, onPlanStuckGo }) {
+    const ChatBubble = React.memo(function ChatBubble({ item, sessionId, theme, onPrefill, onSend, editable, onOpenEditor, t, isLatestArtifact, allowScheduledTaskDraft, conversationVariant, showAssistantActions = true, onPlanStuckGo, onOpenSessionMention = null, knownSessionMentionIds = null, sessionMentionDisabled = false }) {
       const chatCopy = t.uiChat;
       // 后端持久化的记忆状态值是固定中文数据，仅在 UI 边界映射为当前语言；未识别值原样透传
       const memoryStatusLabels = getMemoryStatusLabels(t);
@@ -3568,6 +5039,47 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
       // 懒加载语言注册完成会 bump 版本号:legacy assistant 气泡由 item.text 现算
       // markdown(见下),订阅版本号让注册后本组件重渲染,历史消息恢复高亮。
       const syntaxVersion = useSyncExternalStore(subscribeSyntaxHighlight, getSyntaxHighlightVersion);
+      // The exact string the assistant bubble injects (assistant branch below)
+      // plus its parsed bubbles, hoisted here so the no-deps effect below can
+      // hand the stream-fade pass the html React actually compares against:
+      // when the string is unchanged React skipped the write and the pass can
+      // skip its whole-tree walk. Both parse calls are per-item caches (see
+      // renderLegacyMarkdownCached / parseAssistantBubblesCached), so this is a
+      // cache hit for renders that reach the branch and a no-op for other item
+      // types.
+      const assistantHtml = item.type === 'assistant'
+        ? ((!item.streaming && item.text)
+          ? renderLegacyMarkdownCached(item, item.text, syntaxVersion)
+          : (item.html || ''))
+        : null;
+      const assistantDraftLabel = item.type === 'assistant'
+        ? (/scheduled-task-draft/.test(assistantHtml) ? t.uiChatExtra.draftingScheduled : (t && t.cpDesigning))
+        : null;
+      const assistantParsed = item.type === 'assistant'
+        ? parseAssistantBubblesCached(item, assistantHtml, !!item.streaming, allowScheduledTaskDraft, assistantDraftLabel)
+        : null;
+      // 代码块一键复制:assistant 气泡经 dangerouslySetInnerHTML 注入,按钮只能在
+      // 提交后补挂。目标 div 在流式首帧(item.streaming && !item.html)时不渲染,
+      // ref 可能为 null,因此不设 deps:每次渲染后重跑,目标挂载后的下一次渲染即
+      // 接上;ensureCodeCopyButtons 幂等(流式/重渲染会整体替换内部 DOM,新块自动
+      // 补装)。观察器与 ensure 同 effect:innerHTML 可能在 effect 不再触发时被整体
+      // 替换(冷启动懒注册重提交等),MutationObserver 自愈补装;重渲染时清理函数先
+      // 断开旧观察器再重挂,卸载时断开。
+      useEffect(() => {
+        if (item.type !== 'assistant') return;
+        const target = assistantSelectionTargetRef.current;
+        if (!target) return;
+        const labels = codeBlockCopyLabels(t.uiConversation);
+        ensureCodeCopyButtons(target, labels);
+        // Wrap text streamed since the previous render in one-shot fade spans
+        // (no-op when nothing is new); runs before the observer below is
+        // (re)installed and the cleanup already disconnected the previous one,
+        // so the wrap's own mutations are not self-observed. `html` is the
+        // string this render injected: when unchanged, React skipped the
+        // write and the pass skips its DOM walk (see stream-fade.js).
+        applyStreamFade(target, { streaming: !!item.streaming, html: assistantParsed.cq.html || '' });
+        return observeCodeCopyButtons(target, labels);
+      });
 
       if (item.type === 'artifact_card') return <ArtifactCard item={item} t={t} isLatest={isLatestArtifact} />;
       if (item.type === 'plan_card') return <PlanCard item={item} t={t} onPrefill={onPrefill} />;
@@ -3575,7 +5087,7 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
       if (item.type === 'careful_blocked') return <CarefulBlockedCard item={item} t={t} />;
       if (item.type === 'user_input') return <UserInputCard item={item} t={t} />;
       if (item.type === 'user') {
-        return <UserBubble item={item} sessionId={sessionId} editable={editable} t={t} conversationVariant={conversationVariant} />;
+        return <UserBubble item={item} sessionId={sessionId} editable={editable} t={t} conversationVariant={conversationVariant} onOpenSessionMention={onOpenSessionMention} knownSessionMentionIds={knownSessionMentionIds} sessionMentionDisabled={sessionMentionDisabled} />;
       }
 
       if (item.type === 'card_creator_intro') {
@@ -3593,16 +5105,9 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
         // 沿用冻结的 item.html,首次渲染时未注册的语言将永久纯文本。现算结果按
         // item 缓存(见 renderLegacyMarkdownCached),重渲染零解析成本。流式消息仍
         // 走 item.html(增量渲染管线);仅存 html 无 text 的旧消息无法现算,保持
-        // 原样(其语言在启动核心集内,不受懒注册影响)。
-        const html = (!item.streaming && item.text)
-          ? renderLegacyMarkdownCached(item, item.text, syntaxVersion)
-          : (item.html || '');
-        const streamingDraftLabel = /scheduled-task-draft/.test(html) ? t.uiChatExtra.draftingScheduled : (t && t.cpDesigning);
-        // The three-pass parse chain is a pure function cached per item (see
-        // parseAssistantBubblesCached): even when the memo is defeated
-        // (streaming delta / syntaxVersion bump) only bubbles that actually
-        // changed reparse.
-        const { pd, cq } = parseAssistantBubblesCached(item, html, !!item.streaming, allowScheduledTaskDraft, streamingDraftLabel);
+        // 原样(其语言在启动核心集内,不受懒注册影响)。解析在组件顶部完成
+        // (assistantParsed,供上方 effect 复用同一 html 身份),此处只取结果。
+        const { pd, cq } = assistantParsed;
         const assistantCopyAvailable = !item.streaming
           && [item.text, item.html].some(value => String(value || '').trim());
         // 草稿是否已存入(按名字在已加载的卡池里找同名自制卡 → 派生"已存入",免单独持久化)
@@ -3617,6 +5122,12 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
                 ref={assistantSelectionTargetRef}
                 className={`msg-md text-[15px] leading-relaxed ${item.streaming ? 'streaming-cursor' : ''} ${'text-[#1F1F1F] dark:text-[#E3E3E3]'}`}
                 onClick={(e) => {
+                  const copyButton = findCodeCopyButton(e.target);
+                  if (copyButton) {
+                    e.preventDefault();
+                    copyCodeBlockFromButton(copyButton, { labels: codeBlockCopyLabels(t.uiConversation) });
+                    return;
+                  }
                   // 聊天里的链接(如飞书授权 URL)点击 → 走系统浏览器,别导航主窗口/不可点。
                   const a = e.target && e.target.closest && e.target.closest('a[href]');
                   if (!a) return;
@@ -3697,7 +5208,10 @@ const UserBubble = ({ item, sessionId, editable, t, conversationVariant }) => {
       if (item.type === 'system') {
         return (
           <div className="flex justify-center">
-            <div className={`text-[13px] px-4 py-1.5 rounded-full ${'bg-[#F0F4F9] text-[#757575] dark:bg-[#1E1F20] dark:text-[#8E8E8E]'}`}>
+            {/* role=status (round-26 asto m9): system pills are outcome
+                notices (steer restore/queue verdicts, upload failures) —
+                announce them politely like the composer's own live regions. */}
+            <div role="status" className={`text-[13px] px-4 py-1.5 rounded-full ${'bg-[#F0F4F9] text-[#757575] dark:bg-[#1E1F20] dark:text-[#8E8E8E]'}`}>
               {item.text}
             </div>
           </div>

@@ -1,6 +1,6 @@
 # im feed.groups
 
-> **Prerequisite:** Read [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) first to understand authentication, global parameters, and safety rules.
+> **Prerequisite:** Read [`../../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) first to understand authentication, global parameters, and safety rules.
 
 This reference is the shared annotation target for the IM feed-group (tag) APIs: it documents what each method does, the `--params` / `--data` request and response shapes, and the enum surface used in payloads. The full method list is in [Command Overview](#command-overview) below.
 
@@ -444,7 +444,7 @@ The three read methods are shortcut-only:
 - [`+feed-group-list`](lark-im-feed-group-list.md) — `im:feed_group_v1:read`
 - [`+feed-group-list-item`](lark-im-feed-group-list-item.md) / [`+feed-group-query-item`](lark-im-feed-group-query-item.md) — `im:feed_group_v1:read` **plus** `im:chat:read` (they always resolve `chat_name`)
 
-If a required scope is missing, the CLI surfaces a hint such as `lark-cli auth login --scope "im:feed_group_v1:write"`.
+If a required scope is missing, the CLI surfaces a scope hint; run that login per the lark-shared on-demand split-flow (`--no-wait --json`), never the blocking in-turn login.
 
 ## References
 

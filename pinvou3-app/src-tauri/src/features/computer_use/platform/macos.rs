@@ -87,7 +87,6 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::{NSPoint, NSSize, NSString};
-use xcap::Monitor;
 
 use super::super::backend::ComputerUseBackend;
 use super::super::types::{
@@ -95,43 +94,17 @@ use super::super::types::{
     UiTreeOptions,
 };
 use super::helpers::{
-    TYPE_CHUNK_CHARS, TypeRun, drag_waypoints, map_scroll, normalize_typed_newlines, sanitize_name,
-    screening_name, split_type_runs,
+    CHORD_HOLD_MS, CLICK_SETTLE_MS, DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES,
+    DRAG_PRESS_SETTLE_MS, DRAG_STEP_DELAY_MS, DRAG_STEPS, HOLD_CANCEL_POLL_MS,
+    MACOS_UNICODE_STRING_UTF16_UNITS, MAX_NAME_CHARS, MAX_TREE_DEPTH, MAX_TREE_NODES,
+    MULTI_CLICK_INTERVAL_MS, TYPE_CHUNK_CHARS, TypeRun, combine_drag_errors, drag_waypoints,
+    map_scroll, map_xcap_err, normalize_typed_newlines, pick_monitor, release_reverse,
+    sanitize_name, screening_hit, split_type_runs, utf16_chunks,
 };
 use crate::platform::cursor::{CFRelease, CursorPositionError, cursor_position};
 
-/// Wait before a click so the preceding move settles (the target process
-/// consumes the mouse-moved event).
-const CLICK_SETTLE_MS: u64 = 30;
-/// Gap between consecutive clicks in a double/triple click (far below the
-/// system double-click threshold; enigo maintains clickState internally per
-/// NSEvent.doubleClickInterval, and double/triple clicks are recognized from
-/// it).
-const MULTI_CLICK_INTERVAL_MS: u64 = 40;
-/// Pause after the drag press and before movement starts, giving the target
-/// window time to enter drag-recognition state.
-const DRAG_PRESS_SETTLE_MS: u64 = 60;
-/// Number of interpolated drag path steps (some apps only recognize a drag
-/// after receiving enough motion events).
-const DRAG_STEPS: usize = 8;
-/// Delay between adjacent drag waypoints.
-const DRAG_STEP_DELAY_MS: u64 = 12;
-/// Pause between pressing all keys and releasing them in reverse; improves
-/// the hit rate of modifier chords (cmd+Tab etc.).
-const CHORD_HOLD_MS: u64 = 20;
-/// Granularity of the hold_key sleep: a stop/timeout cancel flag is polled
-/// at least this often, so an abandoned hold stops within this window
-/// instead of the full hold duration.
-const HOLD_CANCEL_POLL_MS: u64 = 100;
+use super::super::guard::raw_element_binding;
 
-/// `ui_tree` defaults/caps: depth and node count (keeps giant trees from
-/// overwhelming the worker thread and the text budget).
-const DEFAULT_TREE_MAX_DEPTH: u32 = 8;
-const DEFAULT_TREE_MAX_NODES: u32 = 400;
-const MAX_TREE_DEPTH: u32 = 24;
-const MAX_TREE_NODES: u32 = 2000;
-/// Character cap for a single-line name.
-const MAX_NODE_NAME_CHARS: usize = 80;
 /// Global message timeout (seconds) for AX's synchronous cross-process IPC.
 /// The default is about 6s; heavy apps (browsers/Electron) can hang on
 /// attribute reads, so it is tightened to 2s to protect the worker thread.
@@ -154,10 +127,16 @@ const AX_CANNOT_COMPLETE_LIMIT: u32 = 3;
 const CLICK_POSITION_TOLERANCE_PT: i32 = 2;
 
 /// Explicit error when Screen Recording is denied (the grant needs an app
-/// restart to take effect; the error says so).
+/// restart to take effect; the error says so). The pane kept its name across
+/// macOS versions ("Screen Recording" per Apple's own localization table on
+/// 27.2), so no rename guidance is needed.
 const SCREEN_RECORDING_DENIED: &str = "screen_recording_denied: enable in System Settings → Privacy & Security → Screen Recording, then restart the app";
-/// Explicit error when Accessibility is denied.
-const ACCESSIBILITY_DENIED: &str = "accessibility_denied: enable in System Settings → Privacy & Security → Accessibility, then restart the app";
+/// Explicit error when Accessibility is denied. Recent macOS releases
+/// renamed the pane (verified against Apple's localization table on 27.2:
+/// ACCESSIBILITY → "Device Control and Data Access" / 「设备控制和数据访问」),
+/// so the message names both labels — the old name alone sends users (and
+/// the model guiding them) to a pane that may no longer exist.
+const ACCESSIBILITY_DENIED: &str = "accessibility_denied: enable in System Settings → Privacy & Security → Accessibility (labeled \"Device Control and Data Access\" on recent macOS), then fully quit and restart the app";
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -215,10 +194,6 @@ unsafe extern "C" {
     fn AXValueGetTypeID() -> usize;
 }
 
-fn map_xcap_err(context: &str, err: xcap::XCapError) -> ComputerUseError {
-    ComputerUseError::failed(format!("{context}: {err}"))
-}
-
 fn map_input_err(context: &str, err: enigo::InputError) -> ComputerUseError {
     ComputerUseError::failed(format!("{context}: {err}"))
 }
@@ -231,6 +206,15 @@ fn accessibility_granted() -> bool {
     // SAFETY: no arguments, purely queries this process's TCC grant state,
     // shows no dialog, callable on any thread.
     unsafe { AXIsProcessTrusted() }
+}
+
+/// `(screen_recording, accessibility)` grant snapshot for the settings-page
+/// permission row. Both preflights are pure TCC queries (no dialog, any
+/// thread). Note the snapshot is advisory: a grant the user just made still
+/// reads `false` in this running process until relaunch — the UI pairs a
+/// miss with the restart guidance instead of re-polling for a flip.
+pub fn permission_status() -> Option<(bool, bool)> {
+    Some((screen_recording_granted(), accessibility_granted()))
 }
 
 fn screen_recording_error() -> ComputerUseError {
@@ -321,29 +305,6 @@ fn cursor_points() -> Result<(i32, i32), ComputerUseError> {
         };
         ComputerUseError::failed(message)
     })
-}
-
-/// Monitor to capture: the one holding the cursor (on macOS from_point takes
-/// point coordinates); falls back to the primary monitor, then to the first
-/// monitor.
-fn pick_monitor(cursor: Option<(i32, i32)>) -> Result<Monitor, ComputerUseError> {
-    if let Some((x, y)) = cursor {
-        if let Ok(monitor) = Monitor::from_point(x, y) {
-            return Ok(monitor);
-        }
-    }
-    let mut monitors =
-        Monitor::all().map_err(|err| map_xcap_err("cannot enumerate monitors", err))?;
-    if let Some(primary) = monitors
-        .iter()
-        .position(|m| m.is_primary().unwrap_or(false))
-    {
-        return Ok(monitors.swap_remove(primary));
-    }
-    monitors
-        .drain(..)
-        .next()
-        .ok_or_else(|| ComputerUseError::unavailable("no monitor available for screen capture"))
 }
 
 /// This crate's `Key` → enigo key. macOS differences:
@@ -537,23 +498,6 @@ fn ordered_chord_keys(keys: &[Key]) -> Vec<Key> {
 /// secure fields directly as role AXSecureTextField.
 fn is_secure_text(role: &str, subrole: &str) -> bool {
     subrole == "AXSecureTextField" || role == "AXSecureTextField"
-}
-
-/// Releases pressed keys in reverse; even on a mid-way error, best-effort
-/// releases all of them and returns the first error.
-fn release_reverse(pressed: &[enigo::Key], enigo: &mut Enigo) -> Result<(), enigo::InputError> {
-    let mut first_err = None;
-    for key in pressed.iter().rev() {
-        if let Err(err) = enigo.key(*key, Direction::Release) {
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-        }
-    }
-    match first_err {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,10 +935,28 @@ fn element_info_from(info: AxNodeInfo) -> ElementInfo {
     } else {
         info.title
     };
-    let display_name = sanitize_name(&name, MAX_NODE_NAME_CHARS);
+    let display_name = sanitize_name(&name, MAX_NAME_CHARS);
+    // Bound while the raw strings are still in scope (see `raw_binding`).
+    // Disclosed collapse: an element whose raw name is empty (no title and
+    // no description) binds hash("", role), so every empty-named element of
+    // the same role shares one binding — and the binding is (name, role),
+    // not element identity, so raw-identical labels in different windows
+    // bind alike. The Linux secure-field erasure collapses the same way and
+    // the tool description discloses the class; distinguishing true identity
+    // needs a platform-stable element id and is tracked as a follow-up.
+    let raw_binding = raw_element_binding(&name, &info.role);
     ElementInfo {
+        // AXRole/AXSubrole are free-form strings supplied by the target app,
+        // so the role is carried **raw**: it is a screening input
+        // (`is_secure_role` is a `contains` test and the denylist matches the
+        // role too), and bounding it here would let ~80 characters of padding
+        // hide `…SecureTextField` from that test — the same evasion
+        // `name_screening_hit` exists to close on the name. Display bounding
+        // happens where the value is rendered: the consent target line and the
+        // tree node both sanitize.
         role: info.role,
-        screening_name: screening_name(&name, &display_name),
+        name_screening_hit: screening_hit(&name),
+        raw_binding,
         name: display_name,
         x: info.x,
         y: info.y,
@@ -1079,8 +1041,8 @@ fn format_tree_line(index: u32, depth: u32, info: &AxNodeInfo) -> String {
         // AXRole/AXSubrole are free-form strings supplied by the target app;
         // without sanitizing they could break the one-node-per-line invariant
         // (forged tree lines / newline injection) (round-10 review m6).
-        role = sanitize_name(&info.role, MAX_NODE_NAME_CHARS),
-        title = sanitize_name(display_title, MAX_NODE_NAME_CHARS),
+        role = sanitize_name(&info.role, MAX_NAME_CHARS),
+        title = sanitize_name(display_title, MAX_NAME_CHARS),
     );
     line
 }
@@ -1599,7 +1561,10 @@ impl ComputerUseBackend for MacosComputerUseBackend {
                 sleep(Duration::from_millis(MULTI_CLICK_INTERVAL_MS));
                 self.post_mouse_event(up, cg_button, dest, click_state)
                     .map_err(|retry| {
-                        ComputerUseError::failed(format!(
+                        // same_kind, not ::failed: a TCC revocation mid-click surfaces as
+                        // Unavailable, and re-wrapping it as `failed` would destroy exactly
+                        // the classification combine_drag_errors exists to preserve.
+                        error.same_kind(format!(
                             "click release failed twice ({error}; {retry}); \
                              the mouse button may still be pressed"
                         ))
@@ -1699,23 +1664,7 @@ impl ComputerUseBackend for MacosComputerUseBackend {
         if release.is_ok() {
             self.held_buttons.retain(|held| *held != MouseButton::Left);
         }
-        match (result, release) {
-            (Ok(()), Ok(())) => {}
-            // Only the path move failed and the release succeeded: report the
-            // move error unchanged.
-            (Err(move_error), Ok(())) => return Err(move_error),
-            (Ok(()), Err(release)) => {
-                return Err(ComputerUseError::failed(format!(
-                    "drag release failed ({release}); the mouse button may still be pressed"
-                )));
-            }
-            (Err(move_error), Err(release)) => {
-                return Err(ComputerUseError::failed(format!(
-                    "drag move failed ({move_error}); its release also failed ({release}); \
-                     the mouse button may still be pressed"
-                )));
-            }
-        }
+        combine_drag_errors(result, release)?;
         // The drag endpoint is where the cursor lands; refresh the trusted
         // landing point (the start move does not change it).
         self.pending_move_target = Some(to);
@@ -1758,9 +1707,19 @@ impl ComputerUseBackend for MacosComputerUseBackend {
             }
             let injector = self.enigo()?;
             let result = match run {
-                TypeRun::Text(chunk) => injector
-                    .text(&chunk)
-                    .map_err(|err| map_input_err("type text", err)),
+                // Re-chunked by UTF-16 width, not by character:
+                // `CGEventKeyboardSetUnicodeString` stores at most 20 UTF-16
+                // units, and enigo chunks by `char`, so 20 non-BMP characters
+                // (emoji, supplementary-plane CJK) produced 40 units of which
+                // the OS silently kept 20 — with the cut able to land inside a
+                // surrogate pair — while `type` still returned Ok.
+                TypeRun::Text(chunk) => utf16_chunks(&chunk, MACOS_UNICODE_STRING_UTF16_UNITS)
+                    .into_iter()
+                    .try_for_each(|part| {
+                        injector
+                            .text(part)
+                            .map_err(|err| map_input_err("type text", err))
+                    }),
                 TypeRun::Return => injector
                     .key(enigo::Key::Return, Direction::Click)
                     .map_err(|err| map_input_err("type text newline", err)),
@@ -2098,6 +2057,79 @@ mod tests {
         assert!(ensure_readable(&unreadable).is_err());
     }
 
+    /// The screening inputs must be the **raw** strings, not the display
+    /// copies, and this is the only place that can go wrong silently.
+    ///
+    /// `ElementInfo.name` is display-truncated, so the denylist verdict is
+    /// taken here, where the untruncated name still exists, and carried as
+    /// `name_screening_hit`. `role` is a screening input too — `is_secure_role`
+    /// is a `contains` test and the denylist matches the role — and macOS is
+    /// the one backend where it is a free-form, app-supplied string, so it is
+    /// carried raw and bounded only when rendered.
+    ///
+    /// Regressing either one costs nothing at the tool layer (`screen_element`
+    /// keeps compiling and keeps returning Clear), which is exactly why the
+    /// producer needs its own pin: a padded label or role would silently stop
+    /// screening.
+    #[test]
+    fn element_info_screens_raw_strings_not_display_copies() {
+        let padding = "A".repeat(MAX_NAME_CHARS);
+        let base = AxNodeInfo {
+            role: "AXButton".to_string(),
+            title: String::new(),
+            subrole: String::new(),
+            description: String::new(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            disabled: false,
+            focused: false,
+            secure: false,
+            geometry_read: true,
+        };
+
+        // A denylist term pushed past the display window by padding: the
+        // display name no longer carries it, the verdict still does.
+        let padded_name = element_info_from(AxNodeInfo {
+            title: format!("{padding}Delete"),
+            ..base.clone()
+        });
+        assert!(
+            !padded_name.name.contains("Delete"),
+            "the display name is expected to be truncated: {:?}",
+            padded_name.name
+        );
+        assert!(
+            padded_name.name_screening_hit,
+            "the verdict must come from the raw name, not the truncated copy"
+        );
+
+        // The role reaches `is_secure_role`/`matches_t3_denylist` verbatim, so
+        // padding must not be able to push the signal out of it either. The
+        // padding deliberately exceeds the streaming matcher's fold chunk, so
+        // the pinned suffix lands in a window other than the first one.
+        let padded_role = element_info_from(AxNodeInfo {
+            role: format!("{}{padding}AXSecureTextField", "P".repeat(5000)),
+            title: "Card number".to_string(),
+            ..base.clone()
+        });
+        assert!(
+            padded_role.role.ends_with("AXSecureTextField"),
+            "the role must be carried raw: {:?}",
+            padded_role.role
+        );
+
+        // The ordinary case is unchanged: a short raw name that does not hit
+        // stays a non-hit, so the flag is not simply always true.
+        let benign = element_info_from(AxNodeInfo {
+            title: "Open settings".to_string(),
+            ..base
+        });
+        assert!(!benign.name_screening_hit);
+        assert_eq!(benign.role, "AXButton");
+    }
+
     #[test]
     fn tree_line_falls_back_to_description_for_web_nodes() {
         let web_button = AxNodeInfo {
@@ -2161,23 +2193,6 @@ mod tests {
         assert!(is_secure_text("AXSecureTextField", ""));
         assert!(!is_secure_text("AXTextField", ""));
         assert!(!is_secure_text("AXButton", ""));
-    }
-
-    #[test]
-    #[ignore = "live probe: needs Accessibility TCC grant and a real focused UI element"]
-    fn live_focused_element_returns_element_with_role() {
-        if !accessibility_granted() {
-            return;
-        }
-        let mut backend = MacosComputerUseBackend::new();
-        let focused = backend
-            .focused_element()
-            .expect("focused_element must not fail on a granted desktop");
-        let info = focused.expect("a real desktop session always has a focused element");
-        assert!(
-            !info.role.is_empty(),
-            "focused element role must not be empty"
-        );
     }
 
     /// Review finding: a synthetic move while one of this backend's own

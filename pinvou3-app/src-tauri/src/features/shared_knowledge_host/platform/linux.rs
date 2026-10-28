@@ -1,12 +1,13 @@
 //! Linux 适配：通过安装包内的 root-owned helper 管理 systemd 服务。
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use pinvou_knowledge::client::KnowledgeClient;
 use pinvou_knowledge::model::DeviceGrant;
+use pinvou_knowledge::net_policy::{is_tailnet, is_ula};
 
 use crate::platform::process::{output_with_timeout, output_with_timeout_and_kill_tree};
 
@@ -56,7 +57,6 @@ pub async fn status() -> SharedKnowledgeHostStatus {
     SharedKnowledgeHostStatus {
         supported: true,
         installed,
-        running,
         endpoint: LOCAL_ENDPOINT.to_string(),
         service_version,
         app_version,
@@ -235,7 +235,7 @@ pub async fn backup_host(
     output: PathBuf,
     local_recipient: String,
     recovery_recipient: String,
-) -> Result<serde_json::Value, String> {
+) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let uid = command_identity("-u")?;
         let gid = command_identity("-g")?;
@@ -254,8 +254,9 @@ pub async fn backup_host(
         )?;
         result
             .lines()
-            .find_map(|line| serde_json::from_str(line).ok())
-            .ok_or_else(|| "备份结果无效".to_string())
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .ok_or_else(|| "备份结果无效".to_string())?;
+        Ok(())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -288,20 +289,20 @@ pub async fn restore_host(
             "恢复共享知识库",
             BACKUP_HELPER_TIMEOUT,
         )?;
-        let mut manifest = None;
+        let mut manifest_seen = false;
         let mut owner_claim = None;
         for line in result.lines() {
-            if manifest.is_none() {
-                manifest = serde_json::from_str::<serde_json::Value>(line).ok();
+            if !manifest_seen {
+                manifest_seen = serde_json::from_str::<serde_json::Value>(line).is_ok();
             }
             if owner_claim.is_none() {
                 owner_claim = serde_json::from_str::<HostOwnerClaim>(line).ok();
             }
         }
-        Ok(HostRestoreResult {
-            manifest: manifest.ok_or_else(|| "恢复结果无效".to_string())?,
-            owner_claim,
-        })
+        if !manifest_seen {
+            return Err("恢复结果无效".to_string());
+        }
+        Ok(HostRestoreResult { owner_claim })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -383,13 +384,8 @@ fn is_lan_address(address: IpAddr) -> bool {
         // Only ULA addresses are portable between machines. A link-local fe80::
         // endpoint requires an interface zone id, which `hostname -I` does not
         // provide and therefore must never be advertised in a share link.
-        IpAddr::V6(address) => !address.is_loopback() && (address.segments()[0] & 0xfe00) == 0xfc00,
+        IpAddr::V6(address) => !address.is_loopback() && is_ula(address),
     }
-}
-
-fn is_tailnet(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
-    octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
 #[cfg(test)]

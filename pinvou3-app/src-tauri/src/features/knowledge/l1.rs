@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use pinvou_knowledge::chunk_text;
 use pinvou_knowledge::embedding::{Embedder, blob_to_vec, cosine, vec_to_blob};
 
+use super::now;
+
 /// chunk 切块参数：~512 token ≈ 中文 600 字符；15% 重叠保留上下文。
 const CHUNK_CHARS: usize = 600;
 const CHUNK_OVERLAP: usize = 90;
@@ -82,6 +84,14 @@ pub struct ChunkHit {
 pub struct ScopedChunkHit {
     pub collection_ids: Vec<i64>,
     pub hit: ChunkHit,
+}
+
+/// 对话检索结果 + 查询向量是否计算失败（嵌入器挂载但 `embed_one` 报错；未挂载
+/// 不算——那条降级路径由调用方在检索前披露）。调用方据此补模型可见的降级警告。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatRetrievalOutcome {
+    pub hits: Vec<ScopedChunkHit>,
+    pub embed_query_failed: bool,
 }
 
 pub(super) enum ImportIngestOutcome {
@@ -255,6 +265,50 @@ impl L1Store {
         Ok(())
     }
 
+    /// Returns whether the row existed (round-37 review: the CLI's
+    /// update lane must not report success for a collection a concurrent
+    /// delete removed between its pre-check and this write). Partial
+    /// variant of [`Self::update_collection`]: only the provided
+    /// columns join the SET list (plus the `updated_at` stamp). Round-45
+    /// review: the CLI's update lane used to read-merge-write the whole row,
+    /// so a concurrent rename between its read and write was silently
+    /// reverted by stale merged values — a partial UPDATE leaves columns the
+    /// caller omitted (and concurrent edits to them) untouched, while the
+    /// rows-affected return still catches a concurrent delete.
+    pub fn update_collection_fields(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        category: Option<&str>,
+        description: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let mut set_clauses: Vec<String> = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for (column, value) in [
+            ("name", name),
+            ("category", category),
+            ("description", description),
+        ] {
+            if let Some(value) = value {
+                set_clauses.push(format!("{}=?{}", column, values.len() + 1));
+                values.push(Box::new(value.to_owned()));
+            }
+        }
+        set_clauses.push(format!("updated_at=?{}", values.len() + 1));
+        values.push(Box::new(now()));
+        values.push(Box::new(id));
+        let sql = format!(
+            "UPDATE collections SET {} WHERE id=?{}",
+            set_clauses.join(","),
+            values.len()
+        );
+        let changed = self.conn.lock().execute(
+            &sql,
+            rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
+        )?;
+        Ok(changed > 0)
+    }
+
     /// 删知识集 + 其全部文档/块（chunks_fts 由触发器同步）。
     pub fn delete_collection(&self, id: i64) -> rusqlite::Result<()> {
         let mut c = self.conn.lock();
@@ -288,6 +342,22 @@ impl L1Store {
 
     // ───────────────────────── 文档 ─────────────────────────
 
+    /// Row shape shared by every `documents JOIN collections` read below.
+    fn document_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
+        Ok(Document {
+            id: r.get(0)?,
+            collection_id: r.get(1)?,
+            coll_name: r.get(2)?,
+            path: r.get(3)?,
+            name: r.get(4)?,
+            ext: r.get(5)?,
+            size: r.get(6)?,
+            mtime: r.get(7)?,
+            parse_status: r.get(8)?,
+            n_chunks: r.get(9)?,
+        })
+    }
+
     /// 库里是否存在任意已入库文档（任一知识集）。用于「知识库为空时隐藏
     /// kb_search/kb_open_source 工具」门控：
     /// 删光所有文件后不让模型目录里还留着检索工具。EXISTS 子查询走索引，常数时间。
@@ -304,7 +374,15 @@ impl L1Store {
         limit: usize,
     ) -> rusqlite::Result<Vec<Document>> {
         let c = self.conn.lock();
-        let lim = if limit == 0 { 500 } else { limit } as i64;
+        // Clamp the limit with the same policy as Store::search: a raw
+        // `as i64` wraps usize::MAX to -1 (SQLite reads it as unbounded),
+        // materializing the whole documents table for an arbitrary caller
+        // limit.
+        let lim = if limit == 0 {
+            500
+        } else {
+            limit.min(crate::features::knowledge::store::SEARCH_LIMIT_CAP)
+        } as i64;
         let sql = if collection_id > 0 {
             "SELECT d.id,d.collection_id,c.name,d.path,d.name,d.ext,d.size,d.mtime,d.parse_status,d.n_chunks \
              FROM documents d JOIN collections c ON c.id=d.collection_id \
@@ -315,21 +393,7 @@ impl L1Store {
              ORDER BY d.parsed_at DESC, d.id DESC LIMIT ?2"
         };
         let mut stmt = c.prepare(sql)?;
-        let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Document> {
-            Ok(Document {
-                id: r.get(0)?,
-                collection_id: r.get(1)?,
-                coll_name: r.get(2)?,
-                path: r.get(3)?,
-                name: r.get(4)?,
-                ext: r.get(5)?,
-                size: r.get(6)?,
-                mtime: r.get(7)?,
-                parse_status: r.get(8)?,
-                n_chunks: r.get(9)?,
-            })
-        };
-        let rows = stmt.query_map(params![collection_id, lim], map)?;
+        let rows = stmt.query_map(params![collection_id, lim], Self::document_from_row)?;
         rows.collect()
     }
 
@@ -346,26 +410,17 @@ impl L1Store {
              FROM documents d JOIN collections c ON c.id=d.collection_id \
              WHERE d.id=?1 AND d.collection_id=?2 AND d.parse_status='parsed'",
             params![document_id, collection_id],
-            |r| {
-                Ok(Document {
-                    id: r.get(0)?,
-                    collection_id: r.get(1)?,
-                    coll_name: r.get(2)?,
-                    path: r.get(3)?,
-                    name: r.get(4)?,
-                    ext: r.get(5)?,
-                    size: r.get(6)?,
-                    mtime: r.get(7)?,
-                    parse_status: r.get(8)?,
-                    n_chunks: r.get(9)?,
-                })
-            },
+            Self::document_from_row,
         )
         .optional()
     }
 
     /// 分页读取某份已解析文档的 chunk 快照。这里只查数据库，不重新打开原始 Office/PDF
     /// 文件；二进制解析已经在建索引时由 `file_ingest` 完成。
+    /// The `limit` is clamped at the SQL boundary like every other
+    /// SQL-facing limit: a raw cast would wrap usize::MAX to -1, which
+    /// SQLite reads as unbounded (today's only caller passes a small cap;
+    /// the clamp guards future callers).
     pub fn document_chunk_window(
         &self,
         collection_id: i64,
@@ -374,6 +429,7 @@ impl L1Store {
         limit: usize,
     ) -> rusqlite::Result<Vec<(i64, String)>> {
         let c = self.conn.lock();
+        let limit = limit.min(crate::features::knowledge::store::SEARCH_LIMIT_CAP);
         let mut stmt = c.prepare(
             "SELECT k.ord,k.text FROM chunks k JOIN documents d ON d.id=k.document_id \
              WHERE k.document_id=?1 AND k.collection_id=?2 AND d.collection_id=?2 \
@@ -388,8 +444,8 @@ impl L1Store {
 
     /// 插入或更新一条文档记录，返回 doc id。
     /// Test-only fixture seeding: production ingestion goes through the
-    /// resumable `ingest_import_item` staging pipeline, which has its own
-    /// document upsert.
+    /// resumable `ingest_import_item` staging pipeline, whose upsert
+    /// (`upsert_import_document`) this wraps so the SQL cannot drift.
     #[cfg(test)]
     pub fn upsert_document(
         &self,
@@ -400,28 +456,33 @@ impl L1Store {
         size: i64,
         mtime: i64,
     ) -> rusqlite::Result<i64> {
-        let c = self.conn.lock();
-        c.execute(
-            "INSERT INTO documents(collection_id,path,name,ext,size,mtime,parse_status,parsed_at) \
-             SELECT ?1,?2,?3,?4,?5,?6,'pending',0 \
-             WHERE EXISTS(SELECT 1 FROM collections WHERE id=?1) \
-             ON CONFLICT(collection_id,path) DO UPDATE SET \
-               name=excluded.name,ext=excluded.ext,size=excluded.size,mtime=excluded.mtime",
-            params![collection_id, path, name, ext, size, mtime],
-        )?;
-        c.query_row(
-            "SELECT id FROM documents WHERE collection_id=?1 AND path=?2",
-            params![collection_id, path],
-            |r| r.get(0),
-        )
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let doc_id = upsert_import_document(&tx, collection_id, path, name, ext, size, mtime)?;
+        tx.commit()?;
+        Ok(doc_id)
     }
 
-    /// 删除文档及其块。
-    pub fn remove_document(&self, doc_id: i64) -> rusqlite::Result<()> {
+    /// 删除文档及其块。Returns whether the document existed (round-37
+    /// review: the CLI's remove lane must not report success for a
+    /// document a concurrent delete removed between its pre-check and
+    /// this write; the GUI's delete has always been a silent no-op).
+    pub fn remove_document(&self, doc_id: i64) -> rusqlite::Result<bool> {
         let c = self.conn.lock();
         c.execute("DELETE FROM chunks WHERE document_id=?1", params![doc_id])?;
-        c.execute("DELETE FROM documents WHERE id=?1", params![doc_id])?;
-        Ok(())
+        let deleted = c.execute("DELETE FROM documents WHERE id=?1", params![doc_id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Whether the document exists (headless callers reject unknown ids with
+    /// it; the GUI's delete has always been a silent no-op).
+    pub fn document_exists(&self, doc_id: i64) -> rusqlite::Result<bool> {
+        let c = self.conn.lock();
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE id=?1)",
+            params![doc_id],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
     }
 
     /// 仅测试夹具使用：正式 chunks 的整体替换写法。生产入库走暂存表 + 事务提交路径。
@@ -744,6 +805,12 @@ impl L1Store {
         q: &str,
         lim: usize,
     ) -> rusqlite::Result<Vec<ChunkHit>> {
+        // Defensive second clamp before the SQL cast (`usize::MAX` would wrap
+        // to -1, i.e. unbounded, in SQLite). The doubling that could overflow
+        // happens in the CALLER, so the clamp that prevents it lives there
+        // (`retrieve_for_chat_with_vector`) — a clamp here is reached only
+        // after the multiplication has already been evaluated.
+        let lim = lim.min(super::store::SEARCH_LIMIT_CAP);
         let c = self.conn.lock();
         let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ChunkHit> {
             Ok(ChunkHit {
@@ -755,8 +822,8 @@ impl L1Store {
                 ord: r.get(5)?,
             })
         };
-        if q.chars().count() >= 3 {
-            let m = format!("\"{}\"", q.replace('"', "\"\""));
+        if q.chars().count() >= super::store::FTS_MIN_CHARS {
+            let m = super::store::fts_phrase(q);
             let mut stmt = c.prepare(
                 "SELECT d.id,k.text,bm25(chunks_fts) AS score,d.name,d.path,k.ord \
                  FROM chunks_fts JOIN chunks k ON k.id=chunks_fts.rowid \
@@ -767,7 +834,7 @@ impl L1Store {
             let rows = stmt.query_map(params![collection_id, m, lim as i64], map)?;
             rows.collect()
         } else {
-            let like = format!("%{}%", q.replace(['%', '_'], ""));
+            let like = super::store::like_pattern(q);
             let mut stmt = c.prepare(
                 "SELECT d.id,k.text,0.0 AS score,d.name,d.path,k.ord \
                  FROM chunks k JOIN documents d ON d.id=k.document_id \
@@ -841,14 +908,39 @@ impl L1Store {
         query: &str,
         k: usize,
     ) -> rusqlite::Result<Vec<ScopedChunkHit>> {
+        Ok(self
+            .retrieve_for_chat_multi_outcome(collection_ids, query, k)?
+            .hits)
+    }
+
+    /// [`Self::retrieve_for_chat_multi`] 带降级披露：嵌入器已挂载但本次查询向量
+    /// 计算失败时 `embed_query_failed` 为真（本次静默降级纯 FTS）。嵌入器未挂载
+    /// 的降级不算（那是"未安装/未加载"路径，由调用方在检索前统一披露），调用方
+    /// 须把真值转成模型可见的警告，否则模型会把关键词结果当全量作答。
+    pub fn retrieve_for_chat_multi_outcome(
+        &self,
+        collection_ids: &[i64],
+        query: &str,
+        k: usize,
+    ) -> rusqlite::Result<ChatRetrievalOutcome> {
         let q = query.trim();
         if q.is_empty() || collection_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ChatRetrievalOutcome {
+                hits: Vec::new(),
+                embed_query_failed: false,
+            });
         }
         let lim = if k == 0 { 5 } else { k };
-        let query_vector = self
-            .embedder()
-            .and_then(|embedder| embedder.embed_one(q).ok());
+        let (query_vector, embed_query_failed) = match self.embedder() {
+            Some(embedder) => match embedder.embed_one(q) {
+                Ok(vector) => (Some(vector), false),
+                Err(error) => {
+                    eprintln!("[knowledge] 对话检索查询向量计算失败（降级纯全文）: {error}");
+                    (None, true)
+                }
+            },
+            None => (None, false),
+        };
         let mut unique_ids = Vec::new();
         for collection_id in collection_ids.iter().copied().filter(|id| *id > 0) {
             if !unique_ids.contains(&collection_id) {
@@ -864,7 +956,7 @@ impl L1Store {
                 let score = if query_vector.is_some() {
                     hit.score
                 } else {
-                    1.0 / (60.0 + rank as f64 + 1.0)
+                    rrf_score(rank)
                 };
                 candidates.push((score, collection_order, rank, collection_id, hit));
             }
@@ -900,7 +992,10 @@ impl L1Store {
             });
         }
         merged.truncate(lim);
-        Ok(merged)
+        Ok(ChatRetrievalOutcome {
+            hits: merged,
+            embed_query_failed,
+        })
     }
 
     fn retrieve_for_chat_with_vector(
@@ -910,7 +1005,16 @@ impl L1Store {
         k: usize,
         query_vector: Option<&[f32]>,
     ) -> rusqlite::Result<Vec<ChunkHit>> {
-        let lim = if k == 0 { 5 } else { k };
+        // Clamp here, before the doubling: `k` is caller-supplied, and
+        // `lim * 2` would overflow (debug panic / wrap in release) before
+        // either search function got a chance to bound it. Halving the cap
+        // keeps the doubled value inside it, so both arms of the hybrid merge
+        // are bounded by the same number — clamping only inside `search_fts`
+        // would leave the vector arm unbounded and skew the RRF merge.
+        // (`k == 0` needs no fallback here: the only caller,
+        // `retrieve_for_chat_multi`, applies the `k == 0 -> 5` default before
+        // delegating, so `k` always arrives non-zero.)
+        let lim = k.min(super::store::SEARCH_LIMIT_CAP / 2);
         let fts = self.search_fts(collection_id, q, lim * 2)?;
         let ranked = if let Some(query_vector) = query_vector {
             let vec = self.search_vec(collection_id, query_vector, lim * 2)?;
@@ -972,10 +1076,6 @@ fn upsert_import_document(
     )
 }
 
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
 /// 空闲卸载时钟用的 UNIX 秒（u64；负数系统时钟截断为 0，只影响判定方向不致误卸载）。
 fn now_epoch_secs() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
@@ -985,21 +1085,30 @@ fn dedupe_path_key(path: &str) -> String {
     crate::platform::os::filesystem_path_identity_key(path)
 }
 
+/// RRF 的排名→得分公式：`1.0/(K + rank + 1)`（rank 从 0 计），K=60 是
+/// 论文默认常数。混合检索合并（[`rrf_merge`]）与多库归并
+/// （[`L1Store::retrieve_for_chat_multi`]）共用同一公式与同一 K，避免两
+/// 处漂移。
+const RRF_K: f64 = 60.0;
+
+fn rrf_score(rank: usize) -> f64 {
+    1.0 / (RRF_K + rank as f64 + 1.0)
+}
+
 /// 倒数排名融合(RRF)：两路结果按排名给分，按 (docPath#ord) 去重合并，取前 k。
 fn rrf_merge(fts: Vec<ChunkHit>, vec: Vec<ChunkHit>, k: usize) -> Vec<ChunkHit> {
-    const RRF_K: f64 = 60.0;
     let mut score: HashMap<String, f64> = HashMap::new();
     let mut keep: HashMap<String, ChunkHit> = HashMap::new();
-    for (rank, h) in fts.iter().enumerate() {
-        let key = format!("{}#{}", dedupe_path_key(&h.doc_path), h.ord);
-        *score.entry(key.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
-        keep.entry(key).or_insert_with(|| h.clone());
-    }
-    for (rank, h) in vec.iter().enumerate() {
-        let key = format!("{}#{}", dedupe_path_key(&h.doc_path), h.ord);
-        *score.entry(key.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
-        keep.entry(key).or_insert_with(|| h.clone());
-    }
+    // 每一路按各自从 0 计的排名给分，两路合并。
+    let mut add_stream = |hits: &[ChunkHit]| {
+        for (rank, h) in hits.iter().enumerate() {
+            let key = format!("{}#{}", dedupe_path_key(&h.doc_path), h.ord);
+            *score.entry(key.clone()).or_insert(0.0) += rrf_score(rank);
+            keep.entry(key).or_insert_with(|| h.clone());
+        }
+    };
+    add_stream(&fts);
+    add_stream(&vec);
     let mut merged: Vec<ChunkHit> = keep
         .into_iter()
         .map(|(key, mut h)| {
@@ -1029,6 +1138,42 @@ mod tests {
     fn mem() -> L1Store {
         let store = Store::open_in_memory().unwrap();
         L1Store::new(store.conn_arc()) // Unit test: plain full-text only, no embedding
+    }
+
+    /// Round-45 review: the CLI's update lane used to read-merge-write the
+    /// whole row, so a concurrent rename between its read and write was
+    /// silently reverted. The partial UPDATE must leave omitted columns (and
+    /// concurrent edits to them) untouched while keeping the rows-affected
+    /// not-found semantics.
+    #[test]
+    fn partial_collection_update_leaves_omitted_columns_untouched() {
+        let l1 = mem();
+        let id = l1
+            .create_collection("原始名", Some("cat"), Some("desc"))
+            .unwrap();
+        // Simulate the concurrent writer: a rename lands between the CLI's
+        // read and its write (the writer itself uses the partial form, so it
+        // does not clobber the other columns either).
+        l1.update_collection_fields(id, Some("并发改名"), None, None)
+            .unwrap();
+        assert!(
+            l1.update_collection_fields(id, None, None, Some("新描述"))
+                .unwrap()
+        );
+        let row = l1
+            .list_collections()
+            .unwrap()
+            .into_iter()
+            .find(|collection| collection.id == id)
+            .unwrap();
+        assert_eq!(row.name, "并发改名");
+        assert_eq!(row.category.as_deref(), Some("cat"));
+        assert_eq!(row.description.as_deref(), Some("新描述"));
+        // An unknown id still reports not-found through rows-affected.
+        assert!(
+            !l1.update_collection_fields(999_999, Some("x"), None, None)
+                .unwrap()
+        );
     }
 
     #[test]

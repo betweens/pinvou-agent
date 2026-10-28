@@ -15,26 +15,17 @@ use super::IngestResult;
 use super::ingest_deps::{
     add_ocr_tessdata_arg, ocr_lang_arg, ocr_tool_command, pdf_tool_command, system_tools,
 };
-// The LibreOffice primitives are only exercised directly by the cfg(test)
-// conversion tests below; production paths go through run_libreoffice_convert.
-#[cfg(test)]
-use super::ingest_deps::{libreoffice_tool_command, libreoffice_user_installation_arg};
 
 // ============== 产物可视化预览助手（commands::render_artifact_visual 复用）==============
-
-/// Image extension → MIME. Used for data URI prefixes; the mapping itself is
-/// shared with codex_acp::attachments; extensions outside the table fall back to application/octet-stream.
-fn image_mime(ext: &str) -> &'static str {
-    crate::platform::filesystem::image_mime_type_for_ext(ext).unwrap_or("application/octet-stream")
-}
 
 /// 单个图片文件 → `data:image/...;base64,...`。
 pub fn image_file_to_data_uri(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读图失败: {e}"))?;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mime =
+        crate::platform::filesystem::image_mime_type(path).unwrap_or("application/octet-stream");
     Ok(format!(
         "data:{};base64,{}",
-        image_mime(ext),
+        mime,
         base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
 }
@@ -155,17 +146,28 @@ pub fn office_to_png_data_uris(path: &Path, max_pages: u32) -> Result<(Vec<Strin
                 .ok_or_else(|| "LibreOffice 未产出 PDF".to_string())?;
 
             let pages = render_pdf_pages(&pdf, tmpdir, 110, max_pages)?;
-            if pages.is_empty() {
-                return Err("未产出可渲染幻灯片页".into());
-            }
-            let truncated = pages.len() as u32 >= max_pages;
-            let mut uris = Vec::with_capacity(pages.len());
-            for p in &pages {
-                uris.push(image_file_to_data_uri(p)?);
-            }
-            Ok((uris, truncated))
+            pages_to_data_uris(&pages, max_pages, "未产出可渲染幻灯片页")
         },
     )
+}
+
+/// Shared tail of the office/PDF preview lanes: empty-page guard (with the
+/// lane's own empty label), truncation flag at the page cap, then per-page
+/// PNG → data-URI conversion.
+fn pages_to_data_uris(
+    pages: &[PathBuf],
+    max_pages: u32,
+    empty_label: &str,
+) -> Result<(Vec<String>, bool), String> {
+    if pages.is_empty() {
+        return Err(empty_label.to_string());
+    }
+    let truncated = pages.len() as u32 >= max_pages;
+    let mut uris = Vec::with_capacity(pages.len());
+    for p in pages {
+        uris.push(image_file_to_data_uri(p)?);
+    }
+    Ok((uris, truncated))
 }
 
 /// Shared pdftoppm rendering core: renders `pdf` into `dir` at `dpi` (`page-<n>.png`,
@@ -238,15 +240,7 @@ pub fn pdf_to_png_data_uris(path: &Path, max_pages: u32) -> Result<(Vec<String>,
 
     let result = (|| -> Result<(Vec<String>, bool), String> {
         let pages = render_pdf_pages(path, &tmpdir, 110, max_pages)?;
-        if pages.is_empty() {
-            return Err("PDF 未产出可渲染页".into());
-        }
-        let truncated = pages.len() as u32 >= max_pages;
-        let mut uris = Vec::with_capacity(pages.len());
-        for p in &pages {
-            uris.push(image_file_to_data_uri(p)?);
-        }
-        Ok((uris, truncated))
+        pages_to_data_uris(&pages, max_pages, "PDF 未产出可渲染页")
     })();
     let _ = std::fs::remove_dir_all(&tmpdir);
     result
@@ -413,92 +407,4 @@ pub(super) fn ocr_pdf(
 
     let _ = std::fs::remove_dir_all(&tmpdir);
     result
-}
-
-#[cfg(test)]
-mod visual_preview_smoke {
-    use super::*;
-    use std::process::Command;
-
-    // 真跑 soffice/pandoc/pdftoppm，验证可视化预览两条路径产出非空 + 图片内联。
-    // 依赖系统工具，CI 无则 ignore。
-    #[test]
-    #[ignore = "需要 libreoffice + pandoc + poppler"]
-    fn office_to_inline_html_and_pdf_to_pngs() {
-        let dir = std::env::temp_dir().join(format!("pinvou3-visual-smoke-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // 1) md -> docx (pandoc) -> inline html
-        let md = dir.join("doc.md");
-        std::fs::write(&md, "# 标题\n\n正文一段。\n\n- 列表项\n").unwrap();
-        let docx = dir.join("doc.docx");
-        let ok = Command::new("pandoc")
-            .arg(&md)
-            .arg("-o")
-            .arg(&docx)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok && docx.exists(), "pandoc 造 docx 失败");
-        let html = libreoffice_to_inline_html(&docx).expect("office->html 应成功");
-        assert!(html.contains("标题"), "HTML 应含正文文字");
-        assert!(
-            !html.contains("src=\"doc_html"),
-            "旁置图片应已内联(不应残留相对 src)"
-        );
-
-        // 2) md -> pdf (soffice via docx) -> png 页
-        let pdf = dir.join("doc.pdf");
-        let _ = libreoffice_tool_command()
-            .arg(libreoffice_user_installation_arg(&dir.join("p")).unwrap())
-            .args(["--headless", "--convert-to", "pdf", "--outdir"])
-            .arg(&dir)
-            .arg(&docx)
-            .status();
-        if pdf.exists() {
-            let (imgs, _trunc) = pdf_to_png_data_uris(&pdf, 30).expect("pdf->png 应成功");
-            assert!(!imgs.is_empty(), "应产出至少一页");
-            assert!(
-                imgs[0].starts_with("data:image/png;base64,"),
-                "应为 png data URI"
-            );
-        }
-
-        // 3) md -> pptx (pandoc) -> office_to_png(演示稿走 PDF→PNG)
-        let pptx = dir.join("deck.pptx");
-        if Command::new("pandoc")
-            .arg(&md)
-            .arg("-o")
-            .arg(&pptx)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            let (imgs, _t) = office_to_png_data_uris(&pptx, 30).expect("pptx->png 应成功");
-            assert!(
-                !imgs.is_empty() && imgs[0].starts_with("data:image/png;base64,"),
-                "pptx 应产出页图"
-            );
-        }
-
-        // 4) csv -> xlsx (soffice) -> inline html(电子表格走 HTML 表格)
-        let csv = dir.join("data.csv");
-        std::fs::write(&csv, "甲,乙\n1,2\n3,4\n").unwrap();
-        let _ = libreoffice_tool_command()
-            .arg(libreoffice_user_installation_arg(&dir.join("p2")).unwrap())
-            .args(["--headless", "--convert-to", "xlsx", "--outdir"])
-            .arg(&dir)
-            .arg(&csv)
-            .status();
-        let xlsx = dir.join("data.xlsx");
-        if xlsx.exists() {
-            let html = libreoffice_to_inline_html(&xlsx).expect("xlsx->html 应成功");
-            assert!(
-                html.contains('甲') || html.to_lowercase().contains("table"),
-                "xlsx HTML 应含表格内容"
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

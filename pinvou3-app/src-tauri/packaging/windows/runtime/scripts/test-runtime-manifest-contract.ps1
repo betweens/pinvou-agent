@@ -1,3 +1,17 @@
+# Windows runtime manifest contract suite. Scope note: production already
+# consumes the contract library directly -- resolve-runtime.ps1 runs
+# Assert-WindowsRuntimeStagedFilesDeclared on every manifest read and
+# Assert-WindowsRuntimeStagedFilesExact inside Stage-Submodule, and that
+# production wiring is itself pinned by tests/windows_runtime_packaging_
+# contract.test.js. This suite is the library's direct test home (per-throw-
+# site negative cases), run via `npm run test:windows-runtime-manifest` in
+# pr-check's Windows job.
+#
+# The Write-Utf8Atomically assertions below (atomic write / FILE_SHARE_DELETE
+# / litter cleanup) dot-source resolve-runtime.ps1 -ImportFunctionsOnly,
+# which runs its top-level lock validation (read-only, and it passes against
+# the checked-in x86_64.lock.json) before returning ahead of all staging
+# work, so no further resolve-runtime.ps1 parity is required for them.
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "runtime-manifest-contract.ps1")
@@ -122,19 +136,41 @@ try {
       -StageRoot $schema2Root
   }
 
-  foreach ($invalidPath in @(
+  # Pattern is per-throw-site (not the shared word "canonical") so a regression
+  # in one guard cannot be masked by the other one throwing instead. The
+  # whole-path guard's whitespace-only case and the segment guard's
+  # trailing-dot / colon (ADS) / trailing-whitespace cases previously shipped
+  # without direct assertions -- a guard regression there passed the suite
+  # while staging validation weakened.
+  foreach ($wholePathViolation in @(
     "/absolute.txt",
     "C:/absolute.txt",
-    "payload//archive.zip",
-    "payload/./archive.zip",
-    "payload/../archive.zip",
-    "payload\archive.zip"
+    "payload\archive.zip",
+    "   "
   )) {
-    Assert-Throws -Name "schema2 non-canonical path $invalidPath" -MessagePattern "canonical" -Action {
+    Assert-Throws -Name "schema2 non-canonical path $wholePathViolation" -MessagePattern "must be a canonical relative path" -Action {
       Assert-WindowsRuntimeStagedFilesExact `
         -Manifest ([pscustomobject]@{
           schemaVersion = 2
-          stagedFiles = @([pscustomobject]@{ path = $invalidPath; bytes = 1; sha256 = ("0" * 64) })
+          stagedFiles = @([pscustomobject]@{ path = $wholePathViolation; bytes = 1; sha256 = ("0" * 64) })
+        }) `
+        -StageRoot $schema2Root
+    }
+  }
+
+  foreach ($segmentViolation in @(
+    "payload//archive.zip",
+    "payload/./archive.zip",
+    "payload/../archive.zip",
+    "payload/archive.zip.",
+    "payload /archive.zip",
+    "payload/arch:ive.zip"
+  )) {
+    Assert-Throws -Name "schema2 non-canonical segment $segmentViolation" -MessagePattern "non-canonical segment" -Action {
+      Assert-WindowsRuntimeStagedFilesExact `
+        -Manifest ([pscustomobject]@{
+          schemaVersion = 2
+          stagedFiles = @([pscustomobject]@{ path = $segmentViolation; bytes = 1; sha256 = ("0" * 64) })
         }) `
         -StageRoot $schema2Root
     }
@@ -143,6 +179,52 @@ try {
   [System.IO.Directory]::Delete((Join-Path $schema2Root "payload"), $true)
   Assert-Throws -Name "schema2 after payload cleanup" -MessagePattern "staged file is missing" -Action {
     Assert-WindowsRuntimeStagedFilesExact -Manifest $schema2Manifest -StageRoot $schema2Root
+  }
+
+  # Write-Utf8Atomically keeps shared-visibility descriptors continuously
+  # present for the unlocked readers in scripts/tauri/windows-runtime.js:
+  # replacement must swap the file in atomically, a failed replacement must
+  # preserve the previous generation and leave no temp litter behind.
+  . (Join-Path $PSScriptRoot "resolve-runtime.ps1") -ImportFunctionsOnly
+  $atomicRoot = Join-Path $fixtureRoot "atomic"
+  New-Item -ItemType Directory -Path $atomicRoot | Out-Null
+  $atomicPath = Join-Path $atomicRoot "descriptor.json"
+  Write-Utf8Atomically -Path $atomicPath -Content "first"
+  if ([System.IO.File]::ReadAllText($atomicPath) -ne "first") {
+    throw "atomic write must create the destination with the requested content"
+  }
+  foreach ($generation in @("second", "third")) {
+    Write-Utf8Atomically -Path $atomicPath -Content $generation
+    if ([System.IO.File]::ReadAllText($atomicPath) -ne $generation) {
+      throw "atomic replacement must swap in the new content in one operation"
+    }
+  }
+  # A plain .NET reader opens the descriptor without FILE_SHARE_DELETE, which
+  # blocks ReplaceFile: the writer must fail loudly instead of deleting the
+  # destination first (Move-Item -Force semantics).
+  $sharingReader = [System.IO.File]::Open(
+    $atomicPath,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::Read
+  )
+  try {
+    Assert-Throws -Name "atomic replace under a sharing reader" -Action {
+      Write-Utf8Atomically -Path $atomicPath -Content "interrupted"
+    }
+  } finally {
+    $sharingReader.Dispose()
+  }
+  if ([System.IO.File]::ReadAllText($atomicPath) -ne "third") {
+    throw "a failed atomic replacement must preserve the previous descriptor"
+  }
+  $tempLitter = @(Get-ChildItem -LiteralPath $atomicRoot -Filter ".descriptor.json.tmp-*" -Force)
+  if ($tempLitter.Count -ne 0) {
+    throw "atomic replacement left temp files behind: $($tempLitter.Count)"
+  }
+  Write-Utf8Atomically -Path $atomicPath -Content "fourth"
+  if ([System.IO.File]::ReadAllText($atomicPath) -ne "fourth") {
+    throw "atomic replacement must succeed again once the reader is gone"
   }
 } finally {
   Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -61,7 +61,6 @@ async fn tls_config(
 
 pub fn router(service: Arc<KnowledgeService>) -> Router {
     Router::new()
-        .route("/health", get(health))
         .route("/api/v1/info", get(info))
         .route("/api/v1/access", get(current_access))
         .route(
@@ -124,7 +123,7 @@ pub fn router(service: Arc<KnowledgeService>) -> Router {
         )
         .route(
             "/api/v1/collections/{id}",
-            put(update_collection).delete(delete_collection),
+            axum::routing::delete(delete_collection),
         )
         .route("/api/v1/collections/{id}/restore", post(restore_collection))
         .route(
@@ -187,10 +186,6 @@ async fn apply_route_body_limit(
     })
     .apply(&mut request);
     next.run(request).await
-}
-
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"ok": true}))
 }
 
 async fn info(State(service): State<Arc<KnowledgeService>>) -> ApiResult<Json<ServerInfo>> {
@@ -539,20 +534,6 @@ async fn create_collection(
     ))
 }
 
-async fn update_collection(
-    State(service): State<Arc<KnowledgeService>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(request): Json<CreateCollectionRequest>,
-) -> ApiResult<Json<Collection>> {
-    require_access(&service, &headers, true)?;
-    Ok(Json(
-        service
-            .update_collection(id, request)
-            .map_err(ApiError::bad_request)?,
-    ))
-}
-
 async fn delete_collection(
     State(service): State<Arc<KnowledgeService>>,
     headers: HeaderMap,
@@ -584,11 +565,7 @@ async fn documents(
     Query(query): Query<DocumentListQuery>,
 ) -> ApiResult<Json<Vec<Document>>> {
     require_access(&service, &headers, query.include_deleted)?;
-    let documents = if query.limit.is_none() && query.offset == 0 {
-        service.documents(id, query.include_deleted)
-    } else {
-        service.documents_page(id, query.include_deleted, query.limit, query.offset)
-    };
+    let documents = service.documents_page(id, query.include_deleted, query.limit, query.offset);
     Ok(Json(documents.map_err(ApiError::internal)?))
 }
 
@@ -637,6 +614,25 @@ async fn document_statuses(
     ))
 }
 
+/// Document-write errors keep the upload family's 400 contract, except the
+/// stub-build local-embed refusal: that refusal is a platform capability
+/// fact (the service can never index on this build), so it maps to 503 like
+/// the search path instead of reading as a malformed request.
+fn map_document_write_error(error: String) -> ApiError {
+    map_document_write_error_for(crate::embedding::is_local_embed_unavailable(&error), error)
+}
+
+/// Capability bit as a parameter (same shape as the desktop twin's
+/// `local_embed_download_refusal(supported)`): the host executes both
+/// branches, while the production bit stays compile-time per target.
+fn map_document_write_error_for(unavailable: bool, error: String) -> ApiError {
+    if unavailable {
+        ApiError::unavailable(error)
+    } else {
+        ApiError::bad_request(error)
+    }
+}
+
 async fn replace_document(
     State(service): State<Arc<KnowledgeService>>,
     headers: HeaderMap,
@@ -649,7 +645,7 @@ async fn replace_document(
         service
             .replace_document(id, &filename, bytes)
             .await
-            .map_err(ApiError::bad_request)?,
+            .map_err(map_document_write_error)?,
     ))
 }
 
@@ -713,9 +709,6 @@ async fn search(
     // 廉价校验先于装载门:空查询直接 200 []、超量知识集选择 400,不触发
     // 568MB 冷装载,也不因模型不可用把应答变成 503(与 boot 同步装载时代的
     // 行为一致)。
-    // 廉价校验先于装载门:空查询直接 200 []、超量知识集选择 400,不触发
-    // 568MB 冷装载,也不因模型不可用把应答变成 503(与 boot 同步装载时代的
-    // 行为一致)。
     if let Some(hits) =
         KnowledgeService::precheck_search(&request).map_err(ApiError::bad_request)?
     {
@@ -762,22 +755,9 @@ async fn source_window(
 }
 
 fn is_private_network_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        }
-        IpAddr::V6(address) => {
-            if let Some(address) = address.to_ipv4_mapped() {
-                return is_private_network_ip(IpAddr::V4(address));
-            }
-            let first = address.segments()[0];
-            address.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-        }
-    }
+    // Join requests validate the directly-connected source, for which the
+    // host's own loopback is a legitimate source (allow loopback).
+    crate::net_policy::is_private_network_ip(address, true)
 }
 
 fn has_forwarding_headers(headers: &HeaderMap) -> bool {
@@ -809,7 +789,7 @@ fn is_private_network_host(uri: &Uri, headers: &HeaderMap) -> bool {
     if let Ok(address) = host.parse::<IpAddr>() {
         return is_private_network_ip(address);
     }
-    [".local", ".lan", ".internal", ".home.arpa", ".ts.net"]
+    crate::net_policy::PRIVATE_HOST_SUFFIXES
         .iter()
         .any(|suffix| host.ends_with(suffix))
 }
@@ -944,24 +924,47 @@ mod tests {
     use serde::Serialize;
     use tower::ServiceExt;
 
+    #[test]
+    fn document_write_errors_map_the_stub_refusal_to_unavailable() {
+        // The stub refusal is a platform capability fact, not a malformed
+        // request: it must reach the client as 503 (like the search path),
+        // while ordinary document errors keep the family's 400 contract.
+        assert_eq!(
+            map_document_write_error_for(false, "boom".to_string()).status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            map_document_write_error_for(true, "stub".to_string()).status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Real-impl builds never produce the refusal (compile-time pin lives
+        // on the loongarch64 side); the host direction of the predicate.
+        assert!(!crate::embedding::is_local_embed_unavailable(
+            "any parse error"
+        ));
+    }
+
     #[tokio::test]
-    async fn health_is_public_but_collections_require_authentication() {
+    async fn info_is_public_but_collections_require_authentication() {
         let root = tempfile::tempdir().unwrap();
         let service = KnowledgeService::boot(root.path().to_path_buf(), None)
             .unwrap()
             .service;
         let app = router(service);
-        let health = app
+        // /api/v1/info is the only public endpoint: the CLI --health-check
+        // (deploy/install.sh) and the packaged host-helper probe both depend
+        // on unauthenticated reachability; this test pins that too.
+        let info = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/health")
+                    .uri("/api/v1/info")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(info.status(), StatusCode::OK);
         let collections = app
             .oneshot(
                 Request::builder()

@@ -22,21 +22,39 @@ const settingsI18nSources = ['zh', 'en', 'ja'].map((lang) => fs.readFileSync(
   path.join(__dirname, '..', 'src', 'shared', 'i18n', `${lang}.js`),
   'utf8',
 ));
-assert.match(
+// test_model_connection always resolves a serialized result object (the Rust
+// side maps transport/HTTP failures into the struct, including the 402
+// 'billing' code consumed via connectionMessages below); the FE normalizer
+// therefore keeps only the object branch plus an unknown-code reject fallback.
+assert.doesNotMatch(
   settingsViewSource,
-  /status === 402 \? 'billing'/,
-  'settings connection test must classify HTTP 402 as billing',
+  /HTTP\\s\+\(\\d\{3\}\)/,
+  'the legacy string-protocol HTTP parser must stay deleted',
 );
 assert.match(
   settingsViewSource,
-  /status === 402 \? settingsCopy\.connectionMessages\.billing/,
-  'settings connection test must provide a user-friendly billing message',
+  /code: 'unknown', message: settingsCopy\.connectionMessages\.unknown, detail: String\(value \|\| ''\)/,
+  'settings connection test must degrade unknown rejects to the unknown copy',
 );
 for (const settingsI18nSource of settingsI18nSources) {
   assert.match(
     settingsI18nSource,
     /connectionMessages:\{[^}]*billing:/,
     'settings billing message must be provided in every UI language',
+  );
+}
+// Chat streaming fade-in row: desktop-only (WebSettingsPatch has no `chat`
+// field and would hard-reject the patch), with copy present in every language.
+assert.match(
+  settingsViewSource,
+  /!isWeb && \(\s*<IOSSection title=\{t\.chatSection\}>[\s\S]*?t\.chatStreamingAnimation/,
+  'chat streaming fade-in row must exist and stay gated off the web lane',
+);
+for (const settingsI18nSource of settingsI18nSources) {
+  assert.match(
+    settingsI18nSource,
+    /chatStreamingAnimation:/,
+    'chat streaming fade-in copy must be provided in every UI language',
   );
 }
 // Legacy handleDetect auto-fill path is deleted; only handleLocalDetect remains.
@@ -72,6 +90,27 @@ assert.doesNotMatch(
   localDetectSource,
   /setBaseUrl\(|setModel\(/,
   'local detection must not auto-fill the form; the user adds a candidate explicitly',
+);
+// 添加/编辑模型弹窗的滚动必须收敛在内层 data-testid="model-form-scroll" 容器
+// （min-h-0 + flex-1 + overflow-y-auto），弹窗本体（圆角 + max-h 元素）不再自带
+// overflow-y-auto：fixed + backdrop-filter 祖先链下，个别 WebKit 内核不会为
+// 「同元素 max-h + overflow-y-auto」组合建立滚动区（用户反馈：本地模型列表
+// 后半部分无法滚动选择）。内层 flex 滚动区在所有内核行为一致。
+const modelFormScrollers = settingsViewSource.match(
+  /data-testid="model-form-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain custom-scrollbar"/g,
+) || [];
+assert.strictEqual(
+  modelFormScrollers.length,
+  2,
+  'both model form dialogs (picker + edit form) must scroll inside the dedicated min-h-0 container',
+);
+const flexScrollDialogs = settingsViewSource.match(
+  /max-h-\[76vh\] flex flex-col overflow-hidden rounded-\[22px\]/g,
+) || [];
+assert.strictEqual(
+  flexScrollDialogs.length,
+  2,
+  'model form dialog containers must cap height and delegate scrolling to the inner container',
 );
 for (const settingsI18nSource of settingsI18nSources) {
   assert.match(
@@ -186,6 +225,7 @@ function injectSource() {
     var superPerm = false;
     var calls = [];
     var updateResponse = { available: false, current_version: '0.6.1', latest_version: '0.6.1', notes: '', platform: 'windows' };
+    var updateCheckFailure = null;
     var modelTestResponse = { ok: true, code: 'ok', message: '连接成功，服务可用', detail: 'HTTP 200', http_status: 200 };
     var imageTestResponse = { status: 'supported', verified: true, summary: '红色', http_status: 200 };
     var imageTestDelay = 0; // 模拟探测耗时,便于断言行内忙转态
@@ -209,6 +249,8 @@ function injectSource() {
     var failMemoryOverview = false;
     var failMemoryUpdate = false;
     var pendingDownloadResolve = null;
+    var pendingDownloadReject = null;
+    var probedLocalKind = null;
     function record(cmd, args) { calls.push({ cmd: cmd, args: args || null }); }
     // Deliberately not stubbing window.confirm here. SettingsView now routes
     // everything through in-app confirm dialogs (the native confirm does not
@@ -224,6 +266,7 @@ function injectSource() {
     function invoke(cmd, args) {
       record(cmd, args);
       switch (cmd) {
+        case 'probe_local_server_kind': return Promise.resolve(probedLocalKind);
         case 'get_platform_capabilities': return Promise.resolve({
           os: 'windows',
           showSuperPermissionSettings: false,
@@ -235,9 +278,6 @@ function injectSource() {
         case 'update_settings':
           settings = Object.assign({}, settings, args.patch || {});
           return Promise.resolve(settings);
-        case 'save_settings_and_restart':
-          settings = Object.assign({}, settings, args.patch || {});
-          return Promise.resolve(null);
         case 'update_search_settings':
           settings = Object.assign({}, settings, { search: args.search });
           return Promise.resolve(settings);
@@ -265,35 +305,65 @@ function injectSource() {
           return new Promise(function (resolve) {
             setTimeout(function () { resolve(Object.assign({}, imageTestResponse)); }, imageTestDelay);
           });
-        case 'discover_local_vllm': return Promise.resolve({ candidates: [
-          {
-            provider: 'ollama',
-            label: 'Ollama',
-            base_url: 'http://127.0.0.1:11434/v1',
-            status: 'ready',
-            model: 'qwen2.5-coder:32b',
-            models: [{ id: 'qwen2.5-coder:32b', loaded: true }, { id: 'deepseek-r1:14b', loaded: false }],
-            max_model_len: 32768,
-          },
-          {
-            provider: 'vllm',
-            label: 'vLLM',
-            base_url: 'http://127.0.0.1:8000/v1',
-            status: 'ready',
-            model: 'qwen36_35b_256k',
-            models: ['qwen36_35b_256k'],
-            max_model_len: 262144,
-          },
-        ] });
-        case 'detect_local_vllm_setup': return Promise.resolve({ eligible: false, has_packages: false, vllm_online: false });
+        case 'discover_local_vllm': {
+          // Port-routed alternate rosters: the candidates mapping keeps
+          // max_model_len on the first row only, so each provider's
+          // persistence arm in buildLocalModelPayload is pinned by
+          // detecting that provider on its own port and adding its
+          // index-0 row.
+          const alternates = {
+            1234: [{
+              provider: 'lm_studio',
+              label: 'LM Studio',
+              base_url: 'http://127.0.0.1:1234/v1',
+              status: 'ready',
+              model: 'gemma-3-12b',
+              models: [{ id: 'gemma-3-12b', loaded: true }],
+              max_model_len: 12918,
+            }],
+            8000: [{
+              provider: 'vllm',
+              label: 'vLLM',
+              base_url: 'http://127.0.0.1:8000/v1',
+              status: 'ready',
+              model: 'qwen36_35b_256k',
+              models: ['qwen36_35b_256k'],
+              max_model_len: 262144,
+            }],
+          };
+          const customPort = args && args.request && args.request.customPort;
+          return Promise.resolve({ candidates: alternates[customPort] || [
+            {
+              provider: 'ollama',
+              label: 'Ollama',
+              base_url: 'http://127.0.0.1:11434/v1',
+              status: 'ready',
+              model: 'qwen2.5-coder:32b',
+              models: [{ id: 'qwen2.5-coder:32b', loaded: true }, { id: 'deepseek-r1:14b', loaded: false }],
+              max_model_len: 32768,
+            },
+            {
+              provider: 'vllm',
+              label: 'vLLM',
+              base_url: 'http://127.0.0.1:8000/v1',
+              status: 'ready',
+              model: 'qwen36_35b_256k',
+              models: ['qwen36_35b_256k'],
+              max_model_len: 262144,
+            },
+          ] });
+        }
         case 'get_selected_pet': return Promise.resolve('lingling');
         case 'list_sessions': return Promise.resolve([]);
         case 'get_super_permission_status': return Promise.resolve(superPerm);
         case 'set_super_permission': return Promise.reject(new Error('pkexec unavailable'));
         case 'list_personas': return Promise.resolve([]);
         case 'get_backend_status': return Promise.resolve({ online: true, ok: true, status: 'online' });
-        case 'check_for_update': return Promise.resolve(Object.assign({}, updateResponse));
-        case 'download_update': return new Promise(function (resolve) { pendingDownloadResolve = resolve; });
+        case 'check_for_update':
+          return updateCheckFailure
+            ? Promise.reject(new Error(updateCheckFailure))
+            : Promise.resolve(Object.assign({}, updateResponse));
+        case 'download_update': return new Promise(function (resolve, reject) { pendingDownloadResolve = resolve; pendingDownloadReject = reject; });
         case 'install_update': return Promise.resolve(null);
         case 'find_resumable_run': return Promise.resolve(null);
         case 'check_dependencies': return Promise.resolve(dependencyCheckResponse.slice());
@@ -336,11 +406,13 @@ function injectSource() {
     }
     window.__SETTINGS_TEST__ = {
       calls: calls,
+      setProbedLocalKind: function (kind) { probedLocalKind = kind; },
       emit: emit,
       models: function () { return models.slice(); },
       settings: function () { return settings; },
       activeModelId: function () { return activeModelId; },
       setUpdateResponse: function (next) { updateResponse = Object.assign({}, updateResponse, next || {}); },
+      setUpdateCheckFailure: function (message) { updateCheckFailure = message || null; },
       setModelTestResponse: function (next) { modelTestResponse = Object.assign({}, next || {}); },
       setImageTestResponse: function (next) { imageTestResponse = Object.assign({}, next || {}); },
       setImageTestDelay: function (ms) { imageTestDelay = Number(ms) || 0; },
@@ -356,6 +428,13 @@ function injectSource() {
           var resolve = pendingDownloadResolve;
           pendingDownloadResolve = null;
           resolve({ package_path: 'C:\\\\tmp\\\\pinvou.zip', installer_path: 'C:\\\\tmp\\\\pinvou.msi', latest_version: updateResponse.latest_version });
+        }
+      },
+      rejectDownload: function (rawError) {
+        if (pendingDownloadResolve) {
+          var reject = pendingDownloadReject;
+          pendingDownloadResolve = null;
+          reject(new Error(rawError));
         }
       },
     };
@@ -508,6 +587,40 @@ async function modalWidth(page, headingText) {
   await sleep(400);
   rec('① 设置页可打开且无错误边界', await page.evaluate(() => document.body.innerText.includes('通用') && !document.body.innerText.includes('设置页加载失败')));
 
+  // Exercise the app shell -> SettingsView callback and actual bridge payload:
+  // an explicit light preference must not follow a darkened OS, "system"
+  // saves the authoritative color_scheme plus the legacy theme mirror, and an
+  // explicit dark pick overrides a light OS.
+  await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'dark' }]);
+  // The .dark class is toggled from a passive useEffect on the media query,
+  // so an absence assertion needs the media change to be observed and one
+  // render committed first — otherwise the check can read the pre-effect DOM
+  // and vacuously pass exactly when explicit light wrongly follows the OS.
+  await page.waitForFunction(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => { requestAnimationFrame(resolve); });
+  }));
+  await sleep(200);
+  rec('① 旧显式浅色偏好不随系统变深', await page.evaluate(() => !document.documentElement.classList.contains('dark')));
+  await clickExact(page, '跟随系统');
+  await page.waitForFunction(() => document.documentElement.classList.contains('dark')
+    && window.__SETTINGS_TEST__.settings().color_scheme === 'system');
+  rec('① 跟随系统保存权威偏好并兼容旧主题字段', await page.evaluate(() =>
+    window.__SETTINGS_TEST__.settings().theme === 'genesis'));
+  await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'light' }]);
+  await page.waitForFunction(() => !document.documentElement.classList.contains('dark'));
+  await clickExact(page, '深色');
+  await page.waitForFunction(() => document.documentElement.classList.contains('dark')
+    && window.__SETTINGS_TEST__.settings().color_scheme === 'dark');
+  rec('① 显式深色覆盖系统浅色', await page.evaluate(() =>
+    window.__SETTINGS_TEST__.settings().theme === 'genesis'));
+  await clickExact(page, '浅色');
+  await page.waitForFunction(() => !document.documentElement.classList.contains('dark')
+    && window.__SETTINGS_TEST__.settings().color_scheme === 'light');
+  rec('① 显式浅色恢复初始偏好与旧主题镜像', await page.evaluate(() =>
+    window.__SETTINGS_TEST__.settings().color_scheme === 'light'
+      && window.__SETTINGS_TEST__.settings().theme === 'liquid-light'));
+
   const voiceShortcutRow = await page.evaluate(() => {
     const row = [...document.querySelectorAll('div')].filter(node => (node.textContent || '').includes('启用 Alt 唤醒语音') && node.querySelector('[role="switch"]')).pop();
     const button = row && row.querySelector('[role="switch"]');
@@ -598,7 +711,20 @@ async function modalWidth(page, headingText) {
       && window.__SETTINGS_TEST__.calls.some(function (item) { return item.cmd === 'delete_work_context_memory'; })));
 
   await clickSettingsSection(page, '更新');
+  // A failed manual check (offline, blocked request, ...) shows only the short localized hint, never the raw backend error.
   await page.evaluate(async () => {
+    window.__SETTINGS_TEST__.setUpdateCheckFailure('update request failed: error sending request for url');
+    await window.TauriBridge.updater.checkForUpdate();
+  });
+  await sleep(250);
+  const updateCheckFailureText = await page.evaluate(() => document.querySelector('#settings-version-update')?.innerText || '');
+  rec('update: a failed manual check shows only the short localized hint',
+    updateCheckFailureText.includes('检查失败')
+    && !updateCheckFailureText.includes('update request failed')
+    && !updateCheckFailureText.includes('error sending request'),
+    updateCheckFailureText);
+  await page.evaluate(async () => {
+    window.__SETTINGS_TEST__.setUpdateCheckFailure(null);
     window.__SETTINGS_TEST__.setUpdateResponse({
       available: true,
       current_version: '0.6.1',
@@ -641,6 +767,29 @@ async function modalWidth(page, headingText) {
   await page.evaluate(() => window.__SETTINGS_TEST__.resolveDownload());
   await sleep(250);
 
+  // ①u A failed download/install shows only the localized short hint: the raw
+  // backend error string (it may carry request details and its language is
+  // undefined) never enters the card — it stays on bridge state and the
+  // updater's log as diagnostics. Do not await the returned promise: the
+  // download hangs until the reject hook fires, and awaiting would stall CDP.
+  await page.evaluate(() => { window.TauriBridge.updater.downloadAndInstallUpdate(); });
+  await sleep(250);
+  await page.evaluate(() => window.__SETTINGS_TEST__.rejectDownload('RAW update diagnostics: apt stderr http://proxy.internal'));
+  await sleep(250);
+  const updateFailureText = await page.evaluate(() => {
+    const root = document.querySelector('#settings-version-update');
+    return root ? root.innerText : '';
+  });
+  rec('①u 更新失败仅显示本地化提示,原始错误串不进卡片',
+    updateFailureText.includes('更新失败')
+    && !updateFailureText.includes('RAW update diagnostics')
+    && !updateFailureText.includes('proxy.internal'),
+    JSON.stringify(updateFailureText));
+  // Note: bs.updateError stays set on the bridge after this rec (the bridge only
+  // clears it at the start of the next download). Harmless today because no
+  // later test reads the update card, but any future update-section test must
+  // run a fresh downloadAndInstallUpdate (or reset state) before asserting.
+
   await clickSettingsSection(page, '模型');
   const modelList = await page.evaluate(() => {
     const text = document.body.innerText;
@@ -666,18 +815,27 @@ async function modalWidth(page, headingText) {
 
   await clickRowAction(page, 'deepseek-v4-flash', '编辑');
   await sleep(250);
-  const maskedSavedKey = await page.evaluate(() => ({
-    maskedPlaceholder: [...document.querySelectorAll('input')].some(node => node.placeholder === '••••••••'),
-    noConfiguredText: !document.body.innerText.includes('已配置'),
-  }));
+  const maskedSavedKey = await page.evaluate(() => {
+    const keyInput = document.querySelector('[data-testid="model-form-dialog"] [data-testid="model-api-key-input"]');
+    return {
+      maskedPlaceholder: [...document.querySelectorAll('input')].some(node => node.placeholder === '••••••••'),
+      noConfiguredText: !document.body.innerText.includes('已配置'),
+      // 掩码不变量:输入框是 type=text,遮挡完全来自 -webkit-text-security。
+      // 没有这条断言,删掉那行 style 就会让 Key 明文渲染而所有门禁照样全绿。
+      maskedByTextSecurity: !!keyInput && window.getComputedStyle(keyInput).webkitTextSecurity === 'disc',
+    };
+  });
   await clickExact(page, '显示');
   await sleep(350);
   const editModelBehavior = await page.evaluate(() => {
     const text = document.body.innerText;
     const input = [...document.querySelectorAll('input')].find(node => node.value === 'sk-saved-deepseek');
+    const keyInput = document.querySelector('[data-testid="model-form-dialog"] [data-testid="model-api-key-input"]');
     return {
       revealCall: window.__SETTINGS_TEST__.calls.some(call => call.cmd === 'reveal_model_api_key' && call.args.id === 'cloud-deepseek'),
       keyRevealed: !!input,
+      // 「显示」必须真正撤掉掩码,而不仅仅是把值取回来。
+      unmaskedAfterReveal: !!keyInput && window.getComputedStyle(keyInput).webkitTextSecurity === 'none',
       sameProviderOnlyClosed: !text.includes('kimi-k3') && !text.includes('glm-5.2'),
       // 带 provider_kind 的官方模型必须仍能找到目录组,配置区与测试连接不被隐藏。
       testConnectionVisible: text.includes('测试连接'),
@@ -776,6 +934,7 @@ async function modalWidth(page, headingText) {
       hasIntlNodes: text.includes('Kimi 国际版 / Kimi Global') && text.includes('智谱国际版 / GLM API (z.ai)')
         && text.includes('MiniMax 国际版 / MiniMax Global') && text.includes('通义千问国际版 / Qwen International'),
       hasTokenPlan: text.includes('通义千问 Token Plan'),
+      hasAggregators: text.includes('聚合平台') && text.includes('OpenRouter') && text.includes('硅基流动 SiliconFlow'),
       providerFirst: !text.includes('deepseek-v4-pro') && !text.includes('kimi-k3'),
       noStale: stale.every(name => !text.includes(name)),
     };
@@ -791,6 +950,46 @@ async function modalWidth(page, headingText) {
     };
   });
   rec('⑥.1 添加模型默认展示云端 tab 且保留本地 tab 入口', Object.values(addPickerDefault).every(Boolean), JSON.stringify(addPickerDefault));
+
+  // ⑥.2 长列表可达性守卫：云端目录远超弹窗 max-h，滚动必须发生在内层
+  // model-form-scroll 容器上，且能一路滚到底部（模型列表后半部分必须可选）。
+  const pickerScroll = await page.evaluate(() => {
+    const dialog = document.querySelector('[data-testid="model-form-dialog"]');
+    const scroller = document.querySelector('[data-testid="model-form-scroll"]');
+    const rect = dialog ? dialog.getBoundingClientRect() : null;
+    return {
+      found: !!dialog && !!scroller,
+      overflowY: scroller ? getComputedStyle(scroller).overflowY : null,
+      capped: dialog ? (parseFloat(getComputedStyle(dialog).maxHeight) || 0) > 0 : false,
+      overflowing: !!scroller && scroller.scrollHeight > scroller.clientHeight,
+      center: rect ? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + Math.min(rect.height / 2, 200)) } : null,
+    };
+  });
+  let pickerScrollAfter = { top: -1, reachedEnd: false };
+  if (pickerScroll.found && pickerScroll.overflowing && pickerScroll.center) {
+    await page.mouse.move(pickerScroll.center.x, pickerScroll.center.y);
+    await page.mouse.wheel({ deltaY: 600 });
+    await sleep(250);
+    for (let i = 0; i < 8; i += 1) {
+      await page.mouse.wheel({ deltaY: 1200 });
+      await sleep(100);
+    }
+    pickerScrollAfter = await page.evaluate(() => {
+      const scroller = document.querySelector('[data-testid="model-form-scroll"]');
+      return {
+        top: scroller.scrollTop,
+        reachedEnd: Math.abs(scroller.scrollTop + scroller.clientHeight - scroller.scrollHeight) <= 2,
+      };
+    });
+  }
+  rec('⑥.2 添加模型弹窗长列表可在内层滚动容器一路滚到底（列表尾部可达）',
+    pickerScroll.found
+      && pickerScroll.overflowY === 'auto'
+      && pickerScroll.capped
+      && pickerScroll.overflowing
+      && pickerScrollAfter.top > 0
+      && pickerScrollAfter.reachedEnd === true,
+    JSON.stringify({ pickerScroll, pickerScrollAfter }));
 
   await clickExact(page, '通义千问 Token Plan');
   await sleep(300);
@@ -1042,10 +1241,73 @@ async function modalWidth(page, headingText) {
       && savedLocalModel.preset === 'local_vllm'
       && savedLocalModel.model === 'qwen2.5-coder:32b'
       && savedLocalModel.base_url === 'http://127.0.0.1:11434/v1'
-      && savedLocalModel.context_window_tokens === 32768
+      // Ollama 的 max_model_len 是运行时生效值（/api/ps），不持久化为用户
+      // 声明——声明会永久 min-clamp 后续探测且表单对该预设隐藏本字段；窗口
+      // 由引擎每次 spawn 原生探测实时采纳（vLLM 候选仍持久化其部署配置）。
+      && savedLocalModel.context_window_tokens === null
       && savedLocalModel.api_key === ''
       && savedLocalModel.credential_action === 'keep_existing',
     JSON.stringify(savedLocalModel));
+
+  // ⑥.5 The other two arms of the persistence ternary: LM Studio persists
+  // null too (its loaded_context_length is runtime-effective like Ollama's
+  // /api/ps), and a vLLM row keeps persisting its deployment max_model_len —
+  // an always-null mutation of buildLocalModelPayload must go red here.
+  await setPortDraft('1234');
+  await clickExact(page, '重新检测');
+  await sleep(500);
+  const lmstudioAddClicked = await page.evaluate(() => {
+    const title = [...document.querySelectorAll('span')].find(node => (node.textContent || '').trim() === 'gemma-3-12b');
+    let row = title;
+    while (row && ![...row.querySelectorAll('button')].some(button => (button.textContent || '').trim() === '添加')) {
+      row = row.parentElement;
+    }
+    const button = row && [...row.querySelectorAll('button')].find(candidate => (candidate.textContent || '').trim() === '添加');
+    if (!button) return false;
+    button.click();
+    return true;
+  });
+  await sleep(500);
+  const savedLmstudioModel = await page.evaluate(() => {
+    const call = [...window.__SETTINGS_TEST__.calls].reverse().find(item => item.cmd === 'save_model');
+    return call && call.args && call.args.model;
+  });
+  rec('⑥.5a LM Studio candidate persists a null window (runtime-effective served value)',
+    lmstudioAddClicked
+      && savedLmstudioModel
+      && savedLmstudioModel.preset === 'local_vllm'
+      && savedLmstudioModel.base_url === 'http://127.0.0.1:1234/v1'
+      && savedLmstudioModel.model === 'gemma-3-12b'
+      && savedLmstudioModel.context_window_tokens === null,
+    JSON.stringify(savedLmstudioModel));
+  await setPortDraft('8000');
+  await clickExact(page, '重新检测');
+  await sleep(500);
+  const vllmAddClicked = await page.evaluate(() => {
+    const title = [...document.querySelectorAll('span')].find(node => (node.textContent || '').trim() === 'qwen36_35b_256k');
+    let row = title;
+    while (row && ![...row.querySelectorAll('button')].some(button => (button.textContent || '').trim() === '添加')) {
+      row = row.parentElement;
+    }
+    const button = row && [...row.querySelectorAll('button')].find(candidate => (candidate.textContent || '').trim() === '添加');
+    if (!button) return false;
+    button.click();
+    return true;
+  });
+  await sleep(500);
+  const savedVllmModel = await page.evaluate(() => {
+    const call = [...window.__SETTINGS_TEST__.calls].reverse().find(item => item.cmd === 'save_model');
+    return call && call.args && call.args.model;
+  });
+  rec('⑥.5b vLLM candidate keeps persisting its deployment max_model_len',
+    vllmAddClicked
+      && savedVllmModel
+      && savedVllmModel.preset === 'local_vllm'
+      && savedVllmModel.base_url === 'http://127.0.0.1:8000/v1'
+      && savedVllmModel.model === 'qwen36_35b_256k'
+      && savedVllmModel.context_window_tokens === 262144,
+    JSON.stringify(savedVllmModel));
+  await setPortDraft('');
 
   await clickExact(page, '添加模型');
   await sleep(300);
@@ -1067,9 +1329,13 @@ async function modalWidth(page, headingText) {
     };
   });
   rec('⑥.5 手动添加本地模型表单保持 iOS 分组且默认无需 Key，不强制显示名', Object.values(manualLocalForm).every(Boolean), JSON.stringify(manualLocalForm));
-  // 思考深度残留：新建草稿默认 DeepSeek 初始化为 high，切到「手动添加本地模型」
-  // 必须把思考深度重置为 vLLM 默认 off（关闭），否则保存会显式写入 high，绕过桥接层
-  // vllm→off 的 SSE timeout 约束。此处断言真实 UI 选中「关闭」。
+  // Thinking-effort leftover: a fresh draft initializes to DeepSeek's high;
+  // switching to "manual local model add" must reset the thinking effort to
+  // the vLLM default lowest thinking tier low — real-machine testing shows
+  // local models like the Qwen3.8 family cannot reliably turn thinking off,
+  // so off is no longer the default; otherwise saving would write an explicit
+  // high, bypassing the bridge's vllm→low default constraint. Asserts the
+  // real UI selects 低 (low).
   const manualLocalEffort = await page.evaluate(() => {
     const dialog = document.querySelector('[data-testid="model-form-dialog"]');
     if (!dialog) return { found: false, labels: [], selected: [] };
@@ -1079,16 +1345,44 @@ async function modalWidth(page, headingText) {
     const selected = buttons.filter(node => (node.className || '').includes('bg-[#007AFF]')).map(node => (node.textContent || '').trim());
     return { found: !!row, labels: buttons.map(node => (node.textContent || '').trim()), selected };
   });
-  rec('⑥.5b 手动添加本地模型思考深度重置为 vLLM 默认「关闭」（不残留 high）',
+  rec('⑥.5b 手动添加本地模型思考深度重置为 vLLM 默认「低」（不残留 high）',
     manualLocalEffort.found
+      && manualLocalEffort.labels.includes('低')
       && manualLocalEffort.labels.includes('关闭')
       && manualLocalEffort.selected.length === 1
-      && manualLocalEffort.selected[0] === '关闭',
+      && manualLocalEffort.selected[0] === '低',
     JSON.stringify(manualLocalEffort));
   // A local model's window comes from the probed max_model_len (authoritative), so no manual input is offered.
   const localNoContextWindowField = await page.evaluate(() =>
     !document.querySelector('[data-testid="model-form-context-window"]'));
   rec('⑥.5c local model form hides the context window input (probed value is authoritative)', localNoContextWindowField);
+  // A legacy high (also selectable while the local_vllm probe is pending)
+  // must highlight its effective medium tier once Tachyon is detected.
+  await page.evaluate(() => window.__SETTINGS_TEST__.setProbedLocalKind('tachyon'));
+  const tachyonUrlInput = await page.evaluateHandle(() => {
+    const dialog = document.querySelector('[data-testid="model-form-dialog"]');
+    const label = [...dialog.querySelectorAll('label,span')].find(node => (node.textContent || '').trim() === 'API 地址');
+    return label.closest('div').querySelector('input');
+  });
+  await tachyonUrlInput.click({ clickCount: 3 });
+  await tachyonUrlInput.type('http://127.0.0.1:8001/v1');
+  await clickModalExact(page, '高');
+  await sleep(700);
+  const tachyonEffort = await page.evaluate(() => {
+    const dialog = document.querySelector('[data-testid="model-form-dialog"]');
+    const label = [...dialog.querySelectorAll('span')].find(node => (node.textContent || '').trim() === '思考深度');
+    const buttons = [...label.parentElement.querySelectorAll('button')];
+    return {
+      count: buttons.length,
+      hasHigh: buttons.some(node => node.textContent.trim() === '高'),
+      selected: buttons.filter(node => node.className.includes('bg-[#007AFF]')).map(node => node.textContent.trim()),
+    };
+  });
+  rec('Tachyon probe keeps legacy high highlighted as effective medium',
+    tachyonEffort.count === 4 && !tachyonEffort.hasHigh
+      && tachyonEffort.selected.length === 1 && tachyonEffort.selected[0] === '中',
+    JSON.stringify(tachyonEffort));
+  await page.evaluate(() => window.__SETTINGS_TEST__.setProbedLocalKind(null));
   await clickExact(page, '取消');
   await sleep(200);
 
@@ -1615,8 +1909,10 @@ async function modalWidth(page, headingText) {
     return { text, showsError: text.includes('测试失败') && !text.includes('不支持图像识别') && !text.includes('支持图片') };
   });
   rec('⑦.img.10 error 结果与「不支持」严格区分', imageTestError.showsError, imageTestError.text);
-  // 表单值变化后上一次测试结果应清除(恢复提示文案)。已存 Key 的模型占位符是掩码,按类型选择。
-  const imageTestKeyInput = await page.$('[data-testid="model-form-dialog"] input[type="password"]');
+  // 表单值变化后上一次测试结果应清除(恢复提示文案)。按 testid 选择:API Key 输入框
+  // 统一为 type=text + WebkitTextSecurity 掩码(消除 WebView2 自带的第二个眼睛图标),
+  // 已存 Key 时占位符也是掩码,按 type 或 placeholder 选择都会落空。
+  const imageTestKeyInput = await page.$('[data-testid="model-form-dialog"] [data-testid="model-api-key-input"]');
   await imageTestKeyInput.type('k');
   await sleep(200);
   const imageTestCleared = await page.evaluate(() => {

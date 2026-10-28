@@ -28,8 +28,8 @@ use super::types::{
     normalize_work_context_topic,
 };
 use super::util::{
-    clean_id, clean_text, contains_memory_block_marker, looks_completed_work_status,
-    looks_sensitive, validate_memory_content,
+    COMPLETED_WORK_STATUS_NEEDLES, clean_id, clean_text, contains_memory_block_marker,
+    looks_completed_work_status, looks_sensitive, validate_memory_content,
 };
 
 const LLM_REVIEW_TIMEOUT: StdDuration = StdDuration::from_secs(75);
@@ -264,9 +264,21 @@ pub(super) fn append_memory_review_diagnostic_to(
         .write_all(line.as_bytes())
 }
 
+/// Classify a review failure for the diagnostics ledger. Parse markers are
+/// checked before request markers on purpose: a parse failure's chain still
+/// contains "chat/completions" from the earlier request contexts, so the
+/// order decides its stage. Side effect of status errors now embedding the
+/// endpoint body (`error_for_status_with_body`): a 400 body that happened to
+/// quote a parse marker would be filed as `parse_failed`. Diagnostics-only,
+/// so the substring exposure is accepted rather than parsed around.
 pub(super) fn memory_review_error_stage(error: &anyhow::Error) -> &'static str {
     let message = format!("{error:#}").to_ascii_lowercase();
-    if message.contains("parse memory review") || message.contains("memory review response json") {
+    if message.contains("parse memory review")
+        || message.contains("memory review response json")
+        // 空响应与坏 JSON 同属响应内容异常（organize 侧同口径报错），归
+        // parse_failed 而非落到 apply_failed。
+        || message.contains("empty response")
+    {
         "parse_failed"
     } else if message.contains("chat/completions")
         || message.contains("memory review client")
@@ -526,32 +538,9 @@ pub(super) fn assistant_suggests_delivery_complete(user: &str, assistant: &str) 
     if negative.iter().any(|needle| assistant.contains(needle)) {
         return false;
     }
-    [
-        "已完成",
-        "已经完成",
-        "完成了",
-        "已生成",
-        "已经生成",
-        "生成了",
-        "写好了",
-        "整理好了",
-        "已整理",
-        "已经整理",
-        "已实现",
-        "已经实现",
-        "实现了",
-        "已修复",
-        "已经修复",
-        "修复了",
-        "已交付",
-        "已经交付",
-        "交付了",
-        "已更新",
-        "已经更新",
-        "更新了",
-    ]
-    .iter()
-    .any(|needle| assistant.contains(needle))
+    COMPLETED_WORK_STATUS_NEEDLES
+        .iter()
+        .any(|needle| assistant.contains(needle))
 }
 
 /// Shared transport for the two memory LLM calls (the per-turn review and the
@@ -582,7 +571,7 @@ pub(super) async fn send_memory_llm_request(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let provider = bridge.memory_provider();
     let preset = bridge.memory_model_preset();
-    let model_name = if provider == "vllm" {
+    let model_name = if provider == "vllm" || provider == "tachyon" {
         // The served-name probe uses an inference-same-origin key:
         // authenticated vLLM 401s on /v1/models. resolve_served_model keeps a
         // configured name the server lists (LM Studio/Ollama expose every
@@ -609,6 +598,7 @@ pub(super) async fn send_memory_llm_request(
             prompt,
             user_content,
             max_tokens,
+            &bridge.aux_conversation_key("memory-review"),
         )
         .await?;
         if completion.stop_reason.as_deref() == Some("max_tokens") {
@@ -619,27 +609,22 @@ pub(super) async fn send_memory_llm_request(
         }
         return Ok(completion.text);
     }
-    let mut body = json!({
-        "model": model_name,
-        "messages": [
-            { "role": "system", "content": prompt },
-            { "role": "user", "content": user_content }
-        ],
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "stream": false,
-        "response_format": { "type": "json_object" }
-    });
+    let mut body = memory_review_request_body(&model_name, prompt, user_content, max_tokens);
     apply_memory_review_reasoning_controls(&mut body, preset, &provider, &base_url, &model_name);
-    let resp = client
-        .post(url)
-        .bearer_auth(bridge.memory_api_key())
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("post memory {label} chat/completions"))?
-        .error_for_status()
-        .with_context(|| format!("memory {label} chat/completions status"))?;
+    let resp = crate::core::model_endpoint::with_opencode_session_header(
+        client.post(url).bearer_auth(bridge.memory_api_key()),
+        &base_url,
+        &bridge.aux_conversation_key("memory-review"),
+    )
+    .json(&body)
+    .send()
+    .await
+    .with_context(|| format!("post memory {label} chat/completions"))?;
+    let resp = crate::core::model_endpoint::error_for_status_with_body(
+        resp,
+        &format!("memory {label} chat/completions status"),
+    )
+    .await?;
     let value: Value = resp
         .json()
         .await
@@ -680,7 +665,7 @@ async fn request_llm_memory_review(
         .map(|(block, _)| block)
         .unwrap_or_default();
     let existing_profile = io::load_profile().unwrap_or_default();
-    let existing_preferences = io::load_preferences().unwrap_or_default();
+    let existing_preferences = io::list_preferences().unwrap_or_default();
     let existing_work_context = io::load_work_context().unwrap_or_default();
     let focus_items = io::load_current_focus().unwrap_or_default();
     let active_current_focus = io::active_timed_memory(&focus_items, Utc::now())
@@ -739,6 +724,32 @@ async fn request_llm_memory_review(
     )
     .await?;
     parse_llm_memory_review(&content)
+}
+
+/// One-shot Chat Completions body for memory review/consolidation. Field set
+/// mirrors the main-session engine wire (`model`/`messages`/`max_tokens`/
+/// `stream`, and — pinned by foundation tests — **no `temperature`**): a
+/// hard-coded 0 400s on gateways that pin sampling server-side (Kimi Coding
+/// Plan, live-probed 2026-09-30: "invalid temperature: only 1 is allowed for
+/// this model"). `response_format` is deliberate additive drift (guided JSON,
+/// same rationale as the model-review body). Single source so the wire-drift
+/// budget stays testable.
+pub(super) fn memory_review_request_body(
+    model: &str,
+    prompt: &str,
+    user_content: &str,
+    max_tokens: u32,
+) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": prompt },
+            { "role": "user", "content": user_content }
+        ],
+        "max_tokens": max_tokens,
+        "stream": false,
+        "response_format": { "type": "json_object" }
+    })
 }
 
 /// Apply a parsed review result. `explicit_remember` means this turn hit an explicit
@@ -908,7 +919,7 @@ pub(super) fn sanitize_llm_memory_item(
         if !validate_memory_content(&kind, &content) {
             return None;
         }
-        topic = normalize_timed_memory_topic(&kind, &topic);
+        topic = normalize_timed_memory_topic(&kind);
     } else if kind == "work_context" {
         if !validate_memory_content(&kind, &content) {
             return None;
@@ -969,7 +980,11 @@ fn auto_write_profile_suggestion(
 pub(super) fn parse_llm_memory_review(content: &str) -> Result<LlmMemoryReview> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return Ok(LlmMemoryReview::default());
+        // Empty content (missing choices / non-string content / refusal / content
+        // filtering) is a transport- or model-side anomaly, not "no items": treat it
+        // as a failure to avoid producing a fake successful no_change outcome. A
+        // semantic no-op is emitting {"items":[]}.
+        return Err(anyhow!("memory review returned an empty response"));
     }
     match serde_json::from_str::<LlmMemoryReview>(trimmed) {
         Ok(review) => Ok(review),
@@ -1014,7 +1029,7 @@ fn memory_review_reasoning_dialect(
     use crate::core::reasoning_dialect::{
         ReasoningDialect, kimi_supports_disabled_thinking, reasoning_dialect_from_base_url,
     };
-    if provider == "vllm" || preset == ModelPreset::LocalVllm {
+    if provider == "vllm" || provider == "tachyon" || preset == ModelPreset::LocalVllm {
         return ReasoningDialect::VllmChatTemplate;
     }
     if provider == "deepseek" || preset == ModelPreset::Deepseek {

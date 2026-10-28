@@ -3,8 +3,6 @@ mod contracts;
 mod error;
 mod event;
 mod manifest;
-// C1 freezes the private store; C2 wires it into runner/service.
-#[allow(dead_code)]
 mod private_prediction;
 mod report;
 mod runner;
@@ -17,9 +15,10 @@ mod windows_private_acl;
 pub use adapter::BenchmarkAdapter;
 pub use contracts::*;
 pub use error::{BenchmarkError, Result};
-pub use event::{RunEvent, RunEventKind};
+pub(crate) use event::{RunEvent, RunEventKind};
 pub use manifest::{ModelIdentity, RunManifest};
-pub use private_prediction::{PrivatePredictionContentType, PrivatePredictionPayload, ScorerView};
+pub(crate) use private_prediction::ScorerView;
+pub use private_prediction::{PrivatePredictionContentType, PrivatePredictionPayload};
 pub use report::{ReportArtifact, publish_markdown_report, publish_score_json};
 pub use runner::{NativeAgentRunner, TaskRunner};
 pub use service::{BenchmarkService, RunSummary};

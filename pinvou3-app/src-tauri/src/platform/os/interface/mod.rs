@@ -1,6 +1,9 @@
+mod clipboard;
 mod path;
 mod permission;
 mod system;
+
+pub use clipboard::read_clipboard_image;
 
 pub use path::{
     apply_user_npm_prefix, configure_onnxruntime_dylib, connector_cli_command,
@@ -24,5 +27,5 @@ pub use system::{
     pdf_text_missing_message, pdf_tool_exists, pdf_tool_path, presentation_pdf_missing_message,
     process_alive, reveal_target, show_archive_dependency_check, show_ocr_dependency_check,
     show_pandoc_dependency_check, show_pdf_dependency_check, spawn_detached_and_reap,
-    startup_platform_env, system_default_open_supported,
+    startup_platform_env, system_default_open_supported, try_make_private_dir,
 };

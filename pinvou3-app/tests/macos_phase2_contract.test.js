@@ -46,20 +46,26 @@ assert.match(
   "release must fail when the main binary is missing",
 );
 
-const macBuild = read(".github/workflows/mac-build.yml");
+// The universal bundle smoke moved from the deleted mac-build.yml into
+// pr-check.yml's macos-rust-check job (push-only, bundle_chain-gated) in
+// 2026-10; the contract follows it there.
+const prCheck = read(".github/workflows/pr-check.yml");
 const macRelease = read(".github/workflows/release-packages.yml");
-const bundleStart = macBuild.indexOf("- name: Tauri bundle smoke");
-const verifyStart = macBuild.indexOf("- name: Verify 脚本", bundleStart);
+const macosJob = prCheck.split("\n  macos-rust-check:", 2)[1].split(
+  "\n  windows-codex-runtime-test:", 2,
+)[0];
+const bundleStart = macosJob.indexOf("- name: Tauri bundle smoke");
+const verifyStart = macosJob.indexOf("- name: Verify script", bundleStart);
 assert.ok(bundleStart >= 0 && verifyStart > bundleStart, "macOS bundle steps must exist");
-const bundleStep = macBuild.slice(bundleStart, verifyStart);
+const bundleStep = macosJob.slice(bundleStart, verifyStart);
 assert.match(bundleStep, /--target universal-apple-darwin/);
 assert.doesNotMatch(
   bundleStep,
   /continue-on-error:\s*true/,
-  "Universal bundle smoke must fail the main mac-build job",
+  "Universal bundle smoke must fail the native macOS job",
 );
 for (const [name, source] of [
-  ["mac-build.yml", macBuild],
+  ["pr-check.yml (macos-rust-check)", macosJob],
   ["release-packages.yml", macRelease],
 ]) {
   assert.match(
@@ -171,17 +177,50 @@ assert.match(
   "Windows bundled ASR must stay on the CLI path",
 );
 
-const voiceCommand = read("pinvou3-app/src-tauri/src/app/commands/voice.rs");
+// The env override list was single-sourced: the GUI gate delegates to
+// has_asr_cli_override() and the probe loop in features/voice/platform/mod.rs
+// owns the variable table (the production has_asr_cli_override probe is
+// behavior-pinned by the env-driving test in features/voice (voice.rs);
+// commands/tests.rs covers its test-local copy of the predicate).
+const voicePlatform = read(
+  "pinvou3-app/src-tauri/src/features/voice/platform/mod.rs",
+);
 for (const envName of [
   "PINVOU3_ASR_CMD",
   "PINVOU3_DEEPSPEECH2_CMD",
   "PADDLESPEECH_BIN",
 ]) {
   assert.match(
-    voiceCommand,
-    new RegExp(`std::env::var\\("${envName}"\\)`),
-    `${envName} must enable explicit CLI fallback`,
+    voicePlatform,
+    new RegExp(`"${envName}"`),
+    `${envName} must stay in the GUI CLI-fallback env table`,
   );
 }
+assert.match(
+  voicePlatform,
+  /std::env::var\(name\)/,
+  "the env table must be read through the single probe loop",
+);
+assert.match(
+  voicePlatform,
+  /pub(?:\(crate\))? fn has_asr_cli_override\(\)/,
+  "the GUI gate must delegate to the shared override predicate",
+);
+// The consumer leg of the same contract: the command-layer CLI-fallback
+// gate must still call the shared predicate. Without this, a regression
+// like `fn has_explicit_asr_cli_fallback() -> bool { false }` (or dropping
+// the call at the fallback site) compiles cleanly and keeps every suite
+// green while the env overrides silently stop gating the CLI fallback.
+const voiceCommands = read("pinvou3-app/src-tauri/src/app/commands/voice.rs");
+assert.match(
+  voiceCommands,
+  /fn has_explicit_asr_cli_fallback\(\) -> bool \{[\s\S]*?has_asr_cli_override\(\)/,
+  "has_explicit_asr_cli_fallback must still evaluate the shared override predicate",
+);
+assert.match(
+  voiceCommands,
+  /if has_explicit_asr_cli_fallback\(\)/,
+  "the voice recognition fallback arm must consume the CLI-fallback gate",
+);
 
 console.log("macOS phase 2 packaging and ASR contracts: ok");

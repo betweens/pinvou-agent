@@ -9,7 +9,7 @@
   const registry = root.__PINVOU_TAURI_BRIDGE_FEATURES__ = root.__PINVOU_TAURI_BRIDGE_FEATURES__ || {};
   registry["voice"] = function (context) {let pinvouSharedtauriVoiceCache = null;
 function pinvouSharedtauriVoice() {
-  if (!pinvouSharedtauriVoiceCache) pinvouSharedtauriVoiceCache = window.PinvouBridgeShared.create("tauriVoice", { state, notify, activeVoiceInput: { get value() { return activeVoiceInput; }, set value(v) { activeVoiceInput = v; } }, stopMediaTracks, bt, VOICE_DEVICE_REQUEST_TIMEOUT_MS, finishVoiceInput });
+  if (!pinvouSharedtauriVoiceCache) pinvouSharedtauriVoiceCache = window.PinvouBridgeShared.create("tauriVoice", { state, notify, activeVoiceInput: { get value() { return activeVoiceInput; }, set value(v) { activeVoiceInput = v; } }, stopMediaTracks, bt, VOICE_DEVICE_REQUEST_TIMEOUT_MS, finishVoiceInput, voiceOperations: { get value() { return voiceOperations; } } });
   return pinvouSharedtauriVoiceCache;
 }
 
@@ -24,6 +24,90 @@ function pinvouSharedtauriVoice() {
   const VOICE_DEVICE_REQUEST_TIMEOUT_MS = 8000;
 
   const VOICE_RECORDING_MAX_DURATION_MS = 60000;
+
+  // Opaque token for recording sessions and operations: ids must be unique per
+  // in-flight attempt so a stale teardown can be told apart from the current
+  // owner (ownership release and queued terminal events dedup by exact match).
+  // Randomness comes from Web Crypto when present (the ids are order keys, not
+  // secrets, so a monotonic fallback is acceptable).
+  function voiceTokenRandomPart() {
+    const cryptoApi = (typeof globalThis !== "undefined" && globalThis.crypto) || null;
+    if (cryptoApi && typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+    return Date.now().toString(36) + "_" + (cryptoApi && typeof cryptoApi.getRandomValues === "function"
+      ? cryptoApi.getRandomValues(new Uint32Array(1))[0].toString(36)
+      : String(++voiceTokenFallbackCounter).toString(36));
+  }
+  let voiceTokenFallbackCounter = 0;
+
+  function voiceToken(prefix) {
+    return prefix + Date.now().toString(36) + "_" + voiceTokenRandomPart();
+  }
+
+  // Operation ownership outlives the recording/UI. Async writeback and chat admission
+  // share this record; dismissing a notice cannot revive or cancel a submitted operation.
+  // Each recording gets its own operationId, handed to the composer before any async
+  // writeback and retained until the draft is really sent or abandoned.
+  const voiceOperations = new Map();
+
+function trackVoiceTerminal(eventName, session, fields) { return pinvouSharedtauriVoice().trackVoiceTerminal(eventName, session, fields); }
+function rememberVoiceOperation(session) { return pinvouSharedtauriVoice().rememberVoiceOperation(session); }
+function getVoiceOperationId(sessionId, ownerKind) { return pinvouSharedtauriVoice().getVoiceOperationId(sessionId, ownerKind); }
+function beginVoiceSubmission(operationId, sessionId) { return pinvouSharedtauriVoice().beginVoiceSubmission(operationId, sessionId); }
+function voiceOperationSessionId(operationId) { return pinvouSharedtauriVoice().voiceOperationSessionId(operationId); }
+function hasVoiceSubmissionPending() { return pinvouSharedtauriVoice().hasVoiceSubmissionPending(); }
+function rebindVoiceOperationToDraft(operationId, toEpoch) { return pinvouSharedtauriVoice().rebindVoiceOperationToDraft(operationId, toEpoch); }
+function completeVoiceSubmission(operationId, sessionId, accepted) { return pinvouSharedtauriVoice().completeVoiceSubmission(operationId, sessionId, accepted); }
+
+  // Only ensureSession's proven same-draft rollback may advance this binding:
+  // the multi-agent toggle save failing rolls the materialization back into the
+  // same logical draft (navigation token unchanged), so a manual retry keeps
+  // the voice association instead of being orphaned in the dead epoch. A real
+  // session switch or a new draft never sets rollbackFromDraftEpoch, so its
+  // operations stay isolated.
+  function rebindVoiceDraftAfterRollback(operationId, fromEpoch, toEpoch) {
+    const operation = voiceOperations.get(operationId);
+    if (!operation || operation.telemetryTerminal || operation.sessionId || operation.ownerKind !== "chat"
+      || operation.draftEpoch !== fromEpoch || toEpoch !== fromEpoch + 1
+      || Number(state.draftEpoch || 0) !== toEpoch) return false;
+    operation.draftEpoch = toEpoch;
+    return true;
+  }
+
+  // Applying an edit preview or dismissing the finished notice retains the
+  // draft's provenance: hiding the completion hint does not end the unsent
+  // operation. An in-flight recording is still an explicit cancellation.
+  function dismissVoiceInput() {
+    if (activeVoiceInput && !activeVoiceInput.voiceResultReady) {
+      clearVoiceInput();
+      return;
+    }
+    // Mark the dismissal so the next recording start can sweep a never-sent
+    // dismissal; until then the operation stays adoptable by a manual send.
+    const operation = voiceOperations.get((state.voiceInput || {}).operationId);
+    if (operation && !operation.telemetryTerminal && !operation.pendingSubmission) {
+      operation.dismissed = true;
+    }
+    setVoiceInputStatus("idle", { message: "", operationId: null });
+  }
+
+
+  // Clearing the input or cancelling the preview abandons the result of a
+  // recorded (but not submitted) operation; these are the only paths that
+  // actually end an unsent operation.
+  function abandonCompletedVoiceResult() {
+    const current = state.voiceInput || {};
+    const operation = voiceOperations.get(current.operationId);
+    if (!operation || operation.telemetryTerminal) return;
+    // Clearing the viewed session's composer must not terminate a result
+    // recorded for another materialized session: its notice and adoption
+    // provenance would silently vanish on return.
+    if (operation.sessionId && operation.sessionId !== state.activeSessionId) return;
+    trackVoiceTerminal("voice_cancelled", operation);
+    state.voiceInput = Object.assign({}, current, {
+      telemetryTerminal: operation.telemetryTerminal,
+      operationId: operation.pendingSubmission ? operation.operationId : null,
+    });
+  }
 
   function normalizeVoiceMode(mode) {
     if (mode === "task") return "task";
@@ -301,9 +385,6 @@ function pinvouSharedtauriVoice() {
       current.push(Object.assign({ recorded_at: new Date().toISOString() }, diagnostic));
       localStorage.setItem(key, JSON.stringify(current.slice(-50)));
     } catch { /* diagnostics persistence is best-effort */ }
-    try {
-      window.dispatchEvent(new CustomEvent("pinvou:voice-pipeline-diagnostic", { detail: diagnostic }));
-    } catch { /* event dispatch is best-effort */ }
   }
 
 function setVoiceInputStatus(status, patch) { return pinvouSharedtauriVoice().setVoiceInputStatus(status, patch); }
@@ -468,47 +549,15 @@ function mergeFloatChunks(chunks) { return pinvouSharedtauriVoice().mergeFloatCh
 
 function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtauriVoice().downsamplePcm(samples, sourceRate, targetRate); }
 
-  function encodeWav(samples, sampleRate) {
-    const dataSize = samples.length * 2;
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-    function writeString(offset, value) {
-      // WAV header writes ASCII only; charCode is the target byte value, fromCodePoint/codePointAt add nothing here.
-      for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i)); // eslint-disable-line unicorn/prefer-code-point
-    }
-    writeString(0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    writeString(8, "WAVE");
-    writeString(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(36, "data");
-    view.setUint32(40, dataSize, true);
-    let offset = 44;
-    for (let i = 0; i < samples.length; i++, offset += 2) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
-    return buffer;
-  }
+function encodeWav(samples, sampleRate) { return pinvouSharedtauriVoice().encodeWav(samples, sampleRate); }
 
   // A 60s 16kHz 16bit WAV is ~1.9MB; shipping it across IPC as a JSON number array means
   // ~1.92M elements, multiple copies, ~25MB peak memory. Use a standard base64 string
-  // (with padding), the same chunked encoding as the web lane's encodeBase64Bytes.
+  // (with padding); encoding delegates to the shared chunked encoder loaded by index.html
+  // (PinvouChunkedFileUpload.bytesToBase64, the same 0x8000 apply-chunked hot path as the
+  // web lane's encodeBase64Bytes).
   function encodeVoiceBase64Bytes(bytes) {
-    let binary = "";
-    const chunkSize = 0x8000;
-    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-      const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
-      // chunk only holds 0-255 byte values; fromCharCode/fromCodePoint are equivalent. Keep the apply-chunked hot path.
-      binary += String.fromCharCode.apply(null, chunk); // eslint-disable-line unicorn/prefer-code-point
-    }
-    return window.btoa(binary);
+    return root.PinvouChunkedFileUpload.bytesToBase64(bytes);
   }
 
   // The model occasionally wraps the whole output in a ``` fence; strip only fully enclosing
@@ -580,11 +629,16 @@ function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtau
     const session = activeVoiceInput;
     if (!session) return;
     // The recording session ends here (cancel/finish/error all funnel through this point);
-    // release this window's cross-window recording mutex claim.
-    // Carries a session token: a late teardown must not erase a new session's registration.
-    syncVoiceShortcutRecording(null, session.sessionId);
+    // release the Rust recording ownership claim. The claim carries the session token:
+    // a late teardown must not release a newer session's claim.
+    syncVoiceShortcutRecording(null, session.id);
     if (cancelled) {
+      trackVoiceTerminal("voice_cancelled", session);
+      // Detach the audio callback first (cleanup nulls onaudioprocess), then
+      // release the PCM: the audio thread must never observe a nulled chunks
+      // array. The operation record keeps provenance, not the audio buffers.
       cleanupVoiceInputSession(session);
+      session.chunks = null;
       activeVoiceInput = null;
       setVoiceInputStatus("cancelled", { message: bt("voiceCancelled"), completedAt: Date.now() });
       emitVoiceDiagnostic("recording", "info", "voice input cancelled", "已取消语音输入", "cancelled");
@@ -600,6 +654,10 @@ function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtau
         emitVoiceDiagnostic("recording", "warn", "recording reached max duration", "", "timeout");
       }
       const raw = mergeFloatChunks(session.chunks);
+      // The merged buffer carries everything transcription needs; the PCM
+      // chunks must not stay pinned on the operation record for the rest of
+      // the app session (provenance keeps the record, not the audio).
+      session.chunks = null;
       const durationMs = raw.length / Math.max(1, session.sampleRate) * 1000;
       if (durationMs < 300) {
         throw voiceFlowError("recording_failed", "recording", bt("voiceRecordingTooShort"));
@@ -615,10 +673,16 @@ function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtau
         },
       });
       const asrDurationMs = roundedMs(asrStartedAt);
-      if (activeVoiceInput !== session) return;
+      if (activeVoiceInput !== session) {
+        // Superseded mid-transcription (a new recording owns the composer now,
+        // so this continuation can never deliver): end the operation here, or
+        // it sits non-terminal, unadoptable and unswept forever.
+        trackVoiceTerminal("voice_cancelled", session);
+        return;
+      }
       const text = String((res && res.text) || "").trim();
       if (!text) throw voiceFlowError("empty_result", "transcribing", "未识别到语音内容");
-      if (state.activeSessionId !== session.sessionId) {
+      if (session.ownerKind === "chat" && state.activeSessionId !== session.sessionId) {
         throw voiceFlowError("context_mismatch", "writeback", "voice result discarded because active session changed");
       }
       const mode = normalizeVoiceMode(session.mode);
@@ -723,9 +787,18 @@ function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtau
       };
       logVoicePipeline(diagnostic);
       if (activeVoiceInput !== session) return;
+      if (session.telemetryTerminal) {
+        // Abandoned mid-pipeline (the composer draft was cleared): the result
+        // must neither land in the cleared draft nor leave the UI stuck on an
+        // active status until the next recording.
+        setVoiceInputStatus("idle", { message: "", operationId: null });
+        return;
+      }
+      session.voiceResultReady = !!finalText && !editUnchanged;
       if (finalText && !editUnchanged && typeof session.writeback === "function") {
         await session.writeback(finalText, session.draftBeforeStart, {
           mode,
+          operationId: session.operationId,
           rawText: text,
           diagnostic,
         });
@@ -733,6 +806,13 @@ function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtau
         // activeVoiceInput and sets cancelled); never overwrite that terminal cancelled
         // state with completed here.
         if (activeVoiceInput !== session) return;
+      }
+      if (session.telemetryTerminal) {
+        // Terminalized during the writeback await: the text has landed, but
+        // the completed notice must not revive an abandoned operation's UI
+        // state.
+        setVoiceInputStatus("idle", { message: "", operationId: null });
+        return;
       }
       setVoiceInputStatus("completed", {
         message: finalText
@@ -749,10 +829,13 @@ function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedtau
         completedAt: Date.now(),
         mode,
         diagnostic,
+        operationId: session.operationId,
+        startedAt: session.startedAt,
       });
       emitVoiceDiagnostic("writeback", "info", mode === "task" ? "voice task submitted" : "voice text written back", "", "");
     } catch (err) {
       const normalized = normalizeVoiceError(err, "transcribing");
+      if (!session.voiceResultReady) trackVoiceTerminal("voice_recognition_failed", session);
       setVoiceInputStatus("failed", {
         message: normalized.message,
         error: normalized.message,
@@ -838,24 +921,44 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
     // download session; a fresh dependency probe must not overwrite
     // installing/cancelling/progress. Keep the open state as-is too: auto-install uses the
     // button loading state + small popover, only manual repair keeps the install dialog.
+    // The previous operation must not be abandoned either: its text is still
+    // sitting in the composer awaiting a send.
     if (state.voiceAsrSetup.installing) {
       notify();
       return;
     }
 
+    // Opening a new recording abandons the previous unsent operation and the
+    // completed-but-dismissed result still owned by the composer.
+    const previousOperationId = getVoiceOperationId(
+      options && Object.prototype.hasOwnProperty.call(options, "sessionId") ? options.sessionId : state.activeSessionId,
+      (options && options.ownerKind) || "chat"
+    );
+    if (previousOperationId) abandonVoiceResult(previousOperationId);
+    abandonCompletedVoiceResult();
+
     // Enter a visible, cancellable probing state immediately on click. The first model status
     // query may need to read model files; updating the UI only after the query finishes makes
     // the button look unresponsive on Windows.
     const session = {
-      id: Date.now().toString(36),
-      sessionId: state.activeSessionId || null,
+      id: voiceToken("voice_"),
+      operationId: voiceToken("voiceop_"),
+      sessionId: options && Object.prototype.hasOwnProperty.call(options, "sessionId")
+        ? options.sessionId
+        : state.activeSessionId || null,
+      ownerKind: (options && options.ownerKind) || "chat",
       draftBeforeStart: String(draftText || ""),
       writeback,
       mode: normalizeVoiceMode(options && options.mode),
       chunks: [],
       sampleRate: 16000,
       startedAt: Date.now(),
+      telemetryTerminal: false,
+      permissionRecorded: false,
     };
+    rememberVoiceOperation(session);
+    state.voiceInput = Object.assign({}, state.voiceInput, { operationId: session.operationId });
+    state.voiceInput.ownershipToken = session.id;
     activeVoiceInput = session;
     setVoiceInputStatus("requesting_permission", {
       message: bt("voiceCheckingDevice"),
@@ -874,6 +977,7 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
       // Not ready: pop the install guide; installable decides whether this platform offers
       // the built-in install entry.
       if (asrStatus && !asrStatus.ready) {
+        trackVoiceTerminal("voice_recognition_failed", session);
         cleanupVoiceInputSession(session);
         activeVoiceInput = null;
         setVoiceInputStatus("idle", { message: "", stage: null, sessionId: null });
@@ -905,6 +1009,9 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
       });
       if (activeVoiceInput !== session) return;
       if (shouldContinue === false) {
+        // The gate refused before anything started: still end the remembered
+        // operation so it cannot sit unswept alongside the next one.
+        trackVoiceTerminal("voice_cancelled", session);
         cleanupVoiceInputSession(session);
         activeVoiceInput = null;
         setVoiceInputStatus("idle", { message: "", stage: null, sessionId: null });
@@ -926,6 +1033,26 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
       if (!AudioCtor) {
         throw voiceFlowError("recording_failed", "recording", bt("voiceWebviewNoRecording"));
       }
+      // Atomically claim the Rust recording ownership (this window + this
+      // operation's token) before touching any microphone: another window
+      // recording, or missing native support, fails closed here.
+      const claimed = await syncVoiceShortcutRecording(currentVoiceWindowLabel(), session.id);
+      if (activeVoiceInput !== session) {
+        // A cancel raced the claim resolution: finishVoiceInput may have
+        // released before the claim landed, so release again — the Rust
+        // side ignores a release from a non-owner.
+        syncVoiceShortcutRecording(null, session.id);
+        cleanupVoiceInputSession(session);
+        return;
+      }
+      if (claimed !== true) {
+        // The mic is held by another Pinvou window — unless the ownership
+        // check itself failed, which must not be reported as "another
+        // window" (a transient IPC error would otherwise look like a
+        // cross-window lock and send the user hunting for it).
+        throw voiceFlowError("device_unavailable", "device",
+          claimed === "error" ? bt("voiceMicOwnershipUnavailable") : bt("voiceMicBusyOtherWindow"));
+      }
       const hasAudioInput = await probeVoiceAudioInput(VOICE_DEVICE_PROBE_TIMEOUT_MS);
       if (activeVoiceInput !== session) return;
       if (hasAudioInput === false) {
@@ -943,6 +1070,7 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
         cleanupVoiceInputSession(session);
         return;
       }
+      session.permissionRecorded = true;
       session.audioContext = new AudioCtor();
       session.sampleRate = session.audioContext.sampleRate || 16000;
       session.source = session.audioContext.createMediaStreamSource(session.stream);
@@ -966,23 +1094,31 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
           if (activeVoiceInput === session) finishVoiceInput(false);
         };
       });
+      session.recognitionStartedAt = Date.now();
       setVoiceInputStatus("recording", { message: bt("voiceRecording"), stage: "recording" });
-      // Once recording actually starts, register this window's label; while window A records,
-      // window B's Alt gesture is routed to window A to stop it.
-      syncVoiceShortcutRecording(currentVoiceWindowLabel(), session.sessionId);
-      invoke("track_behavior_event", {
-        request: {
-          eventName: "voice_started",
-          sessionId: session.sessionId,
-          stage: "recording",
-        },
-      }).catch(function () {});
+      // The ownership claim was made before the probe; the native hook already
+      // routes other windows' Alt gestures here to stop, never double-starting.
       emitVoiceDiagnostic("recording", "info", "recording started", "", "");
     } catch (err) {
       cleanupVoiceInputSession(session);
+      // The teardown above detached the audio callback first; release the PCM
+      // now so the terminal operation record never pins partial audio.
+      session.chunks = null;
       if (activeVoiceInput !== session) return;
       activeVoiceInput = null;
+      // The start failed after the claim landed (claim rejection, device
+      // probe, permission, getUserMedia): release the ownership claim, or
+      // the stale owner makes every later start in every window fail closed.
+      syncVoiceShortcutRecording(null, session.id);
       const normalized = normalizeVoiceError(err, "recording");
+      if (!session.permissionRecorded && normalized.category !== "cancelled") {
+        session.permissionRecorded = true;
+        trackVoiceTerminal("voice_permission_result", session);
+      } else if (normalized.category === "cancelled") {
+        trackVoiceTerminal("voice_cancelled", session);
+      } else {
+        trackVoiceTerminal("voice_recognition_failed", session);
+      }
       if (normalized.category === "permission_denied") {
         try {
           const permissionReset = await invoke("reset_microphone_permission");
@@ -1005,16 +1141,39 @@ function closeVoiceAsrSetup() { return pinvouSharedtauriVoice().closeVoiceAsrSet
     }
   }
 
-function cancelVoiceInput() { return pinvouSharedtauriVoice().cancelVoiceInput(); }
+  function cancelVoiceInput() { return pinvouSharedtauriVoice().cancelVoiceInput(); }
 
-function clearVoiceInput() { return pinvouSharedtauriVoice().clearVoiceInput(); }
+  function clearVoiceInput() {
+    if (activeVoiceInput) {
+      finishVoiceInput(true, false);
+      return;
+    }
+    // Clearing the input on the idle notice is the user abandoning the
+    // unsent result: that ends the operation (a pending submission keeps its
+    // admission outcome instead).
+    abandonCompletedVoiceResult();
+    setVoiceInputStatus("idle", {
+      message: "",
+      error: null,
+      category: null,
+      stage: null,
+      sessionId: null,
+    });
+  }
+
+  function abandonVoiceResult(operationId) {
+    const operation = voiceOperations.get(operationId || getVoiceOperationId(state.activeSessionId, "chat"));
+    if (operation) trackVoiceTerminal("voice_cancelled", operation);
+    if (!operationId) abandonCompletedVoiceResult();
+  }
 
 function appendVoiceText(base, text) { return pinvouSharedtauriVoice().appendVoiceText(base, text); }
 
-  // Cross-window recording mutex: the recording lifecycle syncs this window's label to the
-  // native shortcut hook, and Rust uses it to route other windows' Alt gestures to the
-  // recording window as a stop, never double-starting. Silently ignored by old backends
-  // without the command.
+  // Cross-window recording ownership is authoritative in Rust: the same owner
+  // guards both the button/shortcut start and cross-window Alt routing (see
+  // voice_shortcut.rs). The claim must succeed before any microphone is
+  // opened; another window holding a claim, or missing native support, fails
+  // the recording start closed.
   function currentVoiceWindowLabel() {
     try {
       const windowApi = window.__TAURI__ && window.__TAURI__.window;
@@ -1024,23 +1183,37 @@ function appendVoiceText(base, text) { return pinvouSharedtauriVoice().appendVoi
     return "";
   }
 
-  // Session token: registration carries the session id, and teardown only dispatches the
-  // clear when the token still matches, preventing a previous session's late teardown
-  // (async window/race) from wiping the mutex label the new session just registered.
-  // Token-less clears (the shortcut Router purging stale registrations) always pass.
-  let voiceShortcutRecordingToken = null;
-
+  // Rust atomically owns (caller window, token): release only dispatches when
+  // the token still matches — a previous session's late teardown can never
+  // wipe the claim the new session just registered, another WebView can never
+  // overwrite it, and tokenless clears are rejected instead of clearing the
+  // current owner. Returns whether the claim/release landed, or the string
+  // "error" when the IPC itself failed or the window identity could not be
+  // read (the caller must still fail closed, but may tell the user the check
+  // failed instead of blaming another window).
+  // Ownership syncs are serialized through one promise chain: the
+  // release-then-reclaim handoff (a fire-and-forget release racing the next
+  // start's claim) relies on the backend receiving the syncs in call order,
+  // and per-webview IPC ordering alone does not guarantee that once the
+  // runtime dispatches invokes concurrently.
+  let voiceOwnershipSyncTail = Promise.resolve();
   function syncVoiceShortcutRecording(label, token) {
-    try {
-      if (label) {
-        voiceShortcutRecordingToken = token || null;
-      } else if (token && voiceShortcutRecordingToken && token !== voiceShortcutRecordingToken) {
-        return;
-      } else {
-        voiceShortcutRecordingToken = null;
-      }
-      Promise.resolve(invoke("set_voice_shortcut_recording", { label: label || null })).catch(function () {});
-    } catch { /* old backend without the command */ }
+    const attempt = voiceOwnershipSyncTail.then(function () {
+      if (!token) return false;
+      // An unreadable window label must not go over the wire: the Rust command
+      // treats a null label as a release and would answer false, which the
+      // caller would misreport as "another window is recording". Report the
+      // ownership check as unavailable instead.
+      if (label === "") return "error";
+      return Promise.resolve(invoke("set_voice_shortcut_recording", { label: label || null, token }))
+        .then(function (claimed) { return claimed === true; }, function (error) {
+          console.warn("[voice] recording ownership sync failed", error);
+          emitVoiceDiagnostic("recording", "warn", "recording ownership sync failed: " + String((error && error.message) || error), "", "claim_error");
+          return "error";
+        });
+    });
+    voiceOwnershipSyncTail = attempt.then(function () {}, function () {});
+    return attempt;
   }
 
   function setVoiceShortcutEnabled(enabled) {
@@ -1068,6 +1241,15 @@ function appendVoiceText(base, text) { return pinvouSharedtauriVoice().appendVoi
       closeVoiceAsrSetup,
       cancelVoiceInput,
       clearVoiceInput,
+      abandonVoiceResult,
+      getVoiceOperationId,
+      voiceOperationSessionId,
+      rebindVoiceDraftAfterRollback,
+      rebindVoiceOperationToDraft,
+      beginVoiceSubmission,
+      completeVoiceSubmission,
+      dismissVoiceInput,
+      hasVoiceSubmissionPending,
       setVoiceShortcutEnabled,
       syncVoiceShortcutRecording,
       appendVoiceText

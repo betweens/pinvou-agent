@@ -11,8 +11,12 @@ name: PR Check
 #   select browser smokes from their actual base/head diff and fail closed for
 #   unknown or shared paths.
 # - release-contract-test:发布链路改动只跑配置/脚本契约,不在 PR 构建安装包。
+# - relay-test:remote-control-relay 回归套件(纯 Node,单依赖,10 分钟上限);
+#   relay 路径的 PR(含 draft)与 Merge Queue 运行,直推 main 不跑(MQ 是
+#   main 侧唯一 relay 执行点)。
 # - knowledge-rust:独立 pinvou-knowledge crate/部署入口改动跑 fmt/clippy/test 与 shell
 #   语法检查；依赖或策略改动时追加 cargo-deny，不依赖 Tauri workspace 间接覆盖。
+#   main push 无条件运行刷新 knowledge-rust-v2 存档(同 cli-test);draft 跳过。
 # - rust-test: Draft and explicitly low-risk Rust changes skip the large test
 #   binary. Ready high-risk PRs and their combined Merge Queue tree run Linux
 #   regressions; Windows runs once on the ready PR. main push 无条件累计编译
@@ -20,17 +24,37 @@ name: PR Check
 # - cli-test: pinvou-cli workspace contract suite (fmt + all-target tests),
 #   triggered by cli_rust/rust_full changes; follows the rust-test push and
 #   cache policies (memory setup, --no-run on push, ~/.cargo-only cache).
-# - rust-lint:Draft 只跑 fmt；Ready/Queue/main 跑 clippy；cargo-deny 仅在依赖
-#   或策略路径变化时追加，三项均无 continue-on-error。
+# - cli-lint: clippy for the pinvou-cli workspace (parallel job like
+#   rust-lint: clippy-driver artifacts are not reusable by the test
+#   compilers). Warn-visible until the pinvou-cli [lints] table and the
+#   measured debt cleanup land; fails closed on compile errors either way.
+# - rust-lint:Draft 只跑 fmt；Ready/Queue 跑 clippy；main push 无条件跑(刷新
+#   rust-lint-v2 存档)；cargo-deny 仅在依赖或策略路径变化时追加，三项均无
+#   continue-on-error。
 #   与 rust-test 并行,各自独立 cache。clippy 规则见 Cargo.toml [lints] 表:
 #   只启用实测零欠账的 lint(deny),有欠账的 lint/group 显式 allow,
 #   欠账由清理 PR(#35 及后续)消化后逐个升 deny。
 # - windows-rust-test: Native Windows coverage runs for ready high-risk paths or
 #   ci:full-rust. Merge Queue does not repeat it; main retains cumulative coverage.
-# - macos-rust-check: Native macOS compile check (check does not link, no signing/packaging)
-#   mirrors windows-rust-test gating; the Linux leg cannot expose platform-specific type errors.
+#   The all-target check and the linked native regressions run as two parallel
+#   matrix legs under the same routing; both must pass.
+# - macos-rust-check: Native macOS compile check mirrors windows-rust-test gating; the Linux
+#   leg cannot expose platform-specific type errors. On main push it also runs the coverage
+#   folded in from the deleted mac-build.yml (full lib tests, release-fast smoke on
+#   bundle_chain/rust_full/cli_rust/knowledge_rust pushes, bundle_chain-gated
+#   universal bundle smoke, mac verify script).
 # - windows-codex-runtime-test:Relevant PRs exercise the browser-wrapper lifecycle,
 #   prepare Node + ACP Bridge, and verify packaged resources on native Windows.
+# - windows-rustup-repair-test: Relevant PRs corrupt a copied toolchain in an
+#   isolated RUSTUP_HOME and verify download-source fallback and reinstall.
+# - macos-cli-check:macOS-gated pinvou-cli code (#[cfg(target_os = "macos")]) must
+#   type-check somewhere; compile-only leg mirroring the Windows CLI compile check
+#   for ready cli_rust/rust_full PRs, the matching Merge Queue combined tree, and
+#   main push (cumulative; Linux cannot type-check macOS-gated code).
+# - rust-loongarch64-check:交叉 compile-only leg:用发布 job 同一套钉死 loong64
+#   工具链 + deepin glibc-2.38 sysroot 对三个 workspace 做
+#   cargo check --target loongarch64-unknown-linux-gnu,防止目标专属 cfg/依赖
+#   静默破坏 loongarch64 构建(GitHub 无 loong64 runner,发布侧交叉构建太重)。
 # - Benchmarks stay outside product PR/MQ gates and run manually in an isolated environment.
 # - required-gate:PR 阶段汇总所有适用检查，作为唯一 required check。
 # - merge_group:按 base/head 的真实组合 diff 运行适用门禁，保证验证对象就是
@@ -79,6 +103,12 @@ concurrency:
   group: pr-check-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# CI runners are ephemeral: incremental compilation artifacts are never reused
+# across runs (each job restores a fresh cache), so they are pure cache-bloat
+# under the 10GB quota. CodeWhale CI sets the same value in every lane.
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   commit-message:
     name: commit-message
@@ -93,7 +123,7 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: Validate commit messages
         run: |
@@ -101,6 +131,20 @@ jobs:
             python3 scripts/validate-commit-msg.py --range "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
           else
             before="${{ github.event.before }}"
+            # A ref creation reports the zero SHA as `before`, and a
+            # force-push reports the previous head, which a fresh checkout
+            # may no longer contain. Either way there is no usable old
+            # boundary: the validator's missing-base fallback sweeps the
+            # whole lineage and false-reds on pre-convention history. Skip
+            # instead — those commits reached main through pull requests,
+            # whose base..head lane validates format, and dco.yml enforces
+            # the sign-off trailers there. Sign-offs are never this job's
+            # concern.
+            if [ "$before" = "0000000000000000000000000000000000000000" ] || \
+              ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+              echo "No usable push boundary (ref created or history rewritten); skipping commit-message range validation."
+              exit 0
+            fi
             python3 scripts/validate-commit-msg.py --range "$before" "${{ github.sha }}"
           fi
 
@@ -115,7 +159,7 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: Node.js
         uses: actions/setup-node@v7
@@ -127,7 +171,9 @@ jobs:
           node --test
           scripts/tests/sync-version.test.mjs
           scripts/tests/select-frontend-smokes.test.mjs
+          scripts/tests/run-frontend-smokes.test.mjs
           scripts/tests/pr-check-routing.test.mjs
+          scripts/tests/run-webui-smoke.test.mjs
 
       - name: 校验 VERSION 与各版本文件一致
         run: node scripts/sync-version.mjs --check
@@ -141,7 +187,16 @@ jobs:
     name: changes
     if: ${{ (github.event_name == 'pull_request' && github.event.action != 'closed') || github.event_name == 'merge_group' || github.event_name == 'push' }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 5
+    # 10min: fetch-depth:0 checkout plus the memory-setup wrapper's worst case
+    # (240s + 15s kill grace) must not turn the intended non-fatal degradation
+    # into a hard job timeout. Since 2026-10 the fold makes this job's
+    # bundle_chain output load-bearing for the macos-rust-check bundle
+    # smoke on main pushes, and since 2026-10-15 the release-fast smoke
+    # needs the bundle_chain/rust_full/cli_rust/knowledge_rust outputs as
+    # well (a timed-out or failed changes job = silently skipped smokes),
+    # so this job now carries the same cap the folded mac-build changes
+    # job used for the identical step set.
+    timeout-minutes: 10
     outputs:
       rust_code: ${{ steps.filter.outputs.rust_code }}
       rust_dependencies: ${{ steps.filter.outputs.rust_dependencies }}
@@ -155,13 +210,15 @@ jobs:
       relay: ${{ steps.filter.outputs.relay }}
       acp_runtime: ${{ steps.filter.outputs.acp_runtime }}
       windows_codex: ${{ steps.filter.outputs.windows_codex }}
+      bundle_chain: ${{ steps.filter.outputs.bundle_chain }}
+      windows_rustup_repair: ${{ steps.filter.outputs.windows_rustup_repair }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -176,19 +233,30 @@ jobs:
               - 'CodeWhale'
               - '.gitmodules'
               - '.github/workflows/pr-check.yml'
-              - '.github/workflows/mac-build.yml'
             rust_dependencies:
+              - 'scripts/guard-webpki-roots-exception.py'
+              - 'scripts/tests/test_webpki_roots_exception.py'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - '**/deny.toml'
               - 'CodeWhale'
               - '.gitmodules'
               - '.github/workflows/pr-check.yml'
-              - '.github/workflows/mac-build.yml'
             # All unclassified Rust paths fail closed to full regression. Only
             # isolated leaf-feature boundaries are explicitly low risk; changes
             # to their registration or app command surface still run full tests.
             rust_full:
+              # Round-1 fix wave (PR #715 review): the loong64 cross-pipeline
+              # scripts are build inputs of the rust legs — the pr-check
+              # rust-loongarch64-check leg executes the toolchain/sysroot
+              # setup scripts, and the release job's orchestrator drives the
+              # cargo builds. Without these entries a script-only edit (sha
+              # re-pin, sysroot package list, packaging step) ran NO rust
+              # leg and required-gate passed on `skipped` — the same gap the
+              # ci-libpipewire-build.sh entries below exist for.
+              - 'scripts/ci-loongarch64-toolchain.sh'
+              - 'scripts/ci-loongarch64-sysroot.sh'
+              - 'scripts/ci-build-linux-loongarch64.sh'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - '**/deny.toml'
@@ -205,50 +273,151 @@ jobs:
               - 'pinvou-cli/**/*.rs'
               - 'pinvou-cli/**/Cargo.toml'
               - 'pinvou-cli/**/Cargo.lock'
+              # Round-47 review: the Linux CLI legs (cli-test and cli-lint)
+              # run this script as a setup step (the PipeWire prefix every
+              # Linux compile needs), but it routed only to rust_code —
+              # a script-only PR reached the post-merge main push before any
+              # CLI leg could catch a break. (macos-cli-check compiles the
+              # same CLI without the Linux PipeWire prefix, so it has no
+              # such step.)
+              - 'scripts/ci-libpipewire-build.sh'
+              # Build inputs cargo reads but the patterns above miss: a
+              # `[build]`/`rustflags` edit in the workspace config and the
+              # Windows exe manifest (consumed by crates/cli/build.rs via
+              # /MANIFESTINPUT) both change the shipped binary. Without
+              # these entries a PR touching only them skips cli-test,
+              # cli-lint, windows-rust-test AND macos-cli-check while
+              # required-gate passes on `skipped`.
+              - 'pinvou-cli/.cargo/**'
+              - 'pinvou-cli/**/*.manifest'
               - 'CodeWhale'
+              # Round-42 review: tauri-build parses this config in EVERY
+              # pinvou3-tauri compile, so it is a compile input of every CLI
+              # leg (the workflow's own comment says the CLI legs run "same
+              # tauri_build resource check") — a schema-breaking config-only
+              # PR used to skip every Rust/CLI compile leg pre-merge because
+              # the file routed only to release_contract/pet/frontend.
+              - 'pinvou3-app/src-tauri/tauri.conf.json'
+              # This workflow file is deliberately excluded from cli_rust
+              # (policy: workflow changes must not drag in the full app test
+              # suite; test_ci_gate_policy pins this). A workflow-only change
+              # therefore reaches cli-test/macos-cli-check only on the main
+              # push after merge — the pre-merge legs stay skipped, including
+              # in the Merge Queue, which recomputes the same paths filter.
               # The CLI path-depends on the app crate: leaf features exempt
-              # from the full app suite still gate through the CLI suite, so
-              # a consumer-breaking change cannot escape pre-merge CI.
+              # from the full app suite (feedback, personas, pet) still gate
+              # through the CLI suite, so a consumer-breaking change cannot
+              # escape pre-merge CI.
               - 'pinvou3-app/src-tauri/src/features/feedback/**'
               - 'pinvou3-app/src-tauri/src/features/personas/**'
+              - 'pinvou3-app/src-tauri/src/features/pet/**'
+              # The CLI compiles the connector lock tables in with
+              # `include_str!` (src-tauri/src/platform/connector_lock.rs), so
+              # editing or deleting one is a CLI source change in all but
+              # name. Without this entry such a PR skips cli-test,
+              # windows-rust-test AND macos-cli-check — the very leg whose
+              # reason for existing is those per-target files — and
+              # required-gate passes on `skipped`.
+              - 'pinvou3-app/src-tauri/resources/platforms/**'
+              # Same include_str!/build.rs class as the lock tables, wider:
+              # src-tauri/build.rs unconditionally reads four
+              # resources/common/bundle/instructions-*.md plus
+              # deny_sensitive_paths.sh (panicking when absent), and
+              # native_installer.rs include_str!s the dws LICENSE — every
+              # pinvou3-tauri compile in the CLI's build graph needs them, so
+              # a bundle-resource-only rename must not skip the CLI legs.
+              - 'pinvou3-app/src-tauri/resources/common/bundle/**'
+              # Round-37 review: two more compile inputs of the same class
+              # the lock-table entry exists for. mcp_catalog.rs
+              # include_str!s 20+ files under the APP-LEVEL resources dir
+              # (pinvou3-app/resources/mcp-servers/** — not
+              # src-tauri/resources, which the filters above cover), and
+              # app/commands/marketplace.rs embeds
+              # docs/plugin-package-spec.md; `pub mod marketplace;` is
+              # unconditional, so every CLI-leg compile of pinvou3-tauri
+              # reads both. Without these entries such a PR skips
+              # cli-test, windows-rust-test AND macos-cli-check while
+              # required-gate passes on `skipped`.
+              # Round-38 review: the path had been written `pinvoy3-app/...`,
+              # which never matches — the filter entry was dead and the gap
+              # stayed open. Also see the gate-policy suite's reachability
+              # check, added so the pin cannot outlive the path again.
+              - 'pinvou3-app/resources/mcp-servers/**'
+              - 'docs/plugin-package-spec.md'
+              # Round-48 review: cli_contract.rs include_str!s the gaia
+              # benchmark doc and asserts its dataset table — the same class
+              # as the spec-doc entry above (a doc-only edit that breaks the
+              # assertion must run a CLI leg, not skip all of them with
+              # required-gate passing on `skipped`).
+              - 'docs/gaia-benchmark.md'
             knowledge_rust:
               - 'pinvou-knowledge/**/*.rs'
               - 'pinvou-knowledge/Cargo.toml'
               - 'pinvou-knowledge/Cargo.lock'
+              # The alignment step below declares this file the single source
+              # of truth for the toolchain it resolves (mirror of rust_full
+              # routing the app twin); without this entry a version-bump-only
+              # PR skips the job that aligns to it.
+              - 'pinvou-knowledge/rust-toolchain.toml'
               - 'pinvou-knowledge/deploy/**'
               - '.github/workflows/pr-check.yml'
             knowledge_dependencies:
+              - 'scripts/guard-webpki-roots-exception.py'
+              - 'scripts/tests/test_webpki_roots_exception.py'
               - 'pinvou-knowledge/Cargo.toml'
               - 'pinvou-knowledge/Cargo.lock'
               - 'pinvou3-app/src-tauri/deny.toml'
               - '.github/workflows/pr-check.yml'
             release_contract:
+              # Round-1 fix wave (PR #715 review): the loong64 packaging
+              # pipeline scripts are read (and bash -n'd) by the loong64
+              # release policy suite, which fast-gate runs unconditionally;
+              # these filter entries are belt-and-braces so a script-only PR
+              # also re-runs release-contract-test instead of passing the
+              # gate on `skipped`.
+              - 'scripts/package-deb-loongarch64.sh'
+              - 'scripts/ci-build-linux-loongarch64.sh'
+              - 'scripts/ci-loongarch64-toolchain.sh'
+              - 'scripts/ci-loongarch64-sysroot.sh'
               - 'VERSION'
               - 'scripts/sync-version.mjs'
               - 'scripts/check-linux-glibc-floor.sh'
               - 'scripts/check-linux-elf-policy.sh'
               - 'scripts/asr/build-sensevoice-runtime.sh'
               - 'scripts/asr/sensevoice-source.env'
+              - 'scripts/repack-deb-xz.sh'
+              - 'scripts/convert-dmg-ulmo.sh'
+              - 'scripts/release-deb.sh'
+              - 'scripts/release-macos.sh'
+              - 'scripts/build-windows-ota.ps1'
               - 'scripts/tests/sync-version.test.mjs'
               - 'scripts/tests/test_ci_gate_policy.py'
               - 'scripts/tests/test_release_arm64_policy.py'
+              - 'scripts/tests/test_release_cache_policy.py'
               - 'scripts/tests/test_release_linux_floor_policy.py'
+              - 'scripts/tests/test_release_loongarch64_policy.py'
               - 'scripts/tests/test_release_manifest_probe.py'
+              - 'scripts/tests/test_release_size_policy.py'
               - '.github/workflows/release-packages.yml'
               - '.github/workflows/pr-check.yml'
-              - '.github/workflows/mac-build.yml'
               - '.gitmodules'
               - 'private-runtimes/windows'
               - 'pinvou3-app/package.json'
               - 'pinvou3-app/package-lock.json'
               - 'pinvou3-app/scripts/tauri/**'
+              # tauri_effective_config.test.js parses this script's target
+              # dispatch to pin the cross-build Node architecture mapping.
+              - 'pinvou3-app/scripts/prepare-codex-bridge-runtime.sh'
+              - 'pinvou3-app/src-tauri/Cargo.toml'
               - 'pinvou3-app/src-tauri/tauri.conf.json'
+              - 'pinvou-knowledge/Cargo.toml'
               - 'pinvou3-app/src-tauri/config/**'
               - 'pinvou3-app/src-tauri/packaging/**'
               - 'pinvou3-app/src-tauri/resources/**'
               - 'pinvou3-app/tests/knowledge_host_packaging.test.mjs'
               - 'pinvou3-app/tests/linux_asr_runtime_packaging.test.js'
               - 'pinvou3-app/tests/macos_phase2_contract.test.js'
+              - 'pinvou3-app/tests/tauri_effective_config.test.js'
             pet:
               - 'pinvou3-app/src/assets/pet/**'
               - 'pinvou3-app/src/features/pet/**'
@@ -277,6 +446,36 @@ jobs:
             frontend:
               - 'pinvou3-app/src/**'
               - 'pinvou3-app/tests/**'
+              # multiagent_plan_normalize.test.mjs 读取下列 Rust 源做跨语言
+              # 契约断言(蜂群契约/同快照不变式/编辑重发等);不列出则
+              # Rust-only 改动会静默跳过该 node 门禁(同 resources/** 的
+              # connector 契约测试先例;test_ci_gate_policy 锁定此路由)。
+              # sessions 与 remote_control/manager 是 readdirSync 整目录拼接
+              # 读取,必须整目录路由——只列单个文件必漏其余模块。
+              - 'pinvou3-app/src-tauri/src/features/assistant/**'
+              - 'pinvou3-app/src-tauri/src/features/multiagent/transcripts.rs'
+              - 'pinvou3-app/src-tauri/src/features/remote_control/manager/**'
+              - 'pinvou3-app/src-tauri/src/features/sessions/**'
+              - 'pinvou3-app/src-tauri/src/features/personas/mod.rs'
+              - 'pinvou3-app/src-tauri/src/features/files/file_ingest.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/multiagent.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/chat.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/memory.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/interaction.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/remote_control.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/personas.rs'
+              - 'pinvou3-app/src-tauri/src/lib.rs'
+              # The atomic-write helper has staging+rename contract assertions;
+              # leaving the file out of this list means Rust-only changes to it
+              # silently skip the node gate (same locking mechanism as above).
+              - 'pinvou3-app/src-tauri/src/platform/filesystem.rs'
+              # consent_marker_frontend.test.mjs 读取下列 Rust 源做 marker
+              # 跨语言契约断言;不列出则 Rust-only 改动会静默跳过该 node
+              # 门禁——marker 连同其 Rust 值 pin 一起 reword 时所有 leg 全绿,
+              # 前端 includes() 静默失配(test_ci_gate_policy 锁定此路由)。
+              - 'pinvou3-app/src-tauri/src/features/marketplace/scope.rs'
+              - 'pinvou3-app/src-tauri/src/app/commands/marketplace.rs'
+              - 'pinvou3-app/src-tauri/src/features/connectors/skill_gate.rs'
               - 'pinvou3-app/scripts/tauri/**'
               - 'pinvou3-app/src-tauri/config/**'
               - 'pinvou3-app/src-tauri/packaging/**'
@@ -300,6 +499,9 @@ jobs:
               - 'pinvou3-app/knip.json'
               - 'pinvou3-app/jsconfig.json'
               - 'pinvou3-app/scripts/audit-compat.mjs'
+              # test:webui 的包装脚本只被 frontend-test 的 diff-selection 消费;
+              # 不列入则 wrapper-only PR 静默跳过该门禁(test_ci_gate_policy 锁定)。
+              - 'pinvou3-app/scripts/run-webui-smoke.mjs'
               - 'pinvou3-app/src-tauri/tauri.conf.json'
               - '.gitmodules'
               - '.github/workflows/pr-check.yml'
@@ -329,6 +531,7 @@ jobs:
               - 'pinvou3-app/scripts/tauri/windows-runtime.js'
               - 'pinvou3-app/src-tauri/config/platforms/windows/runtime/**'
               - 'pinvou3-app/src-tauri/packaging/windows/runtime/**'
+              - 'pinvou3-app/src-tauri/packaging/windows/nsis/**'
               - 'pinvou3-app/src-tauri/src/features/codex_acp/**'
               - 'pinvou3-app/src-tauri/src/platform/capabilities.rs'
               - 'pinvou3-app/src-tauri/resources/common/bundle/mcp-servers/browser-*'
@@ -340,6 +543,24 @@ jobs:
               - 'pinvou3-app/package.json'
               - 'pinvou3-app/package-lock.json'
               - '.github/workflows/release-packages.yml'
+              - '.github/workflows/pr-check.yml'
+            windows_rustup_repair:
+              - '.github/workflows/pr-check.yml'
+              - 'pinvou3-app/scripts/ci/**'
+              - 'pinvou3-app/scripts/tauri/build.js'
+              - 'pinvou3-app/tests/windows_rustup_repair_smoke.ps1'
+              - 'pinvou3-app/tests/windows_rust_toolchain_contract.test.js'
+              - 'pinvou3-app/src-tauri/rust-toolchain.toml'
+              - 'pinvou3-app/package.json'
+            bundle_chain:
+              - 'pinvou3-app/scripts/tauri/**'
+              - 'pinvou3-app/src-tauri/tauri.conf.json'
+              - 'pinvou3-app/src-tauri/config/**'
+              - 'pinvou3-app/src-tauri/packaging/**'
+              - 'pinvou3-app/src-tauri/resources/**'
+              - 'pinvou3-app/package.json'
+              - 'pinvou3-app/package-lock.json'
+              - 'pinvou3-app/vite.config.mjs'
               - '.github/workflows/pr-check.yml'
 
   fast-gate:
@@ -356,7 +577,7 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       # The workflow's own gate: YAML structure, expression typos, matrix/
       # runner labels, and cron syntax fail here before reaching a runner,
@@ -381,8 +602,9 @@ jobs:
           python3 scripts/architecture-guard.py --base-ref "origin/$base_ref"
 
       - name: 公开底座 gitlink 可达性
-        # Fail closed: gitlink 必须等于公开维护分支头；过渡期（fork-policy 第 0 节豁免）
-        # 内不可变 tag 钉在其收口 commit，rN 收口后恢复三方相等。
+        # Fail closed: the gitlink must equal the public maintenance head,
+        # including candidate windows. The transition policy only lets that
+        # public head lead the immutable closure tag; it does not waive this gate.
         run: ./scripts/verify-public-submodule.sh
 
       - name: 初始化公共底座 submodule
@@ -390,6 +612,18 @@ jobs:
 
       - name: fork-guard 指纹层 (秒级,不编译)
         run: ./scripts/fork-guard.sh --fast
+
+      # Merge authored-identifier audit (round-30 m10 wiring): enumerate the
+      # resolution-authored identifiers of every merge commit on the branch
+      # and print them (disclosure-only, always exits 0) — makes
+      # "resolution content reached the tree" visible on every PR instead of
+      # relying on a per-round manual run.
+      - name: Merge authored audit (seconds)
+        if: ${{ github.event_name != 'push' }}
+        run: |
+          base_ref="${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || github.base_ref }}"
+          base_ref="${base_ref#refs/heads/}"
+          python3 scripts/audit-merge-authored.py "origin/$base_ref"
 
       - name: fork 合规联动 (gitlink ↔ fork-modifications)
         run: |
@@ -402,7 +636,7 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Session replay auditor 测试
+      - name: Gate policy test suite (scripts/tests)
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Python MCP server 测试 (mcp-servers/*/test_*.py)
@@ -427,10 +661,13 @@ jobs:
     # 且 pet 缺 lint:ui。统一为一个 job 后:依赖/build 各装一次、lint 全覆盖。
     # Draft runs lint/build/logic tests. Ready PRs and merge groups select browser
     # smokes from their actual base/head diff. Shared, unknown, test-infrastructure,
-    # and empty diffs fail closed to the complete smoke set.
+    # and empty diffs fail closed to the complete smoke set. Each selected smoke is
+    # retried once to absorb transient hosted-runner flakes; the 25-minute cap
+    # covers setup plus one full pass and a single rerun of the biggest smoke,
+    # while a run with several independent flakes hits the cap and fails.
     if: ${{ !cancelled() && github.event.action != 'closed' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.pet == 'true') }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: pinvou3-app
@@ -441,7 +678,7 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - uses: actions/setup-node@v7
         with:
@@ -483,6 +720,15 @@ jobs:
       - name: Vite build
         run: npm run build:ui
 
+      # Web (relay) build: the startup-bundle layer and the web index contract
+      # test (tests/vite_static_assets_contract.test.mjs) only cover the web
+      # dist when it exists, so build it unconditionally here instead of
+      # relying on the diff-selected test:webui smoke. That smoke reuses this
+      # dist via PINVOU_WEBUI_SKIP_BUILD=1 (smoke steps below) instead of
+      # running a second identical vite build.
+      - name: Vite web build (remote relay)
+        run: npm run build:web
+
       # Dist-layer compatibility audit (a marked@16-style lookbehind parse
       # regression is caught by exactly this layer); build:ui above already
       # produced dist/, while the contract test only covers static/inline layers.
@@ -499,44 +745,42 @@ jobs:
           test -n "$chrome"
           echo "CHROME=$chrome" >> "$GITHUB_ENV"
 
+      # The runner retries each selected smoke once so a transient runner
+      # flake (headless Chrome missing its 30 s DevTools-endpoint launch
+      # window) cannot evict a healthy PR from the merge queue; it fails
+      # closed on an empty selection, which also covers a masked upstream
+      # pipeline failure (select-frontend-smokes never emits an empty set).
       - name: Ready PR 定向浏览器 smoke
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # dist was already built unconditionally above; skip the identical
+          # in-smoke rebuild (see scripts/run-webui-smoke.mjs).
+          PINVOU_WEBUI_SKIP_BUILD: "1"
         run: |
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
             | node ../scripts/select-frontend-smokes.mjs \
-            > "$RUNNER_TEMP/frontend-smokes.tsv"
-          while IFS="$(printf '\t')" read -r kind target; do
-            case "$kind" in
-              npm) npm run "$target" ;;
-              node) node "$target" ;;
-              *) echo "未知 smoke 类型: $kind" >&2; exit 1 ;;
-            esac
-          done < "$RUNNER_TEMP/frontend-smokes.tsv"
+            | node ../scripts/run-frontend-smokes.mjs --selected
 
       - name: Merge Queue diff-selected browser smoke
         if: ${{ github.event_name == 'merge_group' }}
         env:
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          # Same dist reuse as the PR smoke step above.
+          PINVOU_WEBUI_SKIP_BUILD: "1"
         run: |
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
             | node ../scripts/select-frontend-smokes.mjs \
-            > "$RUNNER_TEMP/frontend-smokes.tsv"
-          while IFS="$(printf '\t')" read -r kind target; do
-            case "$kind" in
-              npm) npm run "$target" ;;
-              node) node "$target" ;;
-              *) echo "Unknown smoke kind: $kind" >&2; exit 1 ;;
-            esac
-          done < "$RUNNER_TEMP/frontend-smokes.tsv"
+            | node ../scripts/run-frontend-smokes.mjs --selected
 
   relay-test:
     name: relay-test
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.relay == 'true' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)) }}
+    # Drafts run too: the relay suite is short (10m cap) and early feedback
+    # beats a queue-time surprise on relay-touching changes.
+    if: ${{ !cancelled() && needs.changes.outputs.relay == 'true' && (github.event_name == 'merge_group' || github.event_name == 'pull_request') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -544,13 +788,14 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: remote-control-relay/package-lock.json
+          # No npm cache here: the install is seconds and setup-node would
+          # still write a 107MB PR-scoped cache copy per run (invisible to
+          # other PRs — pure quota weight). Same policy as release-contract-test.
 
       - name: 安装 relay 依赖
         run: npm --prefix remote-control-relay ci --prefer-offline --no-audit
@@ -571,13 +816,15 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: pinvou3-app/package-lock.json
+          # No npm cache here: a PR-scoped copy is never shared cross-PR, so
+          # it is pure quota weight. Unlike relay-test this install is the
+          # full pinvou3-app tree (~1 min, not seconds) — the quota win is
+          # the point, the cold install is the accepted cost.
 
       - name: 安装前端依赖
         run: npm --prefix pinvou3-app ci --prefer-offline --no-audit
@@ -598,8 +845,43 @@ jobs:
   knowledge-rust:
     name: knowledge-rust
     needs: changes
-    if: ${{ !cancelled() && github.event.action != 'closed' && (needs.changes.outputs.knowledge_rust == 'true' || needs.changes.outputs.knowledge_dependencies == 'true') }}
+    # Same trigger shape as cli-test: main push runs unconditionally so the
+    # knowledge-rust-v2 namespace keeps refreshing on non-knowledge merges
+    # (PRs never save; a namespace whose writer skips on main ages out and the
+    # next knowledge PR pays a full cold run). The push arm reads no changes
+    # outputs, so it also covers a push where the changes job itself fails
+    # (same cumulative-verification trade as rust-test/cli-test). Merge Queue
+    # and ready PRs stay paths-driven; drafts skip, like every other heavy leg.
+    if: >-
+      ${{
+        !cancelled() &&
+        github.event.action != 'closed' &&
+        (
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'merge_group' &&
+            (
+              needs.changes.outputs.knowledge_rust == 'true' ||
+              needs.changes.outputs.knowledge_dependencies == 'true'
+            )
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.draft == false &&
+            (
+              needs.changes.outputs.knowledge_rust == 'true' ||
+              needs.changes.outputs.knowledge_dependencies == 'true'
+            )
+          )
+        )
+      }}
     runs-on: ubuntu-22.04
+    # 冷跑时长未实测(~/.cargo 存档命中的运行 3–6min;cache-targets: false,
+    # 编译每轮全冷)。工具链滚动触发冷跑且逼近 30m 时 job 被超时判败,
+    # cache-on-failure 的 post 步会保存 ~/.cargo(registry/git 等,不含
+    # target 编译产物),失败与手动取消都会触发(post-if =
+    # success() || cache-on-failure;取消时 runner 仍执行 post 步),
+    # namespace 不会全冷。冷跑实测逼近上限时再上调。
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -607,26 +889,43 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0
           components: clippy, rustfmt
+
+      # rust-toolchain.toml lives under pinvou-knowledge, so it does not apply
+      # to cargo invoked from the repo root via --manifest-path; set the
+      # toolchain resolved from that file as the default (same alignment step
+      # as rust-test) so CI and local use the same rustc (currently floating
+      # stable). The file is the single source of truth: the version is not
+      # re-hardcoded in the workflow, upgrades only touch rust-toolchain.toml.
+      - name: Align the toolchain resolved by rust-toolchain.toml
+        working-directory: pinvou-knowledge
+        run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: pinvou-knowledge
           shared-key: knowledge-rust-v2
+          # Quota policy: this workspace's compiled artifacts are small but the
+          # job is never on the critical path (it runs parallel to the heavy
+          # legs), so only ~/.cargo is cached and the compile stays cold.
+          cache-targets: false
+          # cache-on-failure: still save when a main push fails — otherwise
+          # one failure drops the namespace fully cold (same anti-death-loop
+          # rationale as rust-test/cli-lint).
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo fmt --check
         run: cargo fmt --manifest-path pinvou-knowledge/Cargo.toml -- --check
 
       - name: cargo clippy (all targets, all features)
-        run: cargo clippy --manifest-path pinvou-knowledge/Cargo.toml --all-targets --all-features --no-deps
+        run: cargo clippy --manifest-path pinvou-knowledge/Cargo.toml --all-targets --all-features --no-deps --locked
 
       # Same hard gate rust-lint applies to src-tauri: deny every warning on
       # lib/bins/tests with the server feature, only outside Drafts. This lives
@@ -637,29 +936,57 @@ jobs:
       - name: cargo clippy (hard gate, lib/bins/tests + server)
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
         run: |
-          cargo clippy --manifest-path pinvou-knowledge/Cargo.toml --lib --bins --no-deps --features server -- -D warnings
-          cargo clippy --manifest-path pinvou-knowledge/Cargo.toml --lib --bins --tests --no-deps --features server
+          cargo clippy --manifest-path pinvou-knowledge/Cargo.toml --lib --bins --no-deps --features server --locked -- -D warnings
+          cargo clippy --manifest-path pinvou-knowledge/Cargo.toml --lib --bins --tests --no-deps --features server --locked
 
       - name: cargo test
-        run: cargo test --manifest-path pinvou-knowledge/Cargo.toml --all-features
+        run: cargo test --manifest-path pinvou-knowledge/Cargo.toml --all-features --locked
+
+      # feature-off 桩契约：--no-default-features 时嵌入走显式 unsupported 桩
+      # （loongarch64 上即使 feature 全开也是同一桩，且此前没有任何腿编译过
+      # 该变体）。先编译测试目标保证桩分支不腐坏，再运行桩契约测试（过滤
+      # stub_tests：其余测试可能假设 server feature）。
+      - name: cargo check + test (feature-off embedder stub)
+        run: |
+          cargo check --manifest-path pinvou-knowledge/Cargo.toml --tests --no-default-features --features client --locked
+          cargo test --manifest-path pinvou-knowledge/Cargo.toml --lib --no-default-features --features client --locked -- embedding::stub_tests
 
       - name: 部署脚本 shell 语法
         run: bash -n pinvou-knowledge/deploy/install.sh
+
+      # CodeWhale parity: fail loudly if any cargo invocation regenerated a
+      # lockfile instead of honoring it (the parent has no dedicated lock-drift
+      # gate; this catches accidental `cargo add`/`cargo update` side effects).
+      - name: Cargo.lock drift guard
+        run: git diff --exit-code -- '**/Cargo.lock'
 
       - name: cargo-deny
         if: ${{ needs.changes.outputs.knowledge_dependencies == 'true' }}
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          # Version pinned, same rationale as cargo-shear below/above:
+          # install-action defaults to latest, and upstream CLI changes
+          # (flag renames, new lint severities) would silently flip this
+          # hard gate nondeterministically.
+          tool: cargo-deny@0.20.2
 
-      # 共用现有许可证/来源策略，但审计对象显式指向独立 crate。
+      # Reuses the existing license/source policy, but the audited target is
+      # pointed at the standalone crate. The lock-graph guard runs in the same
+      # fail-fast step, before the --locked scan, so metadata resolution can
+      # never rewrite the audited lockfile.
+      - name: Python for dependency exception guard
+        if: ${{ needs.changes.outputs.knowledge_dependencies == 'true' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
       - name: cargo deny check
         if: ${{ needs.changes.outputs.knowledge_dependencies == 'true' }}
-        run: >-
-          cargo deny
-          --manifest-path pinvou-knowledge/Cargo.toml
-          --config pinvou3-app/src-tauri/deny.toml
-          check advisories licenses bans sources
+        shell: bash
+        working-directory: .
+        run: |
+          python3 scripts/guard-webpki-roots-exception.py
+          cargo deny --locked --manifest-path pinvou-knowledge/Cargo.toml --config pinvou3-app/src-tauri/deny.toml check advisories licenses bans sources
 
   # clippy/fmt/deny 独立 job:与 rust-test 并行,各自独立 cache。
   # clippy 用 clippy-driver 编译,产物不能被 cargo test(rustc)复用;在同一 job 里
@@ -674,9 +1001,33 @@ jobs:
     # 纳入 rust_dependencies:只改 deny.toml 时 rust_code=false 但 rust_dependencies=true,
     # cargo-deny 子步骤(已按 rust_dependencies 门控)需本 job 启动才能运行;
     # 否则 deny.toml 策略改动会静默漏检 cargo-deny。
-    if: ${{ !cancelled() && github.event.action != 'closed' && (needs.changes.outputs.rust_code == 'true' || needs.changes.outputs.rust_dependencies == 'true') }}
+    # Main push runs unconditionally (same "cumulative verification
+    # independent of a single push's paths-filter" rule as cli-lint): the
+    # rust-lint-v2 namespace must keep refreshing on non-rust merges, which a
+    # paths-gated writer cannot do. The push arm reads no changes outputs, so
+    # it also covers a push where the changes job itself fails. PR routing
+    # stays paths-driven, and drafts keep the fmt-only fast pass via
+    # RUN_HEAVY_RUST_CHECKS below.
+    if: >-
+      ${{
+        !cancelled() &&
+        github.event.action != 'closed' &&
+        (
+          github.event_name == 'push' ||
+          needs.changes.outputs.rust_code == 'true' ||
+          needs.changes.outputs.rust_dependencies == 'true'
+        )
+      }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # 30m 上限在缓存冷启动下不够:Cargo cache 是 save-if main-only(PR 永不保存)。
+    # 2026-10 起本 job 在 main push 上无条件运行以刷新存档(此前非 rust 合并会
+    # 整体跳过、存档老化),但工具链滚动或缓存池淘汰仍可能让 PR 端
+    # "No cache found" 冷跑(2026-10-01 前后多次冷跑在 ~30m 整点被 cancel,
+    # 公开运行史可查)。main push 成功运行实测(2026-10-17..22,近 30 次
+    # push 中 15 次成功):10m19s–34m53s,其中 12/15 落在 10–17m,
+    # 29m03s/34m53s 两个离群也未触上限,不受影响。
+    # 冷跑至少需要 30m 以上,60m 留出余量。
+    timeout-minutes: 60
     env:
       # Draft 只跑无系统依赖的 fmt 快检；Ready PR、Queue 与 main 跑 clippy。
       RUN_HEAVY_RUST_CHECKS: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
@@ -693,7 +1044,7 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: 初始化公共底座 submodule
         run: git submodule update --init --recursive -- CodeWhale
@@ -714,6 +1065,10 @@ jobs:
             pinvou3-app/src-tauri
             pinvou-knowledge
           shared-key: rust-lint-v2
+          # cache-on-failure: still save when a main push fails — otherwise
+          # one failure drops the namespace fully cold (same anti-death-loop
+          # rationale as rust-test/cli-lint).
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # fmt 硬门禁:风格规则见 rustfmt.toml(只用 stable 可用选项)。
@@ -766,8 +1121,8 @@ jobs:
         if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' }}
         working-directory: pinvou3-app/src-tauri
         run: |
-          cargo clippy --lib --bins --no-deps --features dev-tools -- -D warnings
-          cargo clippy --lib --bins --tests --no-deps --features dev-tools
+          cargo clippy --locked --lib --bins --no-deps --features dev-tools -- -D warnings
+          cargo clippy --locked --lib --bins --tests --no-deps --features dev-tools
 
       # pinvou-knowledge clippy hard gate lives in the knowledge-rust job: the
       # standalone workspace is compiled and linted there in a single shared
@@ -785,7 +1140,7 @@ jobs:
         working-directory: pinvou3-app/src-tauri
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --locked
 
       # cargo-shear (unused deps / unlinked source files): static parse, no
       # compile cost, rust-analyzer-grade precision (same tool as uv/oxc);
@@ -799,7 +1154,7 @@ jobs:
         if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' && needs.changes.outputs.rust_code == 'true' }}
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-shear@1.13.4
+          tool: cargo-shear@1.14.0
       - name: cargo shear (hard gate, both workspaces)
         if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' && needs.changes.outputs.rust_code == 'true' }}
         run: |
@@ -807,20 +1162,11 @@ jobs:
           cargo shear --deny-warnings pinvou-knowledge
 
       # dump_system_prompt is isolated behind the dev-tools feature: the
-      # default lib/clippy/test targets never compile it. Check explicitly so
-      # a CodeWhale Prompt API upgrade cannot slip through unadapted.
-      # (clippy --lib --bins + dev-tools already includes this bin; kept here
-      # as defense in depth at zero extra cost.)
-      - name: cargo check --bin dump_system_prompt (dev-tools)
-        if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' }}
-        working-directory: pinvou3-app/src-tauri
-        run: cargo check --bin dump_system_prompt --features dev-tools
-
-      # benchmark-hooks is intentionally outside the desktop default feature
-      # set, so the ordinary clippy legs cannot detect API drift in the
-      # headless evaluation bridge. Keep both compile contracts here, but run
-      # the executable contract in rust-test's shared lib harness, where it is
-      # covered without linking a second full Tauri integration-test binary.
+      # default lib/clippy/test targets never compile it. Its compile contract
+      # is covered by the clippy hard gate above (--bins --features dev-tools
+      # compiles the bin), so no separate rustc check is spent on it — a
+      # CodeWhale Prompt API upgrade that breaks the bin fails clippy
+      # identically.
       - name: benchmark-hooks + product backend compile checks (hard gate)
         if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' }}
         working-directory: pinvou3-app/src-tauri
@@ -828,16 +1174,36 @@ jobs:
           cargo check --all-targets --features benchmark-hooks --locked
           CARGO_TARGET_DIR=target cargo check --manifest-path ../../pinvou-cli/Cargo.toml --package pinvou-product-backend --locked
 
+      # Cargo.lock drift guard (CodeWhale parity): every cargo invocation in
+      # this job runs --locked, so any diff here means a lockfile was
+      # regenerated outside the lock discipline.
+      - name: Cargo.lock drift guard
+        if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' }}
+        run: git diff --exit-code -- '**/Cargo.lock'
+
       # cargo-deny only cares about dependency/policy paths (Cargo/lock/deny/gitlink).
       - name: cargo-deny (advisories/licenses/bans/sources)
         if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' && needs.changes.outputs.rust_dependencies == 'true' }}
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          # Version pinned (same rationale as the cargo-shear pin): this is a
+          # hard gate on every dependency change — a floating install would
+          # let an upstream release flip its CLI or lint semantics
+          # nondeterministically. Keep in sync with the knowledge-rust
+          # cargo-deny pin.
+          tool: cargo-deny@0.20.2
+      - name: Python for dependency exception guard
+        if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' && needs.changes.outputs.rust_dependencies == 'true' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
       - name: cargo deny check (hard gate)
         if: ${{ env.RUN_HEAVY_RUST_CHECKS == 'true' && needs.changes.outputs.rust_dependencies == 'true' }}
+        shell: bash
         working-directory: pinvou3-app/src-tauri
-        run: cargo deny check advisories licenses bans sources
+        run: |
+          python3 ../../scripts/guard-webpki-roots-exception.py
+          cargo deny --locked check advisories licenses bans sources
 
   rust-test:
     name: rust-test
@@ -884,14 +1250,32 @@ jobs:
       # runner 上内存峰值越线被 SIGTERM(merge_group run 实证,exit 143)。
       # 实测(CI 对照):thin LTO + lld 能 Finished + 全量通过;
       # lld-only(无 LTO)仍 OOM(binary 太大,lld 独立不够)。故两者都必需:
-      #   - Thin LTO:跨 crate 死代码消除 → test binary 变小(rustc 给依赖 crate 传
-      #     -C linker-plugin-lto,生成 LLVM bitcode,link 阶段合并——故依赖 lld)。
-      #   - lld:link 阶段处理 LLVM bitcode(lld 原生支持,BFD ld 不支持)。
-      #   - --thinlto-jobs=1:避免多个 ThinLTO backend 并行把 16GB runner
-      #     推过内存峰值并导致 hosted runner 与 GitHub 失联。
-      #   - --threads=1:also serialize lld's final link; after BrowserCore enlarged the test
-      #     binary, limiting only ThinLTO backends still exhausted hosted-runner memory there.
-      # 不设 codegen-units:dev 默认 256,对 test 改动最小(不影响 release 的 codegen=1)。
+      #   - Thin LTO: cross-crate dead-code elimination shrinks the test binary.
+      #     Cargo compiles dependency crates with -C linker-plugin-lto (bitcode
+      #     rlibs); cross-crate merging happens in-process in the final crate's
+      #     rustc, so bitcode never reaches the linker.
+      #   - lld: covers the object-linking phase's time and memory (BFD is
+      #     inefficient on large Rust binaries and is the standalone OOM cause),
+      #     not bitcode support.
+      #   - --threads=1: serializes lld's object linking; running it in parallel
+      #     pushed the 16GB runner past its memory peak and dropped the hosted
+      #     runner's connection to GitHub. The round that only capped
+      #     --thinlto-jobs still OOMed, because the backends already run inside
+      #     rustc's process, which jobs=1 cannot reach.
+      #   - --thinlto-jobs=1: a no-op for this workspace (lld receives no
+      #     bitcode, so there is no backend to cap); carried along with the
+      #     recipe so far, removal to be evaluated separately.
+      # Mechanism note (2026-10 calibration): since rustc >= 1.90,
+      # x86_64-linux-gnu self-links with its bundled rust-lld by default
+      # (proven by the mold experiment PR #644's failure logs: the cc command
+      # line carries rustc-injected -B<sysroot>/.../gcc-ld). -fuse-ld=lld above
+      # is a redundant fallback under jammy gcc 11 (when gcc resolves ld.lld by
+      # name, the -B directory precedes PATH and matches rust-lld); it stays as
+      # a fallback for older toolchains and local environments.
+      # dev 默认 256 个 codegen units 会把大型测试 harness 展开成过多 ThinLTO 输入，
+      # 在 16GB Linux hosted runner 上放大链接峰值。收敛到 16 只影响本 CI job；
+      # release 仍使用 Cargo.toml 的 codegen-units=1，产品产物不变。
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: "16"
       CARGO_PROFILE_DEV_LTO: "thin"
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--thinlto-jobs=1 -C link-arg=-Wl,--threads=1"
       # Cargo.toml [profile.dev] 固化 line-tables-only(本地调试体验);CI 改为完全
@@ -905,9 +1289,23 @@ jobs:
         with:
           submodules: false
 
+      # / and /mnt share one disk on hosted runners. Memory setup first claims
+      # 8 GiB of swap (16 GiB when zram is unavailable), then system/Node
+      # dependencies and the Rust cache are installed/unpacked on top. Freeing
+      # space only after the cache restore can be too late: the runner may hit
+      # ENOSPC before it can even write diagnostic logs. Remove explicitly
+      # unused preinstalled SDKs before any large write and require at least
+      # 24 GiB of initial headroom; the second and third calls below re-run
+      # before and after the cache restore.
+      - name: Prepare Rust disk space before swap and caches
+        run: |
+          sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            python3 scripts/ci-rust-disk.py --min-free-gib 24
+
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: 初始化公共底座 submodule
         run: git submodule update --init --recursive -- CodeWhale
@@ -915,7 +1313,10 @@ jobs:
       # pinvou3 编译链接的系统库(本地 pkg-config 实测:gtk/webkit/soup/rsvg/openssl/
       # X11×3/appindicator)。ubuntu runner 默认没装,否则 glib-sys 等 build script 失败。
       # cmake:reqwest 0.13 的 rustls 改用 aws-lc-rs,其 build script 需 cmake + C 编译器。
-      # lld:上方注入 CARGO_PROFILE_DEV_LTO=thin 后 link 阶段需支持 LLVM bitcode 的链接器。
+      # lld: a fallback for object-linking time and memory (-fuse-ld=lld only
+      # takes effect on old toolchains and local setups without -B injection;
+      # bitcode never reaches the linker, see the RUSTFLAGS mechanism note
+      # above).
       - name: 装 Tauri + pinvou3 Linux 系统依赖
         run: |
           sudo apt-get update
@@ -951,6 +1352,26 @@ jobs:
         working-directory: pinvou3-app/src-tauri
         run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
 
+      # v0.9.12 底座升级后,dev 对依赖开 O2 时 codewhale-tui 的 LLVM IR/bitcode
+      # 体量使本 job 的 thin LTO 在 16GB Linux hosted runner 上越线:2026-09-12 起 main
+      # push 与 PR 的 rust-test 均在编译最终 crate(pinvou3-tauri lib test,单个
+      # rustc ~7GB)时被内存看门狗按可用内存阈值提前杀掉(连续 8+ 次实证)。
+      # 与 windows-rust-test job 同款缓解(见该 job 同名 step):仅在本 job 内把
+      # codewhale-tui 覆盖回 dev 默认 O0,写入 CARGO_HOME/config.toml(package 级
+      # profile 覆盖只能走 config,Cargo 无对应环境变量),不改动仓库 Cargo.toml,
+      # 本地开发与 release 产物不受影响;overflow-checks 等其余 dev 设置继承,
+      # 测试语义不变。
+      - name: dev profile 内存边界覆盖(codewhale-tui O0,仅本 job)
+        run: |
+          config="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          cat >> "$config" <<'EOF'
+
+          [profile.dev.package.codewhale-tui]
+          opt-level = 0
+          EOF
+          echo "appended codewhale-tui dev O0 override to $config"
+          tail -n 4 "$config"
+
       # remote_control 的真实 relay 下载 e2e 需要 node + relay 依赖,缺 node_modules/ws 时
       # 该 e2e 会自动 skip —— 装上依赖让 CI 真正执行它,而不是绿灯假过。
       # push(main) 只编译不执行测试(见下方 --no-run),不需要 relay/Chrome 运行时依赖。
@@ -960,7 +1381,12 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: remote-control-relay/package-lock.json
+          # Same two-lockfile key as frontend-test/windows-codex-runtime-test:
+          # one shared npm cache namespace instead of per-job keys fragmenting
+          # the 10GB quota with duplicate 107MB entries.
+          cache-dependency-path: |
+            pinvou3-app/package-lock.json
+            remote-control-relay/package-lock.json
 
       - name: relay 依赖 (真实 relay e2e)
         if: ${{ github.event_name != 'push' }}
@@ -973,28 +1399,47 @@ jobs:
         # 因此直接用 package-lock 驱动的 npm ci，避免额外维护一份硬编码版本并保证可复现。
         run: npm --prefix pinvou3-app ci --prefer-offline --no-audit
 
+      # Cache extraction itself can exhaust the build disk; unused SDKs must
+      # go before the restore, not after it. Base tier only (this job needs
+      # Chrome for the e2e round, so the aggressive tier cannot be used).
+      - name: Prepare Rust disk space before cache restore
+        run: |
+          sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            python3 scripts/ci-rust-disk.py
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: pinvou3-app/src-tauri
-          # 2026-08-29/30 事故:凡 restore 本 job 的 target/ 缓存并据其链接出的
-          # 测试二进制,执行数秒内把 runner VM 打到失联(1s 遥测实证:内存/磁盘/
-          # 负载全程健康,死亡点在套件内随机)。与 cache 内容的新旧无关——#379
-          # (debug=0)之后每次 main push 保存的 target/ 都在 restore 后复现致死,
-          # 而全冷编译(不吃 target/ 缓存)的对照组同 runner 池 100% 全绿;
-          # 纯文档 PR 也死,与 PR 代码无关。根因定位期间先关掉 target/ 缓存:
-          # 只缓存 ~/.cargo(registry/git 索引,省下载),target/ 每次全冷编译
-          # (~15 分钟,与绿色对照组同构)。根因查明并验证前不要重新打开。
-          cache-targets: false
-          # 稳定 key 前缀(跨 PR/push 一致);restore 按前缀回退,lock 变了也增量。
+          # 2026-08-29/30 incident: every test binary linked from a restored
+          # copy of this job's target/ cache knocked the runner VM offline
+          # within seconds of execution; the emergency response at the time
+          # was cache-targets: false. The root cause was later identified as
+          # insufficient runner RAM (the 14.2GB Max RSS peak approached the
+          # 16GB ceiling), absorbed by the memory-expansion layer of zram
+          # (zstd, 2x RAM, pool capped at 70% of RAM) + the 8G /mnt swapfile
+          # (scripts/ci-memory-setup.sh, run by every ubuntu job, see the
+          # gate-policy test); the link side additionally has the
+          # ThinLTO/lld/threads=1 guards (see the job env comments).
+          # Re-verified on 2026-10-02, the target/ cache is back on (saves
+          # ~15min of cold compile per run).
+          # Stable key prefix (identical across PRs/pushes); restore falls
+          # back by prefix, so incremental reuse survives lockfile changes.
           shared-key: rust-test-v2
-          # 只在 main 保存(暖 cache 唯一来源);PR 侧只读,不占 10GB 限额。
+          # Save on main only (the sole source of warm cache); the PR side is
+          # read-only and stays out of the 10GB quota.
+          # cache-on-failure: still save the compiled artifacts when a main
+          # push fails — otherwise one failure drops the namespace fully cold
+          # (mac-build died exactly this way: timeout -> no save -> cold
+          # forever).
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Single-disk hosted runners are tight on disk (PR #988: cold build had only 7.3 GiB
-      # left); remove unused preinstalled SDKs before dependency and test compilation. "base" tier:
-      # this job needs Chrome for e2e, so the "aggressive" tier (which removes /opt/google/chrome) cannot be used.
-      - name: Prepare disk space for the two Rust test rounds
+      # Reserve room after dependencies, the cache restore and the swap
+      # allocation; only unused SDKs on this disposable hosted runner are
+      # removed (PR #988: a cold build once started with only 7.3 GiB free).
+      - name: Re-check Rust disk space after cache restore
         run: |
           sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
             RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
@@ -1016,6 +1461,17 @@ jobs:
       - name: cargo test --lib --no-run（编译链接测试二进制）
         if: ${{ github.event_name != 'push' }}
         run: /usr/bin/time -v cargo test --manifest-path pinvou3-app/src-tauri/Cargo.toml --lib --features benchmark-hooks --locked --no-run
+
+      # Test registry guard: a duplicated #[test] registers one case twice
+      # and swallows the adjacent case's attributes (happened twice on PR
+      # #455, rounds 26/28), and is invisible to the total run count
+      # (inflation and shrinkage cancel out). Reuses the previous step's
+      # build artifacts, done in seconds: assert no duplicated registration
+      # paths + every consent-critical pin is present
+      # (scripts/test-registry-guard.py).
+      - name: test-registry guard (duplicates + required pins)
+        if: ${{ github.event_name != 'push' }}
+        run: python3 scripts/test-registry-guard.py
 
       - name: cargo test --lib（含 strict_mode 回归；真 bge-m3/vLLM 测试已 #[ignore]）
         if: ${{ github.event_name != 'push' }}
@@ -1069,18 +1525,33 @@ jobs:
       }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      # The CLI workspace compiles pinvou3-tauri plus its own targets. Disable
+      # dev DWARF to keep a cold target directory within hosted-runner disk.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           submodules: false
 
+      # A cold CLI workspace plus pinvou3-tauri exhausts the hosted runner's
+      # initial ~13 GiB. This allowlisted helper (base tier) removes only the
+      # unused Android/.NET/ghcup/Julia SDKs; memory headroom afterwards comes
+      # from zram plus the mandatory /mnt/swapfile provisioned by
+      # scripts/ci-memory-setup.sh in the next step.
+      - name: Prepare Rust disk capacity
+        run: |
+          sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            python3 scripts/ci-rust-disk.py
+
       # Same policy as rust-test: the Linux Rust job attempts extra memory
       # first (best effort and non-fatal; only the wrapper structure is
       # enforced by the gate policy).
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: Init CodeWhale submodule
         run: git submodule update --init --recursive -- CodeWhale
@@ -1105,8 +1576,10 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             build-essential pkg-config cmake \
-            time \
             libpipewire-0.3-dev libdrm-dev libgbm-dev libegl-dev
+          # Keep this package list byte-identical with the cli-lint job's
+          # setup block below (round-45 review: the two blocks are copies;
+          # an entry that goes stale in one hides which are load-bearing).
           # Reduce footprint at the source: orphan dependencies, apt cache packages, and index lists do not stay on the build disk.
           sudo apt-get autoremove -y --purge
           sudo apt-get clean
@@ -1147,11 +1620,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: pinvou-cli
-          # Same standing incident directive as rust-test (see its Cargo cache
-          # comment): target/ caches took runners down with the root cause
-          # still unidentified - cache ~/.cargo only until then.
+          # rust-test's 2026-08-29/30 restored-target incident was root-caused
+          # to runner RAM (see its Cargo cache comment) and its cache-targets
+          # flag has been re-enabled there. This job stays cargo-only for a
+          # different reason: quota. The 10GB budget cannot also hold a second
+          # multi-GB target tree, and this job is never the critical path
+          # (med 817s, parallel to the heavy legs), so the cold compile is the
+          # cheaper side of the trade.
           cache-targets: false
           shared-key: cli-test
+          # cache-on-failure: still save when a main push fails — otherwise
+          # one failure drops the namespace fully cold (same anti-death-loop
+          # rationale as rust-test/cli-lint).
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # --all is required: pinvou-cli is a virtual workspace (no [package]),
@@ -1184,11 +1665,169 @@ jobs:
         working-directory: pinvou-cli
         run: cargo test -p adapter-gaia --features test-support --locked --no-run
 
+  # pinvou-cli lint leg (round 18, review §3 "The CI leg doesn't lint the
+  # CLI"): until now ~50k lines of CLI Rust had no clippy on any lane, and
+  # the src-tauri [lints] table (unwrap/expect kept at warn there) does not apply
+  # to the pinvou-cli workspace. This job runs clippy on every CLI-triggering
+  # PR, Merge Queue combined tree, and main push.
+  # Scope decision — warn-visible only, deliberately NOT `-D warnings` yet:
+  # the workspace carries a three-digit clippy warning count on this tree
+  # (round-48 review measured 114: ~70 in crates/cli/src lib code, the rest
+  # in test targets — the count drifts as waves land; the point is the
+  # order of magnitude), so a deny gate would ship red on this very PR. The app crate went through the same sequence
+  # (see its rust-lint comment): pay the debt, then flip. Lint configuration
+  # belongs in pinvou-cli/Cargo.toml [lints] — a per-repository convention
+  # (never CLI -W/-D, to avoid divergence from local runs) for which crates
+  # are owned by the CLI work, not this workflow. Until that table lands and
+  # the debt is digested, this leg surfaces every warning on every run and
+  # fails closed on any compile error; it cannot silently pass a broken
+  # build (the step's exit status is the compiler's).
+  # Placement rationale (same as rust-test vs rust-lint): clippy-driver
+  # artifacts are not reusable by the cargo test compilers, so running both
+  # inside cli-test would compile the dependency graph twice serially; a
+  # separate job keeps wall-clock at max(lint, test) with an independent
+  # cache. No RUSTC_WRAPPER stack wrapper (same reason as cli-test: the
+  # pinvou-cli workspace has no [profile] section, so dependencies compile
+  # at O0 and the codewhale-tui O2 overflow trigger is absent).
+  cli-lint:
+    name: cli-lint
+    needs: changes
+    # Same trigger set as cli-test: ready cli_rust/rust_full PRs, the
+    # matching Merge Queue combined tree, and main push (cumulative
+    # verification independent of a single push's paths-filter).
+    if: >-
+      ${{
+        !cancelled() &&
+        github.event.action != 'closed' &&
+        (
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'merge_group' &&
+            (
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.rust_full == 'true'
+            )
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.draft == false &&
+            (
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.rust_full == 'true'
+            )
+          )
+        )
+      }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Set up zram and swap
+        # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+
+      - name: Init CodeWhale submodule
+        run: git submodule update --init --recursive -- CodeWhale
+
+      # Same system packages as cli-test (the workspaces are identical: the
+      # CLI compiles pinvou3-tauri as a path dependency, so its build script
+      # and its computer_use capture headers need the same libraries).
+      - name: Install Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          # Package list audited per-package on 2026-09-15: gtk/soup/x11 are installed
+          # transitively via webkit-dev — that transitive set is what covers the pure-Rust
+          # x11/xkbcommon/xcb crates the computer_use capture stack builds against
+          # (libxkbcommon-dev via libgtk-3-dev, libxcb1-dev via libx11-dev; enigo's X11
+          # input path is pure-Rust x11rb and needs no C XTest/XInput headers); librsvg2-dev
+          # is not needed for the build; libssl-dev (openssl-sys is not vendored)
+          # and appindicator (tray) must be kept.
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            build-essential pkg-config cmake \
+            libpipewire-0.3-dev libdrm-dev libgbm-dev libegl-dev
+          # Reduce footprint at the source: orphan dependencies, apt cache packages, and index lists do not stay on the build disk.
+          sudo apt-get autoremove -y --purge
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # pipewire-rs 0.10 (computer_use Wayland capture, direct + via xcap) needs SPA
+      # static inline helpers that ubuntu-22.04's libpipewire 0.3.48 headers lack
+      # (libspa-sys bindgens against system headers at build time). See
+      # scripts/ci-libpipewire-build.sh for the full rationale.
+      - name: Build PipeWire 1.0.7 dev prefix (jammy SPA headers too old)
+        run: bash scripts/ci-libpipewire-build.sh
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Same as cli-test: the version pinned by src-tauri/rust-toolchain.toml
+      # must become the default so cargo invoked from the repo root with
+      # --manifest-path uses the same toolchain as local development.
+      - name: Align the toolchain pinned by rust-toolchain.toml
+        working-directory: pinvou3-app/src-tauri
+        run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
+
+      # Target-dir caching follows rust-lint, not cli-test: the standing
+      # incident directive (cache-targets: false) exists because RESTORED
+      # target/ entries that needed linking (test binaries) took the hosted
+      # runners down. Clippy artifacts are rmeta-only checks that never link,
+      # which is exactly the rust-lint case ("clippy/check" target caching in
+      # the repo's cache policy). Own key: clippy artifacts differ from the
+      # rustc artifacts of the cli-test cache and would evict each other.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pinvou-cli
+          shared-key: cli-lint
+          # cache-on-failure matches the sibling legs (rust-test,
+          # windows-rust-test, macos-rust-check, macos-cli-check):
+          # save-on-success-only means one failed main push drops the
+          # namespace fully cold and every later run pays the full cold
+          # compile. Saves stay main-only (save-if below).
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Warn-visible by design (see the job comment); --all-targets so tests
+      # are linted too (they carry their own share of the measured debt).
+      # --no-deps: dependencies and the CodeWhale submodule are not linted;
+      # their warnings are displayed but never block, same as rust-lint.
+      # Note: targets hidden behind required-features (adapter-gaia
+      # test-support) are skipped by the workspace run, exactly as in
+      # cli-test's cargo test step.
+      - name: cargo clippy (workspace, all targets)
+        run: >-
+          cargo clippy --manifest-path pinvou-cli/Cargo.toml
+          --workspace --all-targets --no-deps --locked
+
+      # The featureless build (product-backend off) is not exercised by any
+      # test leg — cargo test always runs default features — so without this
+      # step the `#[cfg(not(feature = "product-backend"))]` refusal arms in
+      # the cli crate could rot silently. The family modules cfg-guard their
+      # product-backend code, so the featureless build must keep compiling —
+      # lib, bins, and test targets alike (`--all-targets`; the contract
+      # tests import only ungated items, and docs/pinvou-cli.md promises
+      # exactly this coverage, so the guarantee is enforced here rather than
+      # verified once by hand).
+      - name: cargo check (workspace, no default features, all targets)
+        run: >-
+          cargo check --manifest-path pinvou-cli/Cargo.toml
+          --workspace --all-targets --no-default-features --locked
+
   windows-rust-test:
-    name: windows-rust-test
+    name: windows-rust-test (${{ matrix.phase }})
     needs: changes
     # Native Windows coverage runs once on ready high-risk/explicit PRs and on main.
-    # Merge Queue does not repeat this up-to-90-minute leg; Linux validates the combined tree.
+    # Merge Queue does not repeat these legs (each capped at its own
+    # timeout-minutes below); Linux validates the combined tree.
     if: >-
       ${{
         !cancelled() &&
@@ -1208,6 +1847,19 @@ jobs:
           )
         )
       }}
+    # `cargo check --all-targets --features dev-tools` (plus the pinvou-cli
+    # check) produces metadata-only graphs, while `cargo test --lib --no-run`
+    # must codegen and link the default-feature test harness; a prior check
+    # does not turn that link into an incremental step. Running them in one
+    # serial job put both compile graphs on the critical path (passing runs
+    # took 85-87 minutes). Both legs stay required under this aggregate
+    # matrix job, but run independently so wall time is the slower leg
+    # rather than the sum. See docs/windows-rust-ci.md.
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        phase: [all-targets-check, regression]
     runs-on: windows-latest
     # 状态机回归使用 Bash 循环；job 级固定 shell 也覆盖 merge ref 从 base
     # 带入该步骤的场景。本 job 其余 run 命令均兼容 Bash。
@@ -1219,12 +1871,19 @@ jobs:
     # after sccache removal (aws-lc-sys prebuilt NASM objects compile even
     # slower). Since 2026-09 several runs died at the 90-minute cap during
     # the link step while passing runs already took 85-87 minutes, so the
-    # cap is raised to 180 minutes. PR #478 additionally compiles the whole
+    # cap was raised to 180 minutes. PR #478 additionally compiles the whole
     # pinvou-cli workspace on this Windows-only leg, and lockfile changes
-    # miss the rust-cache key (full cold compile); a 90-minute run was
-    # cancelled mid-build (run 34802015051), so 180 minutes leaves headroom
-    # for two cold workspaces.
-    timeout-minutes: 180
+    # miss the rust-cache key (full cold compile). Floating stable rolled to
+    # 1.99.0 on 2026-10-01: the rust-cache key hashes the rustc version, so
+    # every PR leg recompiled both workspaces from scratch and the cold link
+    # step alone consumed the whole 180-minute budget before any regression
+    # ran (this PR's run 36919362322). PR legs never save the cache
+    # (save-if main-only), so the cap is raised to 240 minutes to keep one
+    # fully cold toolchain rollover per channel bump inside a single leg;
+    # each independent leg can still compile cold on a cache miss, so the
+    # cap is kept per leg until the phase timings below justify a tighter
+    # one.
+    timeout-minutes: 240
     env:
       # reqwest 0.13 → aws-lc-sys(非 FIPS)。Windows x86_64 需 NASM 汇编;runner 默认无 NASM,
       # 用预生成 NASM 对象规避(aws-lc-rs 官方支持,无需额外装 NASM)。
@@ -1238,6 +1897,25 @@ jobs:
       # client、到不了 server 派生的 rustc,codegen 仍会溢出。必须用
       # ${{ github.workspace }} 绝对路径(避免按 cwd 双拼解析)。
       RUSTC_WRAPPER: ${{ github.workspace }}/pinvou3-app/src-tauri/scripts/rustc-stack-wrapper.exe
+      # 2026-10 stable 1.99: the cold `cargo test --lib --no-run` OOM'd the
+      # 16 GB hosted runner in the final test-binary link (730 dep crates
+      # compile in ~25 minutes, then the link pagefile-thrashes silently for
+      # hours; runs 36919362322 and 36940184038 were killed at the 180/240
+      # caps). Same OOM the linux rust-test leg already solved; mirror its
+      # measured recipe for MSVC: thin LTO shrinks the test binary cross-crate
+      # (cargo compiles dependency crates with -C linker-plugin-lto; the final
+      # crate's rustc consumes that bitcode in-process, so the linker receives
+      # only post-LTO objects), lld-link links those objects with a far
+      # smaller peak than link.exe, /threads:1 serializes lld-link's own
+      # threading and the final link (the ThinLTO backends run inside rustc
+      # with no knob to cap them), and dropping DWARF shrinks objects further
+      # (panic file:line comes
+      # from Location rodata, not debuginfo). Growing the hosted runner's
+      # pagefile instead needs a reboot a CI job cannot perform, so the fix
+      # is to cut peak link memory below RAM. The linker flags are probed and
+      # exported as RUSTFLAGS by the probe step below.
+      CARGO_PROFILE_DEV_LTO: "thin"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -1245,23 +1923,96 @@ jobs:
           submodules: false
 
       - name: 初始化公共底座 submodule
-        run: git submodule update --init --recursive -- CodeWhale
+        run: |
+          started=$SECONDS
+          set +e
+          git submodule update --init --recursive -- CodeWhale
+          status=$?
+          set -e
+          echo "WINDOWS_RUST_TIMING phase=${{ matrix.phase }} step=codewhale-init elapsed_seconds=$((SECONDS-started)) status=$status"
+          exit "$status"
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # 同 rust-test:把 src-tauri/rust-toolchain.toml 锁定的工具链设为 default,
-      # 保证从仓库根 --manifest-path 调用 cargo 时与本地同一 pinned 版本。
+      # Same as rust-test: set the toolchain pinned by
+      # src-tauri/rust-toolchain.toml as the default, so cargo invoked from
+      # the repo root via --manifest-path uses the same rustc as locally
+      # (currently floating stable). id + output: the CodeWhale regression
+      # step needs the same resolved toolchain as its RUSTUP_TOOLCHAIN
+      # (overriding CodeWhale's own rust-toolchain.toml, see that step's
+      # comment).
       - name: 对齐 rust-toolchain.toml 锁定的工具链
+        id: pinned_toolchain
         working-directory: pinvou3-app/src-tauri
         shell: bash
-        run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
+        run: |
+          toolchain="$(rustup show active-toolchain | awk '{print $1}')"
+          echo "version=${toolchain}" >> "$GITHUB_OUTPUT"
+          rustup default "${toolchain}"
+
+      # v0.9.12 底座升级后,dev 对依赖开 O2 时 rustc/LLVM 编译 codewhale-tui(lib)
+      # 在 16GB Windows hosted runner 上越线(rustc-LLVM out of memory 回归实证);
+      # 收敛 codegen-units 又会显著拉长该 crate 的编译时长(实测,不采用)。故仅在本
+      # job 内把 codewhale-tui 覆盖回 dev 默认 O0:写入 CARGO_HOME/config.toml
+      # (package 级 profile 覆盖只能走 config,Cargo 无对应环境变量),不改动仓库
+      # Cargo.toml,本地与 Linux job 的依赖级 O2 不受影响。release 产物仍由
+      # Cargo.toml 的 release profile 决定。
+      - name: dev profile 内存边界覆盖(codewhale-tui O0,仅本 job)
+        shell: pwsh
+        run: |
+          # Explicit for parity with the content-mutating sibling pwsh
+          # steps (they set the same preference). The runner's pwsh
+          # wrapper already prepends ErrorActionPreference='stop', so a
+          # failed append already fails the step; this line only keeps
+          # the guard if the script is ever run outside that wrapper —
+          # a silent failure here would resurrect the documented 16GB
+          # rustc/LLVM OOM regression this override exists to prevent.
+          $ErrorActionPreference = "Stop"
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $config = Join-Path $cargoHome "config.toml"
+          Add-Content -Path $config -Value @"
+
+          [profile.dev.package.codewhale-tui]
+          opt-level = 0
+          "@
+          Write-Host "appended codewhale-tui dev O0 override to $config"
+          Get-Content -Path $config | Select-Object -Last 4
 
       # 编译 Windows 专用 .exe 栈 wrapper(源码 scripts/rustc-stack-wrapper.rs)。
       # 直接调 rustc 编译、不经 cargo,故不受本 job 的 RUSTC_WRAPPER 影响,无自举依赖。
       - name: 编译 Windows 栈 wrapper(.exe)
         shell: bash
         run: rustc -O pinvou3-app/src-tauri/scripts/rustc-stack-wrapper.rs -o pinvou3-app/src-tauri/scripts/rustc-stack-wrapper.exe
+
+      # Probe which stable rustc flag selects the bundled lld for MSVC on this
+      # toolchain, then export the winning flags as RUSTFLAGS for every later
+      # step. On stable today arm 2 always wins: +lld is unstable on every
+      # target and the stable -lld opt-out is x86_64-linux-gnu only, so MSVC
+      # needs the explicit linker+flavor pair; arm 1 stays so a future +lld
+      # stabilization is picked up automatically. An unsupported flag fails
+      # the probe in seconds; without it the failure would surface only at
+      # the final link, hours into the cold build.
+      - name: Probe and export the Windows lld link flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          echo 'fn main() {}' > "$probe/probe.rs"
+          if rustc -C linker-features=+lld -C link-arg=/threads:1 \
+              -o "$probe/probe.exe" "$probe/probe.rs" 2>"$probe/a.err"; then
+            flags="-C linker-features=+lld -C link-arg=/threads:1"
+          elif rustc -C linker=rust-lld -C linker-flavor=lld-link \
+              -C link-arg=/threads:1 -o "$probe/probe.exe" \
+              "$probe/probe.rs" 2>"$probe/b.err"; then
+            flags="-C linker=rust-lld -C linker-flavor=lld-link -C link-arg=/threads:1"
+          else
+            echo "FAIL: this toolchain has no stable flag to select lld" >&2
+            cat "$probe/a.err" "$probe/b.err" >&2 || true
+            exit 1
+          fi
+          echo "probed RUSTFLAGS=$flags"
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
 
       # This job's cargo steps do not need frontend dependencies: under the
       # debug profile tauri's generate_context! uses devUrl, dist/ is never
@@ -1273,34 +2024,121 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          # This job compiles the CodeWhale Windows-only regression target as
-          # well as the application workspace. Cache both target directories.
+          # This job compiles the CodeWhale Windows-only regression target,
+          # the application workspace, AND the pinvou-cli workspace (the
+          # check leg's `cargo check --manifest-path pinvou-cli` plus the
+          # regression leg's filtered pinvou-cli test runs). Cache all three
+          # target directories: without the CLI entry every run cold-compiled
+          # the CLI dependency tree on the slowest leg — the sibling jobs
+          # that compile it (cli-lint, macos-cli-check, rust-lint's
+          # product-backend check; cli-test shares only the registry
+          # portion via cache-targets: false) cache it in
+          # their own namespaces, which this Windows job can never restore
+          # from, so this entry is the only Windows-side warmth the CLI can
+          # get. Quota note: this grows the namespace ~1GB,
+          # offset by pruning the release artifacts out of the
+          # macos-rust-check save (see that job; its shared-key rotation
+          # lands the shrink on the first post-merge push — rust-cache
+          # skips the save on an exact key hit, so a content-only prune
+          # needs the rotation to ever replace the old fat entry). As with
+          # that rotation, adding a workspace changes only this entry's
+          # exact key (restore prefix unchanged), so the first post-merge
+          # run prefix-restores the old 2-workspace generation and both
+          # entries coexist until LRU/GC reclaims the old one.
           workspaces: |
             pinvou3-app/src-tauri
             CodeWhale
+            pinvou-cli
+          # Both legs restore the established namespace on their isolated
+          # runners. Only the regression leg on main may save (it owns the
+          # linked app and CodeWhale test artifacts), so the split adds
+          # neither a new namespace nor a second writer racing the 10 GB cache.
           shared-key: windows-rust-test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # cache-on-failure: a failed main regression leg must still save the
+          # compiled artifacts — otherwise the namespace stays cold until a
+          # green run lands and every leg pays the full cold compile (the
+          # historical 90-minute-timeout scenario).
+          cache-on-failure: true
+          save-if: ${{ matrix.phase == 'regression' && github.ref == 'refs/heads/main' }}
+
+      # Non-sensitive cache baseline: target presence plus fingerprint and
+      # direct dependency-artifact counts, without a recursive scan.
+      - name: Windows Rust cache baseline diagnostics
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:GITHUB_WORKSPACE "pinvou3-app/src-tauri/target"
+          $fingerprints = Join-Path $target "debug/.fingerprint"
+          $deps = Join-Path $target "debug/deps"
+          $fingerprintCount = if (Test-Path -LiteralPath $fingerprints) {
+            @(Get-ChildItem -LiteralPath $fingerprints -Directory -ErrorAction SilentlyContinue).Count
+          } else { 0 }
+          $depFileCount = if (Test-Path -LiteralPath $deps) {
+            @(Get-ChildItem -LiteralPath $deps -File -ErrorAction SilentlyContinue).Count
+          } else { 0 }
+          Write-Host "WINDOWS_RUST_CACHE phase=${{ matrix.phase }} target_exists=$(Test-Path -LiteralPath $target) fingerprint_crates=$fingerprintCount dep_files=$depFileCount"
 
       - name: Windows Rust 全目标检查
-        run: >-
-          cargo check --manifest-path pinvou3-app/src-tauri/Cargo.toml
-          --all-targets --features dev-tools
+        if: ${{ matrix.phase == 'all-targets-check' }}
+        run: |
+          started=$SECONDS
+          set +e
+          cargo check --manifest-path pinvou3-app/src-tauri/Cargo.toml \
+            --all-targets --features dev-tools --locked
+          status=$?
+          set -e
+          echo "WINDOWS_RUST_TIMING phase=all-targets-check step=cargo-check elapsed_seconds=$((SECONDS-started)) status=$status"
+          exit "$status"
 
       # The pinvou-cli Windows branches (exe/cmd candidates, cmd /D /S /C
       # shims, taskkill tree kill, CREATE_NO_WINDOW) only compile-check on a
-      # Windows runner.
+      # Windows runner. It is metadata-only as well, so it shares the check leg.
       - name: pinvou-cli Windows compile check
+        if: ${{ matrix.phase == 'all-targets-check' }}
+        run: |
+          started=$SECONDS
+          set +e
+          cargo check --manifest-path pinvou-cli/Cargo.toml \
+            --workspace --all-targets --locked
+          status=$?
+          set -e
+          echo "WINDOWS_RUST_TIMING phase=all-targets-check step=cli-check elapsed_seconds=$((SECONDS-started)) status=$status"
+          exit "$status"
+
+      # dataset_contract is gated behind `required-features = ["test-support"]`
+      # and is silently skipped by the workspace-wide run above; the Linux
+      # cli-test leg executes it, so the Windows compile leg must at least
+      # compile it. `--all-targets` is required: a bare `cargo check -p` builds
+      # lib+bins only, and `required-features` can only filter targets out of
+      # the selected set, never add the test target in.
+      - name: pinvou-cli Windows compile check (adapter-gaia test-support)
+        if: ${{ matrix.phase == 'all-targets-check' }}
         run: >-
           cargo check --manifest-path pinvou-cli/Cargo.toml
-          --workspace --all-targets --locked
+          -p adapter-gaia --features test-support --all-targets --locked
 
+      # Round-45 note: this step builds --features benchmark-hooks, which
+      # compiles the headless-bridge contract module the regression filters
+      # pin — the leg's wall clock rose accordingly (~21m → ~56m). That cost
+      # is the price of the filters matching a real test binary; a leg-time
+      # regression here means the feature or the module grew.
       - name: Windows Rust 单元测试链接检查
+        if: ${{ matrix.phase == 'regression' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          # Round-45 review: `benchmark-hooks` must be on, or the
+          # `#[cfg(all(test, feature = "benchmark-hooks"))]` headless-bridge
+          # contract module (incl. `windows_attachment_runtime_stays_security_gated`,
+          # one of the round-44 filters below) is compiled out of this exe
+          # and its regression filter matches 0 tests. agent-backend-api and
+          # deepseek-tui already compile on this leg's toolchain via the
+          # pinvou-cli workspace leg.
           $records = @(& cargo test --manifest-path pinvou3-app/src-tauri/Cargo.toml `
-            --lib --no-run --message-format=json)
+            --lib --no-run --locked --features benchmark-hooks --message-format=json)
           $cargoExit = $LASTEXITCODE
+          $timer.Stop()
+          Write-Host "WINDOWS_RUST_TIMING phase=regression step=cargo-test-link elapsed_seconds=$([math]::Round($timer.Elapsed.TotalSeconds)) status=$cargoExit"
           $records | ForEach-Object { Write-Host $_ }
           if ($cargoExit -ne 0) {
             throw "FAIL: Windows Rust 单元测试链接检查失败(exit=$cargoExit)"
@@ -1332,6 +2170,7 @@ jobs:
       # link.exe 已给测试 exe 嵌入默认清单,Windows 会优先使用内嵌资源而忽略同目录
       # <exe>.manifest；因此必须用 runner 自带的 Windows SDK mt.exe 更新 resource #1。
       - name: Windows 测试 exe 嵌入 Common-Controls v6 清单
+        if: ${{ matrix.phase == 'regression' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1374,6 +2213,7 @@ jobs:
       # SxS 程序集 DLL(如 comctl32)的缺符号假阳性,嵌入前读到的是无 v6 声明的默认清单;
       # 直接传 $PINVOU3_TEST_EXE 保证诊断对象就是刚嵌入清单、回归将运行的那个 exe。
       - name: Windows 测试二进制导入诊断
+        if: ${{ matrix.phase == 'regression' }}
         continue-on-error: true
         shell: pwsh
         run: python scripts/ci-windows-imports-diagnose.py "$env:PINVOU3_TEST_EXE"
@@ -1381,15 +2221,30 @@ jobs:
       # Parent application jobs do not execute a dependency crate's lib tests;
       # this Windows leg explicitly runs the CodeWhale shell regressions. Assert
       # that every filter still matches so a rename cannot become a silent pass.
+      # RUSTUP_TOOLCHAIN overrides CodeWhale's own rust-toolchain.toml: every
+      # other leg compiles the same codewhale-tui sources at whatever
+      # src-tauri's rust-toolchain.toml resolves to (the alignment step above
+      # made that rustup's default). Resolving the same toolchain here keeps
+      # one compiler for one PR — a toolchain-specific bug cannot vanish in
+      # this leg and reappear elsewhere, and the guard holds whether the
+      # files pin a version or float. (RUSTUP_TOOLCHAIN beats the directory
+      # override file.)
       - name: CodeWhale Windows PowerShell regressions
+        if: ${{ matrix.phase == 'regression' }}
         shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.pinned_toolchain.outputs.version }}
         run: |
           set -euo pipefail
+          started=$SECONDS
           # The tested fallback chooses pwsh.exe only when SHELL is absent.
           # Make that runner assumption explicit and deterministic.
           unset SHELL
           cd CodeWhale
-          for filter in forkguard_powershell forkguard_windows_shell_text; do
+          for filter in forkguard_powershell forkguard_windows_shell_text \
+            command_spec_env_overlays_preserve_existing_values \
+            forkguard_windows_shell_env_overlays_keep_python_stdio_utf8 \
+            windows_shell_env_explicit_override_is_case_insensitive; do
             log="/tmp/codewhale_windows_${filter}.log"
             cargo test -p codewhale-tui --lib --locked "$filter" -- --test-threads=1 2>&1 | tee "$log"
             grep -qE 'running [1-9][0-9]* tests?' "$log" || {
@@ -1397,11 +2252,14 @@ jobs:
               exit 1
             }
           done
+          echo "WINDOWS_RUST_TIMING phase=regression step=codewhale-powershell elapsed_seconds=$((SECONDS-started)) status=0"
 
       - name: Windows 原子替换状态机回归
+        if: ${{ matrix.phase == 'regression' }}
         shell: bash
         run: |
           set -euo pipefail
+          total_started=$SECONDS
           # 直接运行已经由 mt.exe 修补的链接产物。这里不能再次调用 cargo test，
           # 否则 Cargo 可能重链并覆盖 exe，导致 Common-Controls v6 清单丢失。
           test_exe="$(cygpath -u "$PINVOU3_TEST_EXE")"
@@ -1412,16 +2270,66 @@ jobs:
           cd pinvou3-app/src-tauri
           # 逐过滤器断言至少命中 1 个测试,避免测试改名后过滤器 0 匹配却 exit 0
           # 导致的静默空跑。
+          index=0
           for filter in \
             'platform::filesystem::tests::windows_' \
             'platform::paths::tests::managed_python_' \
+            'cross_process_lock' \
             'artifact_read_recovers_an_occupied_1177_layout_after_release' \
             'artifact_writes_never_expose_partial_utf8_to_concurrent_readers' \
             'artifact_public_read_' \
             'features::voice::platform::windows::tests::closed_temp_wav_can_be_reopened_when_asr_denies_write_sharing' \
             'features::memory::tests::topic_migration_' \
             'connector_introspection_guard_matches_complete_names_only' \
+            'multiagent_depth_guard_enforces_two_level_inputs' \
+            'features::marketplace::tests::reinstall_upload_with_unlocked_pip_dependencies_contract' \
+            'features::marketplace::scope::tests::' \
+            'before_landing' \
+            'before_anything_lands' \
+            'preserves_consent_state' \
+            'command_bodies_register_deny_first' \
+            'vacuous_uninstall_keeps_fresh_consent_entries' \
+            'standalone_tencent_docs_preset_deny_entry_excludes_the_materialized_dir' \
+            'restore_of_package_missing_entry_registers_no_deny_entry' \
+            'standalone_preset_install_never_folds_package_ids_on_save_or_remove' \
+            'owner_claimed' \
+            'import_rejects_case_variant_connector_ids' \
+            'strips_under_import_lock' \
+            'standalone_components_deny_first' \
+            'market_id_collisions' \
+            'keeps_deny_entries' \
+            'keeps_deny_entry_when' \
+            'stale_store_record_survives' \
+            'leaves_no_deny_entry' \
+            'entries_in_lock' \
+            'install_unknown_ids_write_no_consent_state' \
+            'connector_uninstall_withdraws_materialized_dirs' \
+            'physically_uninstalls_preset_companions' \
+            'install_waits_for_the_per_id' \
+            'restore_waits_for_the_cross_process' \
+            'manifest_load_failure' \
+            'freeze_persist_failures_mirror' \
+            'keeps_mark_on_failure' \
+            'cleanup_defers_consent_strip' \
+            'pre_land_gate_runs_under_the_landing_mark' \
+            'uninstall_waits_for_the_cross_process' \
+            'reconcile_spares_a_live_import' \
+            'quarantine_of_empty_content' \
+            'consent_failure_message' \
+            'cli_bundle_of_skill_folds_case_variant' \
+            'parks_while_a_peer_holds_the_landing_lease' \
+            'cleanup_keeps_consent_rows_when_uninstall_rolls_back' \
+            'uninstall_refuses_hostile_ids' \
+            'install_gates_refuse_companion_claimed' \
+            'restores_the_reimport_backup' \
+            'restored_backup_quarantines' \
+            'holds_the_landing_lease_across' \
+            'holds_the_landing_lease_through' \
+            'crash_stranded_reimport_backup' \
+            'marker_directory_aborts' \
+            'claimed_companion_name' \
             'features::projects::tests::' \
+            'features::sessions::' \
             'run_with_timeout_reaps_and_stays_bounded' \
             'reap_killed_child_' \
             'features::browser::platform::windows::tests::' \
@@ -1429,13 +2337,81 @@ jobs:
             'features::monitor::platform::windows_memory::tests::' \
             'features::monitor::platform::windows_gpu::tests::' \
             'features::remote_control::platform::windows::tests::' \
-            'features::computer_use::platform::windows::tests::'; do
+            'features::computer_use::platform::windows::tests::' \
+            'failed_probe_never_deletes_an_existing_store_windows' \
+            'features::voice_shortcut::platform::tests::' \
+            'app::commands::dependencies::platform::windows::tests::' \
+            'features::codex_acp::platform::windows::tests::' \
+            'install_child_guard_drop_reclaims_tree_and_settled_guards_never_rekill' \
+            'platform::os::windows::' \
+            'windows_attachment_runtime_stays_security_gated'; do
+            index=$((index+1))
+            started=$SECONDS
             "$test_exe" "$filter" --test-threads=1 2>&1 | tee /tmp/windows_regression.log
             grep -qE 'running [1-9][0-9]* tests?' /tmp/windows_regression.log || {
               echo "FAIL: 回归过滤器 '$filter' 匹配 0 个测试(疑似测试改名导致静默空跑)" >&2
               exit 1
             }
+            echo "WINDOWS_RUST_TIMING phase=regression step=test-filter-$index elapsed_seconds=$((SECONDS-started)) status=0"
           done
+          echo "WINDOWS_RUST_TIMING phase=regression step=filter-suite elapsed_seconds=$((SECONDS-total_started)) status=0"
+
+      # Round-42 review: the pinvou-cli workspace's own cfg(windows) unit
+      # tests previously ran on NO CI leg — the Linux cli-test leg cannot
+      # compile them, and the all-targets-check leg above only type-checks
+      # them (Linux never compiles the platform-gated module, so "Linux
+      # already exercises this behavior" does not hold for it). This step
+      # makes the regression pins real: the BatBadBut std-batch
+      # hardening lock (windows_batch_tests), the adapter-gaia Windows
+      # FileIdentity seams (dataset_windows), the orphaned Windows ACL
+      # privacy round-trip in the same crate (round-43 review), and —
+      # round-44 review — the benchmark-core DPAPI fail-closed and ACL-parse
+      # pins, which ran on no leg either. Zero-match guards keep a rename
+      # from becoming a silent pass (same rule as the filter suite above);
+      # the run stays filtered rather than running the whole CLI lib suite
+      # because those tests have never executed on Windows and onboarding
+      # them all belongs to a dedicated change.
+      #
+      # Round-45 review residual: three adapter-gaia tests carry INNER
+      # `#[cfg(windows)]` branches (dataset_contract.rs symlink/reparse
+      # rejection, contract_tests.rs submission symlink block) that execute
+      # on no leg — this leg runs the app lib exe only, and the
+      # dataset_contract integration binary runs only on Linux, where the
+      # Windows branches compile out. Running that binary here belongs to
+      # the same dedicated Windows-execution change as the CLI suite
+      # onboarding above.
+      - name: pinvou-cli Windows-gated unit tests
+        if: ${{ matrix.phase == 'regression' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          started=$SECONDS
+          run_filtered() {
+            log="/tmp/pinvou_cli_windows_tests.log"
+            cargo "$@" 2>&1 | tee "$log"
+            grep -qE 'running [1-9][0-9]* tests?' "$log" || {
+              echo "FAIL: filter '$*' matched 0 tests (a renamed test must not become a silent pass)" >&2
+              exit 1
+            }
+            grep -q "^test result: ok" "$log" || {
+              echo "FAIL: filter '$*' had failing tests" >&2
+              exit 1
+            }
+          }
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p pinvou-cli --lib --locked windows_batch_tests
+          # Round-46 review: the rebind nesting gate's case-fold half moved
+          # out of an inner cfg(windows) block (which executed on no leg)
+          # into this standalone test; the filter keeps the rename guard
+          # over it.
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p pinvou-cli --lib --locked rebind_nesting_rejection_folds_case_where_the_os_folds
+          # Round-53 review: the rebind no-op fold's Windows alias half
+          # (case + both trailing separator spellings) executes only here.
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p pinvou-cli --lib --locked rebind_noop_fold_still_collapses_windows_alias_spellings
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p adapter-gaia --features test-support --lib --locked dataset_windows
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p adapter-gaia --features test-support --lib --locked fetch_windows_acl
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p benchmark-core --lib --locked private_prediction::tests::windows_
+          run_filtered test --manifest-path pinvou-cli/Cargo.toml -p benchmark-core --lib --locked windows_private_acl::tests::
+          echo "WINDOWS_RUST_TIMING phase=regression step=cli-windows-tests elapsed_seconds=$((SECONDS-started)) status=0"
 
   macos-rust-check:
     name: macos-rust-check
@@ -1450,9 +2426,32 @@ jobs:
     # filters; the Linux leg runs Linux tests), leaving macOS runtime behavior
     # author-machine-only. The Merge Queue does not repeat this leg; the Linux
     # rust-test verifies the combined tree; check does not link, so no
-    # signing/packaging/frontend artifacts are needed (same as windows-rust-test: verified
-    # empirically on macOS in 2026-08 that cargo check --all-targets does not depend on
-    # node_modules, hence no node/npm install).
+    # signing/packaging/frontend artifacts are needed on PR legs (verified
+    # empirically on macOS in 2026-08 that cargo check --all-targets does not
+    # depend on node_modules).
+    #
+    # 2026-10-02: the standalone mac-build.yml workflow was folded into this
+    # job as push-only steps. mac-build had been cycling dead for its entire
+    # existence pattern: quota evictions kept its cache cold, the cold build
+    # exceeded its own 50-minute timeout (142/142 runs cancelled in 30d,
+    # zero green), and rust-cache's default save-on-success-only meant a
+    # failed run never warmed the next one. Folding removes the second
+    # concurrency group (mac-build's group covered every main push and its
+    # pending-slot replacement cancelled queued runs under push bursts), keeps
+    # one cache namespace, and puts the native regression under the same
+    # path-independent cumulative main-push contract as the other legs. The
+    # folded push-only legs are: full `cargo test --lib` (native arm64 —
+    # supersedes mac-build's check+test core), the release-fast compile smoke,
+    # the bundle_chain-gated universal bundle smoke, and the mac verify
+    # script. PR legs are unchanged (check + computer_use only), so PR wall
+    # time does not regress. 2026-10-15: the release-fast smoke and the
+    # release-profile artifacts were re-scoped (the smoke runs only on
+    # bundle_chain/rust_full/cli_rust/knowledge_rust pushes; the release
+    # target dirs are pruned from the cache save) after this job's push legs became the
+    # merge-throughput bottleneck — push p90 sat at 99% of the 180-minute
+    # cap with three timeout kills in 13 days, and the shared namespace
+    # (3.1GB) was 30% of the whole cache quota. See the gated step and the
+    # prune step for the respective contracts.
     if: >-
       ${{
         !cancelled() &&
@@ -1473,10 +2472,24 @@ jobs:
         )
       }}
     runs-on: macos-15
-    # A cold check build is slow (macOS runners slower still); same cap as windows-rust-test
-    # (180: the 90-minute cap was once killed at the link phase on the Windows leg, see
-    # that job), so a hang does not burn runner minutes for long.
-    timeout-minutes: 180
+    # A cold check build is slow (macOS runners slower still); same rationale
+    # as windows-rust-test's 240 (its 90-minute cap was once killed at the
+    # link phase, see that job): a hang does not burn runner minutes
+    # indefinitely. Since 2026-10-15 the release-fast smoke only runs on
+    # bundle_chain/rust_full/cli_rust/knowledge_rust pushes (see that
+    # step), so non-Rust
+    # merges run check + full lib tests only and stay far below the cap;
+    # the cap absorbs the warm p90 of the measured 180-cap window (178.3),
+    # the three observed cap kills (181.0/183.4/183.7 minutes, censored at
+    # the cap — true durations at least that long), the shared-key
+    # rotation's one fully-cold replay of the folded sequence, and the
+    # cold-ish release-fast compile on triggered pushes now that its
+    # artifacts are pruned from
+    # the cache save (see the prune step below). A bust is not a death
+    # spiral — cache-on-failure
+    # below saves the partial target state and the next push converges
+    # (mac-build's 50m cap had no such path: save-on-success-only).
+    timeout-minutes: 240
     env:
       # Same as mac-build: inject the sh stack wrapper per platform (the rustc/LLVM stack
       # overflow from codewhale-tui's O2 build has actually been triggered on macOS, see
@@ -1484,6 +2497,47 @@ jobs:
       # Must use the ${{ github.workspace }} absolute path so Cargo does not double-join
       # the per-process cwd when resolving it.
       RUSTC_WRAPPER: ${{ github.workspace }}/pinvou3-app/src-tauri/scripts/rustc-stack-wrapper
+      # Same as mac-build / release-packages: pin the declared minimum so the
+      # folded push legs compile against the same deployment target the
+      # release artifacts do.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Link-memory parity with the linux/windows test legs (they set the same
+      # pair): drop DWARF so objects and the test binary shrink — panic
+      # file:line still comes from Location rodata, not debuginfo.
+      #
+      # Dev thin LTO + the probed ld64.lld (see the probe step below),
+      # landed by #646 after measured runs: every lld sample beat the
+      # Apple-ld reference on this leg (point estimate 10-17 min off the
+      # heaviest step). Previously thin LTO was deliberately not mirrored
+      # here: with thin LTO the final crate's rustc consumes the
+      # dependency bitcode (cargo compiles deps with -C linker-plugin-lto)
+      # and runs the ThinLTO backends in its own process, and there is no
+      # cap knob — an uncapped in-process pass on a 7 GB runner. The cap
+      # lives in the link flags: the outer linker never sees bitcode on
+      # any platform (rustc hands it only post-LTO objects, see the
+      # Cargo.toml lto note), so lld only swaps the object-link step to
+      # rust-lld's Mach-O port (ld64.lld), which links those objects
+      # faster than Apple ld; --threads=1 caps lld's own internal
+      # threading (lld uses all hardware threads by default) while
+      # --thinlto-jobs=1 stays flag parity with the linux leg but caps
+      # nothing here. Should a follow-up move the backends into lld via
+      # -C linker-plugin-lto on the final crate, the consumer would be this
+      # same bundled rust-lld (LLVM build identical to rustc's, resolved
+      # from the rustc sysroot, never from PATH), so producer and consumer
+      # cannot skew. ld64.lld ad-hoc signs arm64 outputs by default, so the
+      # linked test binary executes on the runner.
+      #
+      # Deliberately scoped, not job-level: the linker env (dev thin LTO
+      # + the probe's ld64.lld RUSTFLAGS) is applied per step to the three
+      # dev-profile test legs below (all-targets check, computer_use tests,
+      # full lib tests) — the compile + test-binary link + execution shape
+      # validated on #646. This job folds push-only release legs (the
+      # release-fast compile smoke and the bundle_chain-gated universal
+      # bundle smoke) that ship artifacts: they keep the platform-default
+      # Apple ld, the linker this repo has always used for the
+      # framework-heavy bundling path; moving them to lld would be a
+      # separate change with its own validation.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -1496,17 +2550,103 @@ jobs:
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # Same as rust-test/windows-rust-test: set the toolchain pinned by
-      # src-tauri/rust-toolchain.toml as default, so cargo invoked from the repo root via
-      # --manifest-path uses the same pinned version as locally (the file is the single
-      # source of truth; the version number is not re-hardcoded in the workflow).
-      - name: Align rust-toolchain.toml pinned toolchain
+      # Same as rust-test/windows-rust-test: set the toolchain resolved by
+      # src-tauri/rust-toolchain.toml as default (currently floating stable), so
+      # cargo invoked from the repo root via --manifest-path uses the same rustc
+      # as locally (the file is the single source of truth; the version number is
+      # not re-hardcoded in the workflow).
+      - name: Align rust-toolchain.toml toolchain
         working-directory: pinvou3-app/src-tauri
         run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
 
+      # Same dev-profile memory guard as rust-test/windows-rust-test: with
+      # [profile.dev.package."*"] opt-level = 2, codewhale-tui's LLVM IR makes
+      # the dev thin-LTO compile of the final crate the heaviest single rustc
+      # invocation of this job's test-link legs (cargo check does no
+      # codegen), and this runner has under half the RAM of the 16 GB
+      # machine where that recipe already OOM'd (14.2 GB Max RSS peaks,
+      # see rust-test's Cargo cache comment; this runner is 7 GB with no
+      # swap-expansion step). Warm-cache runs were validated without it on
+      # #646 — this guards the cold runs (toolchain rollover, cache
+      # eviction). Package-level profile overrides can only live in a cargo
+      # config (no env equivalent); writing CARGO_HOME/config.toml keeps the
+      # repo Cargo.toml untouched, so local dev and release artifacts are
+      # unaffected. Profile-scoped: the push-only release-fast/bundle legs
+      # build release profiles and ignore [profile.dev.*].
+      - name: dev-profile memory guard (codewhale-tui O0, this job only)
+        run: |
+          config="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          cat >> "$config" <<'EOF'
+
+          [profile.dev.package.codewhale-tui]
+          opt-level = 0
+          EOF
+          echo "appended codewhale-tui dev O0 override to $config"
+          tail -n 4 "$config"
+
+      # [lld linker] Probe which stable rustc flag selects the bundled
+      # ld64.lld for this apple-darwin toolchain, then emit the winning
+      # flags as a step output. Tier order mirrors #642's Windows probe:
+      # -C linker-features=+lld is unstable on every stable target (1.90.0
+      # stabilized only the x86_64-linux -lld opt-out), so tier 1
+      # hard-errors in seconds on stable and the explicit linker+flavor
+      # pair is the expected winner; tier 1 stays so a future +lld
+      # stabilization is picked up automatically. The third tier drops the
+      # thinlto/threads link-args if the toolchain rejects them (uncapped
+      # lld threading is a degradation, not a failure).
+      # No -syslibroot is passed: rustc emits it itself for the ld64.lld
+      # flavor (the first probe revision injected it by hand into the caps
+      # array and broke argv - the SDK path leaked through as an input file,
+      # which both cap-bearing tiers misreported as "caps rejected" until the
+      # 2026-10-02 rerun with the fixed probe won tier 2 outright; a control
+      # compile with a bogus -- flag is hard-rejected by ld64.lld, so a tier
+      # that reaches the link stage genuinely accepted the caps).
+      # Each rejected tier prints its stderr so a fallback is always
+      # explainable from the step log alone. An unsupported flag fails the
+      # probe in seconds instead of surfacing hours into the cold build.
+      # The output is consumed only by the dev-profile test legs below via
+      # their step-level env — deliberately a step output, not GITHUB_ENV:
+      # a job-wide export would silently put the probed linker under
+      # every later step, including the push-only release legs, which keep
+      # default Apple ld (see the job env comment).
+      - name: Probe and export the macOS lld link flags
+        id: mac_lld_probe
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          echo 'fn main() {}' > "$probe/probe.rs"
+          caps=(-C link-arg=--thinlto-jobs=1 -C link-arg=--threads=1)
+          if rustc -C linker-features=+lld "${caps[@]}" \
+              -o "$probe/probe" "$probe/probe.rs" 2>"$probe/a.err"; then
+            flags="-C linker-features=+lld ${caps[*]}"
+          else
+            echo "probe: tier 1 (-C linker-features=+lld) rejected:" >&2
+            sed 's/^/  /' "$probe/a.err" >&2
+            if rustc -C linker=rust-lld -C linker-flavor=ld64.lld "${caps[@]}" \
+                -o "$probe/probe" "$probe/probe.rs" 2>"$probe/b.err"; then
+              flags="-C linker=rust-lld -C linker-flavor=ld64.lld ${caps[*]}"
+            else
+              echo "probe: tier 2 (rust-lld ld64.lld + thinlto/threads caps) rejected:" >&2
+              sed 's/^/  /' "$probe/b.err" >&2
+              if rustc -C linker=rust-lld -C linker-flavor=ld64.lld \
+                  -o "$probe/probe" "$probe/probe.rs" 2>"$probe/c.err"; then
+                flags="-C linker=rust-lld -C linker-flavor=ld64.lld"
+                echo "::warning::toolchain rejected thinlto/threads caps; linking uncapped"
+              else
+                echo "probe: tier 3 (rust-lld ld64.lld, uncapped) rejected:" >&2
+                sed 's/^/  /' "$probe/c.err" >&2
+                echo "FAIL: this toolchain has no stable way to select ld64.lld" >&2
+                exit 1
+              fi
+            fi
+          fi
+          echo "probed RUSTFLAGS=$flags"
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+
       # bge-m3 is a gitignored large asset (559MB); a clean CI checkout does not have it.
-      # Same as mac-build and the Linux rust-test: create empty placeholder files to pass
-      # tauri-build's resource validation.
+      # Create empty placeholder files to pass tauri-build's resource validation
+      # on this leg (the Linux legs pass without the placeholder; the macOS
+      # build shape is the one that requires it).
       - name: bge-m3 placeholder (satisfies tauri-build resource check)
         run: |
           d=pinvou3-app/src-tauri/resources/bge-m3
@@ -1520,13 +2660,37 @@ jobs:
         with:
           workspaces: pinvou3-app/src-tauri
           # Separate key: macOS artifacts are not interchangeable with Linux/Windows; do not
-          # share with the sibling legs.
-          shared-key: macos-rust-check
+          # share with the sibling legs. The -v2 suffix (2026-10-15) is a
+          # one-time rotation: rust-cache skips the post-job save entirely
+          # on an exact primary-key hit, so pruning the release dirs out of
+          # the save (see the prune step below) can never land while the
+          # pre-rotation fat entry still full-matches — only a key change
+          # lets the pruned generation replace it. Cost: one cold post-merge
+          # push (within the 240 cap); PR legs warm up again once that first
+          # push lands. The prune is `if: always()`, so even a run cancelled
+          # at the cap prunes before the cache-on-failure post-save — the
+          # snapshot
+          # that save takes is already pruned. The cache janitor's A3 rule
+          # insures the residual window where a save lands without the
+          # prune having run (runner forced down mid-prune), which
+          # exact-hit would otherwise pin until the next natural key
+          # rotation.
+          shared-key: macos-rust-check-v2
           # Save only on main (the sole source of warm cache); the PR side is read-only and
           # does not eat the 10GB quota.
+          # cache-on-failure: a failed main push must still warm the cache —
+          # mac-build's old namespace died exactly this way (evicted once,
+          # then save-on-success-only kept it cold until every run timed out).
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: macOS Rust all-targets check
+        # [lld linker] Scoped to the dev-profile test legs; see the job
+        # env comment for why the push-only release legs stay on default
+        # Apple ld linking.
+        env:
+          CARGO_PROFILE_DEV_LTO: "thin"
+          RUSTFLAGS: ${{ steps.mac_lld_probe.outputs.flags }}
         run: >-
           cargo check --manifest-path pinvou3-app/src-tauri/Cargo.toml
           --all-targets --features dev-tools --locked
@@ -1534,7 +2698,17 @@ jobs:
       # Round-17: execute the computer_use unit tests on this leg — macOS-only
       # tests (macos.rs, screen_capture_kit.rs) ran on no CI leg before. The
       # 0-match guard keeps a test rename from silently skipping the suite.
+      # push(main) skips this filtered run: the folded full lib-test leg below
+      # executes the same tests (plus the rest of the suite) on the same
+      # artifacts.
       - name: macOS computer_use unit tests
+        if: ${{ github.event_name != 'push' }}
+        env:
+          # [lld linker] Same scoped pair as the all-targets check above;
+          # identical flags keep the target/debug artifacts incrementally
+          # reusable between the test legs.
+          CARGO_PROFILE_DEV_LTO: "thin"
+          RUSTFLAGS: ${{ steps.mac_lld_probe.outputs.flags }}
         run: |
           set -euo pipefail
           cd pinvou3-app/src-tauri
@@ -1543,6 +2717,204 @@ jobs:
             echo "FAIL: the computer_use filter matched 0 tests (silent no-op guard)" >&2
             exit 1
           }
+
+      # ── Push(main)-only folded legs below (the core coverage of the former
+      # mac-build.yml) ──────
+      # Full native arm64 lib regression (without --target, the host triple on
+      # an arm64 runner is aarch64-apple-darwin). Shares target/debug/ with the
+      # check above, but check builds dev-tools rmeta while this step codegens
+      # benchmark-hooks test code, so the compile graph rebuilds — cross-step
+      # reuse comes mainly from the restored cache. Unlike rust-test's push
+      # leg, this executes the full suite: macOS native behavior has no other
+      # execution leg, so main is its only regression window (the MQ does not
+      # repeat this job, and the MQ already covers the combined tree on
+      # Linux). e2e dependencies (relay/Chrome) are not installed, so real e2e
+      # auto-skips (same silent-skip semantics as mac-build;
+      # PINVOU_REQUIRE_REMOTE_E2E is not set). Carries the same 0-match guard
+      # as the PR leg's computer_use filtered run: a full lib suite that
+      # silently runs zero tests (e.g. a cfg/attr accident) must fail.
+      - name: macOS full lib tests (native regression, push only)
+        if: ${{ github.event_name == 'push' }}
+        env:
+          # [lld linker] Same scoped pair as the all-targets check above;
+          # this dev-profile leg shares its build shape (and target/debug
+          # artifacts) with the validated PR legs.
+          CARGO_PROFILE_DEV_LTO: "thin"
+          RUSTFLAGS: ${{ steps.mac_lld_probe.outputs.flags }}
+        run: |
+          set -euo pipefail
+          cd pinvou3-app/src-tauri
+          cargo test --lib --features benchmark-hooks --locked -- --test-threads=1 2>&1 | tee /tmp/macos_lib_tests.log
+          grep -qE 'running [1-9][0-9]* tests?' /tmp/macos_lib_tests.log || {
+            echo "FAIL: the full lib suite ran 0 tests (silent no-op guard)" >&2
+            exit 1
+          }
+
+      # The universal bundle smoke needs both the arm64 and x86_64 targets,
+      # installed into the toolchain resolved from rust-toolchain.toml (the
+      # alignment step above has already set it as default). Needed only on
+      # push when the bundle chain changed (PR legs have no release-fast or
+      # bundle steps), same condition as the node/npm steps below and the
+      # bundle smoke itself.
+      - name: Install both targets (universal bundle smoke, push only)
+        if: ${{ github.event_name == 'push' && needs.changes.outputs.bundle_chain == 'true' }}
+        working-directory: pinvou3-app/src-tauri
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # Frontend deps serve only the push-only universal bundle smoke
+      # (build.js does require.resolve("@tauri-apps/cli/tauri.js") and
+      # beforeBuildCommand runs vite build — both need node_modules). The
+      # PR legs (check + computer_use) are verified not to need
+      # node_modules, so they skip the install to save time. Same two
+      # steps as the old mac-build.yml.
+      - name: Node.js (universal bundle smoke, push only)
+        if: ${{ github.event_name == 'push' && needs.changes.outputs.bundle_chain == 'true' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: pinvou3-app/package-lock.json
+
+      - name: Install frontend deps (universal bundle smoke, push only)
+        if: ${{ github.event_name == 'push' && needs.changes.outputs.bundle_chain == 'true' }}
+        working-directory: pinvou3-app
+        run: npm ci --prefer-offline --no-audit
+
+      # The macOS 27+ strip=none workaround (folded in from mac-build.yml) is
+      # removed: every stable toolchain since 1.98 (2026-09) contains the
+      # Mach-O __LINKEDIT 8-byte alignment fix (rust#157750, LLVM backport
+      # #158410) — rust-toolchain.toml floats stable and can never roll back
+      # below it — so stripping in release/release-fast is safe again on
+      # every macOS version. release-fast also pins strip="none" explicitly
+      # in Cargo.toml now, making the injection redundant even if it
+      # returned. See release-packages.yml and
+      # docs/binary-size-optimization.md.
+
+      # The compile smoke uses release-fast (the lightweight profile defined
+      # in Cargo.toml specifically for CI: lto=false, codegen-units=16,
+      # inherits="release"): release now carries lto="thin" + codegen-units=1,
+      # and a cold whole-graph thin-LTO compile can easily take hours on the
+      # 3-core M1; release-fast only has to prove the release-path code
+      # compiles. The bundle smoke uses the same profile — same profile, same
+      # target dir, so the bundle's aarch64 compile leg reuses this step's
+      # artifacts directly instead of recompiling the whole graph under two
+      # profiles.
+      #
+      # 2026-10-15 gating: this smoke used to run on EVERY main push and, at
+      # 44-66 minutes, made this job the merge-throughput bottleneck (push
+      # p90 sat at 99% of the old 180-minute cap with three timeout kills in
+      # 13 days; push legs serialize per main). It now runs only when the
+      # push actually touched the Rust or packaging surface:
+      #   - bundle_chain: REQUIRED — the bundle smoke below reuses this
+      #     step's aarch64 release-fast artifacts;
+      #   - rust_full / cli_rust: the same Rust buckets that run this job's
+      #     PR legs (the label-gated rust_code PR leg can also run the job,
+      #     but rust_code-only paths outside the buckets are not src-tauri
+      #     compile inputs);
+      #   - knowledge_rust: src-tauri path-depends on pinvou-knowledge
+      #     (Cargo.toml), so a knowledge-only merge can break the
+      #     release-path compile even though it never runs this job's PR
+      #     legs.
+      # Together these make "every merge that could break the release-path
+      # compile still smoke-tests it" exact per push, with three known,
+      # separately-covered gaps: compile inputs outside all four buckets
+      # (tauri capabilities, the rustc-stack-wrapper, the include_str!'d
+      # JS asset — rebindErrors.js, embedded by src-tauri from the
+      # frontend tree) break the dev-profile compile too and are caught
+      # by this job's push-unconditional check/lib-test legs — NOT by
+      # bundle_chain or release builds; and a
+      # pending Rust push replaced by a docs-only push (push concurrency
+      # replaces pending runs) never runs its own smoke — the next Rust
+      # push re-runs it. Non-Rust merges skip it (their release-path
+      # breakage is still caught by bundle_chain pushes and by the full
+      # dmg/nsis/deb builds that every VERSION bump runs in
+      # release-packages).
+      - name: Cargo build (release-fast smoke, push only)
+        if: >-
+          ${{
+            github.event_name == 'push' &&
+            (
+              needs.changes.outputs.bundle_chain == 'true' ||
+              needs.changes.outputs.rust_full == 'true' ||
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.knowledge_rust == 'true'
+            )
+          }}
+        working-directory: pinvou3-app/src-tauri
+        run: cargo build --profile release-fast --target aarch64-apple-darwin --lib
+
+      # tauri bundle smoke: exercises the real dmg/app packaging chain
+      # (Info.plist/entitlements/resource bundling). Runs only on
+      # packaging-chain (bundle_chain) changes (the dominant cost of the
+      # folded legs; before a packaging-chain PR merges, pr-check's
+      # release-contract-test runs the lightweight release contract, and a
+      # VERSION bump gets full dmg builds from release-packages). A universal
+      # packaging failure fails this job, so main cannot show green without
+      # publishable arm64 + x86_64 artifacts. If the changes job itself
+      # fails, its outputs are empty and this step skips along with them
+      # (that push is already visibly red via changes; the next healthy push
+      # re-derives bundle_chain).
+      # universal-apple-darwin is a Tauri-specific target (internally it runs
+      # cargo twice, aarch64 + x86_64, then lipos the results) and is not a
+      # valid rustc target triple; cargo check/test/build therefore stay on
+      # the host (aarch64), and only the tauri build here uses universal,
+      # producing dmg/app binaries that run on both Intel and Apple Silicon.
+      # `-- --profile release-fast`: the tauri v2 CLI's build has no
+      # first-class --profile option; a custom profile is forwarded to cargo
+      # as trailing runner args after `--` (the CLI uses that to locate the
+      # target/<triple>/release-fast/ artifacts). Same profile as the smoke
+      # above: the aarch64 leg reuses its artifacts, and the x86_64 leg is
+      # the only new compilation.
+      - name: Tauri bundle smoke (verify dmg/app packaging, bundle-chain changes only)
+        if: ${{ github.event_name == 'push' && needs.changes.outputs.bundle_chain == 'true' }}
+        working-directory: pinvou3-app
+        run: node scripts/tauri/build.js build --target universal-apple-darwin -- --profile release-fast
+
+      # Verify script: lightweight probes (brew/connector CLIs) + core checks
+      # (plist/usage-key/bundle targets). A core-check failure exits 1 and
+      # blocks this job. Push-only (the PR-side plist/packaging contract is
+      # covered on Linux by release-contract-test, keeping the per-second
+      # macOS runner cost for the actual release path). if: always(): verify
+      # still runs when an upstream folded leg failed, so the core checks
+      # cannot be skipped (verify runs --skip-test internally; it has no
+      # ordering dependency on the steps above, but its universal-bundle
+      # checks read the bundle smoke's artifact when that exists — the
+      # prune below must stay after this step for exactly that reason).
+      - name: Verify script (plist/usage-key/bundle targets checks, push only)
+        if: ${{ always() && github.event_name == 'push' }}
+        run: ./scripts/run-mac-verify.sh --skip-test
+
+      # The cache namespace above (restored by every PR leg) must carry
+      # dev-profile check/test artifacts only. The release-fast/universal
+      # target dirs are two full release-profile dependency graphs — the
+      # bulk of this namespace's measured 3.1GB standing footprint (30% of
+      # the whole 10GB repo quota, the single largest consumer) — and dead
+      # weight for every PR leg, which never runs release-profile steps.
+      # Prune them before rust-cache's post-job save (cache-on-failure
+      # saves on failed runs too, so the prune runs under always()) and
+      # after every consumer of those artifacts — including the verify
+      # script above, whose universal-bundle checks hard-fail on
+      # plist/ATS/locale/lipo defects only when the bundle smoke's artifact
+      # exists and are warn-only otherwise; an earlier prune would silently
+      # disable them on every bundle_chain push. target/release-fast is the
+      # host-side dir cargo pairs with every --target build (build scripts
+      # and proc macros); rust-cache retains external-package units there,
+      # so it needs pruning with the rest. Cost: the next triggered
+      # release-fast smoke recompiles cold instead of restoring warm
+      # artifacts — accepted, the smoke exists to prove the release path
+      # compiles, not to be fast. This step is `if: always()`: even a run
+      # cancelled at the timeout cap prunes before rust-cache's post-save,
+      # so the snapshot that save takes is already pruned. The cache
+      # janitor's A3 size-threshold rule insures the residual window where
+      # a save lands without this step having run (runner forced down
+      # mid-prune), which an exact-key hit would otherwise pin until the
+      # next natural key rotation.
+      - name: Prune release artifacts before the cache save (push only)
+        if: ${{ always() && github.event_name == 'push' }}
+        working-directory: pinvou3-app/src-tauri
+        run: >-
+          rm -rf target/release-fast target/aarch64-apple-darwin/release-fast
+          target/x86_64-apple-darwin/release-fast target/universal-apple-darwin
 
   windows-codex-runtime-test:
     name: windows-codex-runtime-test
@@ -1559,26 +2931,41 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: pinvou3-app/package-lock.json
+          # Same two-lockfile key as frontend-test/rust-test: one shared npm
+          # cache namespace instead of per-job keys.
+          cache-dependency-path: |
+            pinvou3-app/package-lock.json
+            remote-control-relay/package-lock.json
 
       # Ubuntu npm tests skip these suites outside win32. They use only Node
       # built-ins and fake MCP/host fixtures to exercise the real wrapper
       # subprocess, protocol, heartbeat, tombstone, and commit-unknown paths.
+      # One command per step: a multi-command pwsh run block only reports the
+      # last command's exit code, so an earlier failure would be masked.
       - name: Windows browser wrapper lifecycle regression
         env:
           PINVOU3_TEST_BROWSER_NO_HOST: "1"
-        run: |
-          node --test pinvou3-app/tests/browser_wrapper_windows_lifecycle.test.mjs
-          node pinvou3-app/tests/browser_wrapper_lazy.test.mjs
+        run: node --test pinvou3-app/tests/browser_wrapper_windows_lifecycle.test.mjs
+
+      - name: Windows browser wrapper lazy regression
+        env:
+          PINVOU3_TEST_BROWSER_NO_HOST: "1"
+        run: node pinvou3-app/tests/browser_wrapper_lazy.test.mjs
 
       - name: 安装构建依赖
         run: npm --prefix pinvou3-app ci --prefer-offline --no-audit
 
-      - name: Windows Codex Runtime 原生打包冒烟
-        run: |
-          npm --prefix pinvou3-app run test:windows-runtime-manifest
-          npm --prefix pinvou3-app run test:windows-runtime
-          npm --prefix pinvou3-app run test:codex-acp-windows-runtime
+      # One npm invocation per step: a multi-command pwsh run block only
+      # reports the last command's exit code, so a harness that dies before
+      # its assertions would be masked by the next command's success.
+      - name: Windows runtime manifest lifecycle contract
+        run: npm --prefix pinvou3-app run test:windows-runtime-manifest
+
+      - name: Windows runtime packaging contract
+        run: npm --prefix pinvou3-app run test:windows-runtime
+
+      - name: Windows ACP bridge runtime smoke
+        run: npm --prefix pinvou3-app run test:codex-acp-windows-runtime
 
   macos-codex-runtime-test:
     name: macos-codex-runtime-test
@@ -1601,6 +2988,393 @@ jobs:
       - name: macOS Codex 与 Claude Runtime 原生打包冒烟
         run: npm --prefix pinvou3-app run test:codex-acp-macos-runtime
 
+  windows-rustup-repair-test:
+    name: windows-rustup-repair-test
+    needs: changes
+    if: ${{ !cancelled() && github.event.action != 'closed' && needs.changes.outputs.windows_rustup_repair == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: windows-latest
+    # The smoke keeps the engine's production 1500 s repair budget; a
+    # pathological all-sources-stall run must clip after the engine's own
+    # diagnostics, not before them, so the cap needs headroom over checkout +
+    # setup + the toolchain copy, that budget, and its documented overshoot:
+    # after the final budget check the engine can still burn one bounded
+    # install attempt and one bounded uninstall reset (~650 s each in the
+    # smoke's configuration).
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install the configured Rust toolchain
+        shell: pwsh
+        run: |
+          # No --force: the runner's toolchain home is pristine, and forced
+          # reinstalls are the repair engine's own job under test below.
+          $config = Get-Content pinvou3-app/src-tauri/rust-toolchain.toml -Raw
+          $match = [regex]::Match($config, '(?m)^\s*channel\s*=\s*"([^"]+)"')
+          if (-not $match.Success) {
+            throw "Unable to read the Rust toolchain channel."
+          }
+          rustup toolchain install $match.Groups[1].Value `
+            --profile minimal --component clippy --component rustfmt --no-self-update
+          if ($LASTEXITCODE -ne 0) {
+            throw "rustup toolchain install failed with exit code $LASTEXITCODE."
+          }
+
+      # scripts/ci/** is in no other job filter, so this job is the only gate
+      # triggered by ensure-rust-toolchain.ps1 edits; frontend-test (Linux)
+      # also auto-discovers the contract test, but only this job runs it on
+      # Windows. Node built-ins only; no ci.
+      - name: Rust toolchain contract test
+        run: node --test pinvou3-app/tests/windows_rust_toolchain_contract.test.js
+
+      # The smoke copies the account toolchain into a temporary RUSTUP_HOME,
+      # deletes cargo.exe/rustc.exe there, and requires the repair script to
+      # fail over from an unreachable source to the next mirror in the chain.
+      - name: Isolated toolchain repair and download-source fallback
+        run: npm --prefix pinvou3-app run test:windows-rustup-repair
+  # pinvou-cli contains #[cfg(target_os = "macos")] code (support/supervise.rs,
+  # voice.rs's non-linux/non-windows arms, ...) that compiles nowhere else in CI:
+  # cli-test is ubuntu-only and the macOS
+  # runner above only smokes the Node ACP bridge. This compile-only leg mirrors
+  # the windows-rust-test "pinvou-cli Windows compile check" step for exactly
+  # that risk class. No Tauri system packages are needed on macOS (system frameworks
+  # are preinstalled; same minimum as the Windows compile check), and no zram setup
+  # is required (macOS runners are out of the gate-policy memory scope).
+  # Cache policy: this leg gets the same restorable treatment as
+  # macos-rust-check — the save/restore fallback, separate-key, cached-dir
+  # and rmeta-only rationale are documented once at the Cargo cache step below.
+  # Still compile-only (no test execution): cli-test already runs the CLI
+  # contract suite on Linux, and executing it here too would double the macOS
+  # runner minutes for a second copy of behavior Linux already exercises —
+  # sound while no #[cfg(all(test, target_os = "macos"))] module exists (the
+  # round-42 audit found none); the Windows leg now RUNS its platform-gated
+  # pinvou-cli tests for exactly the reason this rationale does not extend
+  # there: a platform-gated test compiles on no other leg at all.
+  # Triggers: ready cli_rust/rust_full PRs, the matching Merge Queue combined tree
+  # (a PR that is green alone can still combine into a macOS-only compile break,
+  # and Linux cannot type-check #[cfg(target_os = "macos")] code, so "Linux
+  # validates the combined tree" does not cover this risk class), and
+  # unconditionally on main push: main is the cumulative compile verification and
+  # must not depend on a single push's paths-filter (same policy as
+  # rust-test/windows-rust-test, guarding the concurrency pending-replacement
+  # blind spot).
+  macos-cli-check:
+    name: macos-cli-check
+    needs: changes
+    if: >-
+      ${{
+        !cancelled() &&
+        github.event.action != 'closed' &&
+        (
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'merge_group' &&
+            (
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.rust_full == 'true'
+            )
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.draft == false &&
+            (
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.rust_full == 'true'
+            )
+          )
+        )
+      }}
+    runs-on: macos-15
+    # A cold run compiles the whole workspace (the app crate path-dep included)
+    # and 60 minutes once left little headroom on 3-vCPU runners, where the
+    # Windows analogue shares a 240-minute budget. Restored-cache runs are
+    # incremental, but a cache miss (the first main push after this step ships,
+    # or a key/lockfile change) replays the cold compile, so the cap stays a
+    # cold-compile budget rather than being cut to the incremental runtime.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Init CodeWhale submodule
+        run: git submodule update --init --recursive -- CodeWhale
+
+      # Same two-step toolchain as cli-test/windows-rust-test: dtolnay only
+      # bootstraps rustup; the version pinned by src-tauri/rust-toolchain.toml
+      # must become the default so cargo invoked from the repo root with
+      # --manifest-path uses the same toolchain as local development.
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Align the toolchain pinned by rust-toolchain.toml
+        working-directory: pinvou3-app/src-tauri
+        run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
+
+      # Same restorable-cache treatment as macos-rust-check: the entry is
+      # saved only on the main push (PRs and Merge Queue runs restore through
+      # rust-cache's prefix fallback), the key stays separate from the
+      # siblings, and the pinvou-cli workspace target dir is cached like
+      # macos-rust-check caches src-tauri. A check-only target dir carries
+      # rmeta-size artifacts and no linked test binaries, so the link-time
+      # runner deaths behind the cli-test/rust-test cache-targets directive
+      # cannot recur here.
+      # Round-48 review: `cache-on-failure` matches macos-rust-check (its
+      # anti-death-loop rationale: save-on-success-only + eviction left a
+      # failed main push with a cold cache namespace). Without it a failed
+      # main push strands this cache cold, defeating the retention goal.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pinvou-cli
+          shared-key: macos-cli-check
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: pinvou-cli macOS compile check
+        run: >-
+          cargo check --manifest-path pinvou-cli/Cargo.toml
+          --workspace --all-targets --locked
+
+      # dataset_contract is gated behind `required-features = ["test-support"]`
+      # and is silently skipped by the workspace-wide run above; the Linux
+      # cli-test leg executes it, so the macOS compile leg must at least
+      # compile it. `--all-targets` is required: a bare `cargo check -p` builds
+      # lib+bins only, and `required-features` can only filter targets out of
+      # the selected set, never add the test target in.
+      - name: pinvou-cli macOS compile check (adapter-gaia test-support)
+        run: >-
+          cargo check --manifest-path pinvou-cli/Cargo.toml
+          -p adapter-gaia --features test-support --all-targets --locked
+
+  # LoongArch64 交叉编译检查:GitHub 没有 loong64 runner,目标编译只能交叉,
+  # 而发布 job 的完整交叉构建(packaging + ASR/knowledge 交叉产物)太重,
+  # 不能每个 PR 跑——本 leg 用发布 job 同一套钉死工具链
+  # (ci-loongarch64-toolchain.sh,sha256 钉死资产;只有 bfd,无 lld)+
+  # deepin beige glibc-2.38 sysroot 把三个 workspace 对
+  # loongarch64-unknown-linux-gnu 类型检查一遍,让目标专属 cfg/依赖/链接
+  # 约束在 PR 上就红,而不是等下一次 VERSION push 的发布构建才炸。
+  # 与 macos-cli-check 同类:compile-only(check 不链接,不产出安装包)。
+  rust-loongarch64-check:
+    name: rust-loongarch64-check
+    needs: changes
+    if: >-
+      ${{
+        !cancelled() &&
+        github.event.action != 'closed' &&
+        (
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'merge_group' &&
+            (
+              needs.changes.outputs.rust_full == 'true' ||
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.knowledge_rust == 'true'
+            )
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.draft == false &&
+            (
+              needs.changes.outputs.rust_full == 'true' ||
+              needs.changes.outputs.cli_rust == 'true' ||
+              needs.changes.outputs.knowledge_rust == 'true'
+            )
+          )
+        )
+      }}
+    runs-on: ubuntu-22.04
+    # 冷缓存要交叉编译三个 workspace(含 700+ crate 的 src-tauri)加下载
+    # 工具链/sysroot,120 分钟覆盖冷编译与 runner 抖动(同 macos-cli-check
+    # 的"上限=冷编译预算"原则)。
+    timeout-minutes: 120
+    env:
+      # 工具链/sysroot 缓存路径,与 release-packages.yml 的
+      # build-linux-loongarch64 job 逐字一致(键与路径任一漂移,发布 job
+      # 就 restore 不到)。语义注意:ci-loongarch64-toolchain.sh 的 --prefix
+      # 是"接收目录"(树落在 <prefix>/<triple>),而
+      # PINVOU_LOONG64_TOOLCHAIN_PREFIX(ci-build-linux-loongarch64.sh 与
+      # ci-loongarch64-sysroot.sh 的消费约定)指"工具链根"(含 bin/)。
+      PINVOU_LOONG64_CACHE_ROOT: ${{ github.workspace }}/.pinvou-loong64-cache
+      PINVOU_LOONG64_TOOLCHAIN_PREFIX: ${{ github.workspace }}/.pinvou-loong64-cache/cross-tools/loongarch64-unknown-linux-gnu
+      PINVOU_LOONG64_SYSROOT: ${{ github.workspace }}/.pinvou-loong64-cache/sysroot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      # 同 cli-test:冷交叉编译 + 工具链/sysroot 会逼近宿主 ~13 GiB。
+      - name: Prepare Rust disk capacity
+        run: |
+          sudo env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            python3 scripts/ci-rust-disk.py
+
+      # Same policy as the other Linux Rust legs: best-effort extra memory,
+      # non-fatal; only the wrapper structure is enforced by the gate policy.
+      - name: Set up zram and swap
+        # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+
+      - name: Init CodeWhale submodule
+        run: git submodule update --init --recursive -- CodeWhale
+
+      # 宿主侧只需要构建脚本工具(cc/cmake/pkg-config):目标侧的
+      # webkit/gtk/soup/openssl/pipewire 头与库全部来自 glibc 2.38 sysroot
+      # (setup 步骤把 PKG_CONFIG_LIBDIR/SYSROOT_DIR 指向它)。不装 webkit
+      # 主机开发包,不跑 ci-libpipewire-build.sh(beige 已带 libpipewire
+      # 1.2.5,sysroot 头部齐全),lld 不装(钉死交叉工具链只有 bfd)。
+      # libclang: libspa/pipewire 的 bindgen 构建脚本在交叉构建时会给
+      # libclang 传 --target=loongarch64-...,而 LoongArch 要 LLVM >= 16
+      # 才是主 target(jammy 档案里的 libclang 14/15 没有该 target,bindgen
+      # 直接 panic "unknown target triple")。因此钉 apt.llvm.org 的
+      # llvm-toolchain-jammy-18 套件装 libclang-18-dev,并用 LIBCLANG_PATH
+      # 短路 clang-sys 的多目录探测;目标头文件由 BINDGEN_EXTRA_CLANG_ARGS
+      # (sysroot 脚本 print_env 导出)指向 deepin sysroot。此 run 块与
+      # release-packages.yml 的 build-linux-loongarch64 job 在注释剥离后
+      # 逐字一致 (test_release_loongarch64_policy 按剥注释文本钉等价)。
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/apt/keyrings
+          curl --proto '=https' --tlsv1.2 --location --silent --show-error --fail \
+            --retry 3 --retry-delay 2 https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/pinvou-llvm.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/pinvou-llvm.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+            | sudo tee /etc/apt/sources.list.d/pinvou-llvm-18.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake libclang-18-dev file
+          # Reduce footprint at the source: orphan dependencies, apt cache packages, and index lists do not stay on the build disk.
+          sudo apt-get autoremove -y --purge
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          # clang-sys probes several default locations; pin the discovery to
+          # the LoongArch-capable libclang this step just installed.
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+
+      # 工具链/sysroot 缓存:restore 在 setup 之前,save 在 setup 之后拆开写
+      # (actions/cache 没有 rust-cache 的 save-if,用 main-only 条件实现同一
+      # 配额策略:main 写、PR/MQ/发布只读;发布 job 只 restore 这两个键)。
+      # 键把 setup 脚本内容 hash 进去,脚本(钉的 sha256/包清单)一变即换代,
+      # 旧代由 scripts/cache-janitor.sh 规则 E 去重。
+      - name: Restore loong64 cross toolchain cache
+        id: loong64-toolchain-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.pinvou-loong64-cache/cross-tools
+          key: release-linux-loong64-jammy-toolchain-${{ hashFiles('scripts/ci-loongarch64-toolchain.sh') }}
+          restore-keys: |
+            release-linux-loong64-jammy-toolchain-
+
+      - name: Restore loong64 sysroot cache
+        id: loong64-sysroot-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.pinvou-loong64-cache/sysroot
+          key: release-linux-loong64-jammy-sysroot-${{ hashFiles('scripts/ci-loongarch64-sysroot.sh') }}
+          restore-keys: |
+            release-linux-loong64-jammy-sysroot-
+
+      # Same two-step toolchain as cli-test/macos-cli-check: dtolnay only
+      # bootstraps rustup; the floating stable pinned by the three workspaces'
+      # rust-toolchain.toml must become the default so cargo invoked from the
+      # repo root with --manifest-path (and rustup target add below) uses the
+      # same toolchain as local development.
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Align the toolchain pinned by rust-toolchain.toml
+        working-directory: pinvou3-app/src-tauri
+        run: rustup default "$(rustup show active-toolchain | awk '{print $1}')"
+
+      - name: Add the loongarch64 Rust target
+        run: rustup target add loongarch64-unknown-linux-gnu
+
+      # 幂等:restore 命中时脚本自检(marker 含 tag/variant/host/sha)直接
+      # 复用,未命中时下载 + sha256 校验(sha256 钉死在脚本内)。两个脚本把
+      # "export in the CI step"导出块打到 stdout,这里截取后写入 GITHUB_ENV
+      # 供后续 cargo 步骤使用;只取下划线拼写的变量名(GITHUB_ENV 与
+      # cargo/cc-rs/cmake-rs 都认),verbatim-triple 的带横线形式被过滤。
+      - name: Set up the pinned loong64 cross toolchain (sha256-pinned asset)
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/loong64-toolchain.log"
+          bash scripts/ci-loongarch64-toolchain.sh --prefix "$PINVOU_LOONG64_CACHE_ROOT/cross-tools" | tee "$log"
+          sed -n '/export in the CI step/,/^---- notes/p' "$log" \
+            | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' >> "$GITHUB_ENV"
+
+      # sysroot 的 docker 方法需要 loong64 binfmt(本 job 不注册),脚本 auto
+      # 探测失败后自动回退 deepin beige 索引直连方法(逐包 sha256 校验)。
+      - name: Set up the deepin glibc-2.38 loong64 sysroot
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/loong64-sysroot.log"
+          bash scripts/ci-loongarch64-sysroot.sh \
+            --output "$PINVOU_LOONG64_SYSROOT" \
+            --toolchain-prefix "$PINVOU_LOONG64_TOOLCHAIN_PREFIX" | tee "$log"
+          sed -n '/export in the CI step/,/^---- notes/p' "$log" \
+            | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' >> "$GITHUB_ENV"
+
+      # 缓存保存:仅 main push 且 setup 全部成功(success():两个 setup 脚本
+      # 都会先 mkdir 目标目录再下载,setup 失败留下的半空树若被存进 exact
+      # key,后续 restore 会永远命中这份空代;cache-hit 时无需重写同一键)。
+      - name: Save loong64 cross toolchain cache
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.loong64-toolchain-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.pinvou-loong64-cache/cross-tools
+          key: release-linux-loong64-jammy-toolchain-${{ hashFiles('scripts/ci-loongarch64-toolchain.sh') }}
+
+      - name: Save loong64 sysroot cache
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.loong64-sysroot-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.pinvou-loong64-cache/sysroot
+          key: release-linux-loong64-jammy-sysroot-${{ hashFiles('scripts/ci-loongarch64-sysroot.sh') }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 三个 workspace 的交叉产物共享一份缓存(交叉 target 目录都在各自
+          # workspace 的 target 下;工具链/sysroot 在 target 之外,不被吞)。
+          # 独立 shared-key 避免与宿主架构缓存互相污染;main-only 保存,
+          # PR/MQ 走前缀回退,同 cli-test/macos-cli-check。
+          # cache-on-failure 同 macos-cli-check(防死循环理由):只按成功保存
+          # 会让一个挂掉的主干推送把整个 loong64 缓存命名空间冻在冷启动,
+          # 后续每个 PR 都要全额冷交叉。
+          workspaces: |
+            pinvou3-app/src-tauri
+            pinvou-knowledge
+            pinvou-cli
+          shared-key: rust-loongarch64-check
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # --locked:与所有 Rust leg 相同,锁文件即构建输入。check 不链接,
+      # 但 -sys crate 的 build script 会真实交叉编译 C(消费上面导出的
+      # CC_/CARGO_TARGET_*_LINKER/PKG_CONFIG_*/CMAKE_TOOLCHAIN_FILE)。
+      - name: cargo check src-tauri (loongarch64 cross)
+        run: cargo check --manifest-path pinvou3-app/src-tauri/Cargo.toml --target loongarch64-unknown-linux-gnu --locked
+
+      # knowledge 加 --tests:stub 合同测试（embedding::stub_tests）在
+      # loongarch64 目标上也是 cfg 生效路径,编译期钉住它;check 不运行,
+      # 运行由宿主 feature-off 腿覆盖。src-tauri/cli 不加:其 dev-deps 会
+      # 把重型交叉依赖拖进编译却无对应运行环境。
+      - name: cargo check pinvou-knowledge (loongarch64 cross, incl. tests)
+        run: cargo check --manifest-path pinvou-knowledge/Cargo.toml --target loongarch64-unknown-linux-gnu --locked --tests
+
+      - name: cargo check pinvou-cli (loongarch64 cross)
+        run: cargo check --manifest-path pinvou-cli/Cargo.toml --workspace --target loongarch64-unknown-linux-gnu --locked
+
   required-gate:
     name: required-gate
     needs:
@@ -1615,10 +3389,14 @@ jobs:
       - rust-lint
       - rust-test
       - cli-test
+      - cli-lint
       - windows-rust-test
       - macos-rust-check
       - macos-codex-runtime-test
+      - macos-cli-check
+      - rust-loongarch64-check
       - windows-codex-runtime-test
+      - windows-rustup-repair-test
     if: ${{ always() && ((github.event_name == 'pull_request' && github.event.action != 'closed') || github.event_name == 'merge_group') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -1628,7 +3406,7 @@ jobs:
 
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
-        run: timeout --kill-after=15 240 sudo bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
+        run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
 
       - name: 汇总所有适用检查
         env:
@@ -1643,10 +3421,14 @@ jobs:
           RUST_LINT_RESULT: ${{ needs.rust-lint.result }}
           RUST_RESULT: ${{ needs.rust-test.result }}
           CLI_TEST_RESULT: ${{ needs.cli-test.result }}
+          CLI_LINT_RESULT: ${{ needs.cli-lint.result }}
           WINDOWS_RUST_RESULT: ${{ needs.windows-rust-test.result }}
           MACOS_RUST_CHECK_RESULT: ${{ needs.macos-rust-check.result }}
           MACOS_CODEX_RESULT: ${{ needs.macos-codex-runtime-test.result }}
+          MACOS_CLI_RESULT: ${{ needs.macos-cli-check.result }}
+          RUST_LOONGARCH64_CHECK_RESULT: ${{ needs.rust-loongarch64-check.result }}
           WINDOWS_CODEX_RESULT: ${{ needs.windows-codex-runtime-test.result }}
+          WINDOWS_RUSTUP_REPAIR_RESULT: ${{ needs.windows-rustup-repair-test.result }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "merge_group" ]]; then
             # 队列提交由 GitHub 生成，不重复校验人工 commit message；
@@ -1669,10 +3451,14 @@ jobs:
             "rust-lint:$RUST_LINT_RESULT" \
             "rust-test:$RUST_RESULT" \
             "cli-test:$CLI_TEST_RESULT" \
+            "cli-lint:$CLI_LINT_RESULT" \
             "windows-rust-test:$WINDOWS_RUST_RESULT" \
             "macos-rust-check:$MACOS_RUST_CHECK_RESULT" \
             "macos-codex-runtime-test:$MACOS_CODEX_RESULT" \
-            "windows-codex-runtime-test:$WINDOWS_CODEX_RESULT"; do
+            "macos-cli-check:$MACOS_CLI_RESULT" \
+            "rust-loongarch64-check:$RUST_LOONGARCH64_CHECK_RESULT" \
+            "windows-codex-runtime-test:$WINDOWS_CODEX_RESULT" \
+            "windows-rustup-repair-test:$WINDOWS_RUSTUP_REPAIR_RESULT"; do
             name="${item%%:*}"
             result="${item#*:}"
             case "$result" in

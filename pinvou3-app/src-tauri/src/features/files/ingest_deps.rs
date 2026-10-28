@@ -14,7 +14,7 @@ use serde::Serialize;
 
 /// 各 ingest 子模块需要的系统工具探测结果（启动时缓存一次）。
 #[derive(Debug, Clone, Copy, Default, Serialize)]
-pub struct SystemTools {
+pub(super) struct SystemTools {
     pub pandoc: bool,
     pub pdftotext: bool,
     /// LibreOffice headless —— 用来转 .doc / .ppt / .xls 等旧 office 格式。
@@ -34,7 +34,7 @@ pub struct SystemTools {
 static SYSTEM_TOOLS: OnceLock<SystemTools> = OnceLock::new();
 
 /// 启动时（或第一次 ingest 时）检测一次系统工具。
-pub fn system_tools() -> SystemTools {
+pub(super) fn system_tools() -> SystemTools {
     *SYSTEM_TOOLS.get_or_init(|| SystemTools {
         pandoc: crate::platform::os::pandoc_tool_exists(),
         pdftotext: crate::platform::os::pdf_tool_exists("pdftotext"),
@@ -66,7 +66,7 @@ pub struct DependencyCheckItem {
 /// 一键安装进度的实时事件载荷。平台适配器经纯 Rust 回调上报,
 /// 本域层包成此结构后 `app.emit("deps:install_progress", …)`。
 #[derive(Clone, Serialize)]
-pub struct DepInstallProgress {
+pub(super) struct DepInstallProgress {
     pub package: String,
     pub current: usize,
     pub total: usize,
@@ -140,6 +140,28 @@ pub fn check_dependencies() -> Vec<DependencyCheckItem> {
 
 pub(super) fn pdf_tool_command(command: &str) -> Command {
     crate::platform::process::HiddenCommand::new(crate::platform::os::pdf_tool_path(command))
+}
+
+/// `pdftotext -layout <pdf> -` → stdout text, shared by pdf-body extraction
+/// and presentation-to-PDF extraction. Kill-backed timeout (60s): corrupt or
+/// oddly wrapped input can hang the demuxer. Failure wording keeps the two
+/// call sites' historical strings (spawn failure → 「pdftotext 调用失败」,
+/// non-zero exit → 「pdftotext 失败」); the kind/warning IngestResult wrapping
+/// stays with the caller.
+pub(super) fn pdftotext_extract(pdf: &Path) -> Result<String, String> {
+    let mut command = pdf_tool_command("pdftotext");
+    command.arg("-layout").arg(pdf).arg("-");
+    match crate::platform::process::output_with_timeout_and_kill_tree(
+        command,
+        std::time::Duration::from_secs(60),
+    ) {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => Err(format!(
+            "pdftotext 失败: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("pdftotext 调用失败: {e}")),
+    }
 }
 
 pub(super) fn pandoc_tool_command() -> Command {

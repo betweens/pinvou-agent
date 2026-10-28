@@ -262,27 +262,12 @@
       }
     }
 
-    async function getWebRelaySettings() {
-      return invoke("web_access_relay_settings");
-    }
-
-    // eslint-disable-next-line sonarjs/no-invariant-returns -- echoing info from both branches is an intentional API contract
-    async function setWebRelayAddress(address) {
-      const seq = ++webAccessIntentSeq;
-      const info = await invoke("web_access_set_relay", { address });
-      if (seq !== webAccessIntentSeq) return info;
-      await refreshRemoteControlStatus(seq);
-      return info;
-    }
-
     return {
       startDesktopProxy,
       refreshRemoteControlStatus,
       startRemoteControl,
       stopRemoteControl,
       refreshRemoteControlQr,
-      getWebRelaySettings,
-      setWebRelayAddress,
     };
   };
 })(window);

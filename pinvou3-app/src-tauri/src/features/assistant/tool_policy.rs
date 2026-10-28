@@ -89,16 +89,33 @@ pub const PINVOU3_ALLOWED_TOOLS: &[&str] = &[
 ///   user files.
 /// - `registry_sync` / `start_registry_mcp_server`: the base registry-first
 ///   policy orders the model to call these two first.
+/// - `computer_use`: the bridge renders the computer-use instruction section
+///   (see `computer_use::instruction_block`) into every native session while
+///   the master switch is on, and that section names the tool directly.
+///   Deferring it would recreate exactly the failure the admission criterion
+///   exists for — the prompt says the capability exists while the first-turn
+///   tool list says it does not — and the `tool_search` recovery loses its
+///   activation on engine respawn (observed 2026-09-30: discovery needed the
+///   user to ask, then the tool vanished mid-task after an idle gap). While
+///   the toggle is off the disallow list strips the tool anyway and the
+///   section is not rendered, so both sides of visibility stay consistent.
 ///
 /// Always-load only affects deferral and does not bypass `disallowed`
 /// (deny wins).
 pub const PINVOU3_ALWAYS_LOADED_TOOLS: &[&str] = &[
+    // The shared instructions name this family directly. Deny rules still win.
+    "mcp_app-automations_create_scheduled_task",
+    "mcp_app-automations_list_scheduled_tasks",
+    "mcp_app-automations_read_scheduled_task",
+    "mcp_app-automations_update_scheduled_task",
+    "mcp_app-automations_delete_scheduled_task",
     "request_user_input",
     "image_analyze",
     "load_skill",
     "file_search",
     "registry_sync",
     "start_registry_mcp_server",
+    crate::features::computer_use::TOOL_NAME,
 ];
 #[must_use]
 pub fn allowed_tool_names() -> Vec<String> {
@@ -108,7 +125,12 @@ pub fn allowed_tool_names() -> Vec<String> {
         .collect()
 }
 
+/// Test-only allowlist check. Production gating hands `allowed_tool_names()` to the
+/// foundation, whose matcher additionally expands policy aliases; this local
+/// reimplementation does not, so it is kept for the allowlist contract tests only and
+/// must not be used as the production predicate.
 #[must_use]
+#[cfg(test)]
 pub fn is_pinvou3_allowed(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     PINVOU3_ALLOWED_TOOLS.iter().any(|rule| {
@@ -116,4 +138,22 @@ pub fn is_pinvou3_allowed(name: &str) -> bool {
         rule.strip_suffix('*')
             .map_or_else(|| name == rule, |prefix| name.starts_with(prefix))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scheduled_family_is_available_without_tool_search() {
+        for verb in [
+            "create_scheduled_task",
+            "read_scheduled_task",
+            "list_scheduled_tasks",
+            "update_scheduled_task",
+            "delete_scheduled_task",
+        ] {
+            let name = format!("mcp_app-automations_{verb}");
+            assert!(super::PINVOU3_ALWAYS_LOADED_TOOLS.contains(&name.as_str()));
+            assert!(super::is_pinvou3_allowed(&name));
+        }
+    }
 }

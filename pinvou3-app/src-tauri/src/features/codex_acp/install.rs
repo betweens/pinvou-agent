@@ -121,11 +121,6 @@ pub(super) fn resolve_claude_cli(adapter: Option<&Path>) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let binary = if crate::platform::capabilities::is_windows() {
-        "claude.exe"
-    } else {
-        "claude"
-    };
     if let Some((package, binary)) = claude_native_runtime(
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -143,11 +138,8 @@ pub(super) fn resolve_claude_cli(adapter: Option<&Path>) -> Option<PathBuf> {
     }
     // 官方安装脚本默认目录（unix ~/.local/bin，Windows %USERPROFILE%\.local\bin），
     // 使脚本装完后无需重启 App 即可探测到。
-    let script_installed = crate::platform::os::user_home_dir()
-        .join(".local")
-        .join("bin")
-        .join(binary);
-    if nonempty_file(&script_installed) {
+    let script_installed = official_cli_install_path(AgentBackend::ClaudeAcp);
+    if let Some(script_installed) = script_installed.filter(|path| nonempty_file(path)) {
         return Some(script_installed);
     }
     find_agent_cli_in_path(AgentBackend::ClaudeAcp)
@@ -182,19 +174,11 @@ pub(super) fn resolve_kimi_path() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let binary = if crate::platform::capabilities::is_windows() {
-        "kimi.exe"
-    } else {
-        "kimi"
-    };
     // 官方安装脚本默认目录（unix ~/.kimi-code/bin，Windows %USERPROFILE%\.kimi-code\bin）。
     // 优先于 PATH：脚本装完无需重启即可探测，且避开 PATH 中可能残留的废弃
     // Python 版 kimi-cli。
-    let script_installed = crate::platform::os::user_home_dir()
-        .join(".kimi-code")
-        .join("bin")
-        .join(binary);
-    if nonempty_file(&script_installed) {
+    let script_installed = official_cli_install_path(AgentBackend::KimiAcp);
+    if let Some(script_installed) = script_installed.filter(|path| nonempty_file(path)) {
         return Some(script_installed);
     }
     find_agent_cli_in_path(AgentBackend::KimiAcp)
@@ -266,17 +250,13 @@ fn version_from_probe(probe: CliVersionProbe) -> Option<String> {
 pub(super) fn command_version_output(executable: &Path) -> Option<String> {
     version_from_probe(command_version_probe(executable))
 }
-
-pub(super) fn probe_cli_version(executable: &Path) -> CliVersionProbe {
-    command_version_probe(executable)
-}
 pub(super) fn probe_cli(backend: AgentBackend, path: Option<PathBuf>) -> Option<ResolvedCli> {
     let path = path?;
     // 官方 CLI 首次经过系统安全扫描时也可能偶发超过单次自检上限。仅超时
     // 时补一次重试；缺失或明确失败不额外 spawn。
-    let probe = probe_cli_version(&path);
+    let probe = command_version_probe(&path);
     let probe = if matches!(probe, CliVersionProbe::TimedOut) {
-        probe_cli_version(&path)
+        command_version_probe(&path)
     } else {
         probe
     };
@@ -297,29 +277,23 @@ pub(super) fn probe_cli(backend: AgentBackend, path: Option<PathBuf>) -> Option<
         install_source,
     })
 }
-/// 探测 brew 是否已安装该 Agent 的 CLI（macOS 版本过旧时走 brew upgrade）。
-/// codex/claude-code 是 cask，kimi-code 是 formula（无 --cask）；
-/// 非 macOS 平台 brew_available 恒 false。
-pub(super) fn brew_package_installed(backend: AgentBackend) -> bool {
-    if !platform::brew_available() {
-        return false;
-    }
-    let args: &[&str] = match backend {
-        AgentBackend::CodexAcp => &["list", "--cask", "codex"],
-        AgentBackend::ClaudeAcp => &["list", "--cask", "claude-code"],
-        AgentBackend::KimiAcp => &["list", "kimi-code"],
-        AgentBackend::Deepseek => return false,
-    };
-    let mut command = std::process::Command::new(platform::brew_bin());
+/// 统一的「探测命令退出码」语义：spawn 失败、超时或非零退出都视为 false，
+/// 超时进程 kill 后回收。命令由调用方构造（brew 用裸 `std::process::Command`、
+/// npm/CLI 用 `external_command` 的差异保留在入参层），stdio 一律接 null。
+pub(super) fn probe_exit_status(
+    mut command: std::process::Command,
+    args: &[&str],
+    timeout: Duration,
+) -> bool {
+    command.args(args);
     command
-        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let Ok(mut child) = command.spawn() else {
         return false;
     };
-    match child.wait_timeout(Duration::from_secs(10)) {
+    match child.wait_timeout(timeout) {
         Ok(Some(status)) => status.success(),
         Ok(None) | Err(_) => {
             let _ = child.kill();
@@ -327,6 +301,38 @@ pub(super) fn brew_package_installed(backend: AgentBackend) -> bool {
             false
         }
     }
+}
+/// (brew 包名, is_cask)。codex/claude-code 是 cask,kimi-code 是 formula。
+/// 探测(brew_package_installed)与卸载规划(providers::lifecycle)共用同一张表,
+/// 包名改动一处同步。
+pub(super) fn brew_package(backend: AgentBackend) -> Option<(&'static str, bool)> {
+    match backend {
+        AgentBackend::CodexAcp => Some(("codex", true)),
+        AgentBackend::ClaudeAcp => Some(("claude-code", true)),
+        AgentBackend::KimiAcp => Some(("kimi-code", false)),
+        AgentBackend::Deepseek => None,
+    }
+}
+/// 探测 brew 是否已安装该 Agent 的 CLI（macOS 版本过旧时走 brew upgrade）。
+/// codex/claude-code 是 cask，kimi-code 是 formula（无 --cask）；
+/// 非 macOS 平台 brew_available 恒 false。
+pub(super) fn brew_package_installed(backend: AgentBackend) -> bool {
+    if !platform::brew_available() {
+        return false;
+    }
+    let Some((package, is_cask)) = brew_package(backend) else {
+        return false;
+    };
+    let args: &[&str] = if is_cask {
+        &["list", "--cask", package]
+    } else {
+        &["list", package]
+    };
+    probe_exit_status(
+        std::process::Command::new(platform::brew_bin()),
+        args,
+        Duration::from_secs(10),
+    )
 }
 /// 各 Agent CLI 对应的 npm 全局包名。
 pub(super) fn npm_package(backend: AgentBackend) -> Option<&'static str> {
@@ -350,23 +356,11 @@ pub(super) fn npm_global_installed(package: &str) -> bool {
     let Some(npm) = npm_executable() else {
         return false;
     };
-    let mut command = crate::platform::process::external_command(&npm);
-    command
-        .args(["ls", "-g", package, "--depth=0"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    match child.wait_timeout(Duration::from_secs(10)) {
-        Ok(Some(status)) => status.success(),
-        Ok(None) | Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            false
-        }
-    }
+    probe_exit_status(
+        crate::platform::process::external_command(&npm),
+        &["ls", "-g", package, "--depth=0"],
+        Duration::from_secs(10),
+    )
 }
 /// 判定已解析 CLI 的安装来源。多份并存（如同机同时有 brew cask 与官方脚本版）
 /// 时必须按「实际被解析使用的那一份」判定，否则升级会打到包管理器管理的另一份，
@@ -415,25 +409,15 @@ pub(super) fn finalize_install_source(
 pub(super) fn npm_global_root() -> Option<PathBuf> {
     let npm = npm_executable()?;
     let mut command = crate::platform::process::external_command(&npm);
-    command
-        .args(["prefix", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().ok()?;
-    match child.wait_timeout(Duration::from_secs(10)) {
-        Ok(Some(status)) if status.success() => {
-            let mut stdout = String::new();
-            child.stdout.take()?.read_to_string(&mut stdout).ok()?;
-            let root = stdout.trim();
-            (!root.is_empty()).then_some(PathBuf::from(root))
-        }
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            None
-        }
+    command.args(["prefix", "-g"]);
+    let output =
+        crate::platform::process::output_with_timeout(command, Duration::from_secs(10)).ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let root = stdout.trim();
+    (!root.is_empty()).then_some(PathBuf::from(root))
 }
 /// 路径是否位于 npm 全局根下：unix 可执行文件链接在 <root>/bin，Windows 直接在根目录。
 pub(super) fn path_in_npm_global(path: &Path, root: &Path, windows: bool) -> bool {
@@ -444,25 +428,38 @@ pub(super) fn path_in_npm_global(path: &Path, root: &Path, windows: bool) -> boo
     };
     path.starts_with(bin)
 }
+/// 各 Agent 官方安装脚本写入的二进制路径(codex 平台路径 / claude `~/.local/bin`、
+/// kimi `~/.kimi-code/bin`;Windows 仅可执行文件后缀不同)。CLI 解析
+/// ([`resolve_claude_cli`] / [`resolve_kimi_path`])、来源判定
+/// ([`path_install_source`]) 与卸载清理(providers::lifecycle::official_script_paths)
+/// 共用同一张表——目录改名一处同步,卸载不会漏掉旧位置。
+pub(super) fn official_cli_install_path(backend: AgentBackend) -> Option<PathBuf> {
+    let executable = if crate::platform::capabilities::is_windows() {
+        ".exe"
+    } else {
+        ""
+    };
+    match backend {
+        AgentBackend::CodexAcp => Some(platform::codex_official_install_path()),
+        AgentBackend::ClaudeAcp => Some(
+            crate::platform::os::user_home_dir()
+                .join(".local")
+                .join("bin")
+                .join(format!("claude{executable}")),
+        ),
+        AgentBackend::KimiAcp => Some(
+            crate::platform::os::user_home_dir()
+                .join(".kimi-code")
+                .join("bin")
+                .join(format!("kimi{executable}")),
+        ),
+        AgentBackend::Deepseek => None,
+    }
+}
 /// 按路径前缀判定官方脚本来源（codex/claude ~/.local/bin、kimi ~/.kimi-code/bin）。
 pub(super) fn path_install_source(backend: AgentBackend, path: &Path) -> Option<&'static str> {
-    let home = crate::platform::os::user_home_dir();
-    match backend {
-        AgentBackend::CodexAcp
-            if platform::codex_official_install_path()
-                .parent()
-                .is_some_and(|directory| path.starts_with(directory)) =>
-        {
-            Some("script")
-        }
-        AgentBackend::ClaudeAcp if path.starts_with(home.join(".local").join("bin")) => {
-            Some("script")
-        }
-        AgentBackend::KimiAcp if path.starts_with(home.join(".kimi-code").join("bin")) => {
-            Some("script")
-        }
-        _ => None,
-    }
+    let directory = official_cli_install_path(backend)?.parent()?.to_path_buf();
+    path.starts_with(directory).then_some("script")
 }
 /// installed=false 时的安装动作：探测到过旧 CLI 且来源可识别时优先包管理器
 /// upgrade (brew/npm); other sources or a missing CLI keep the default install method.
@@ -641,7 +638,11 @@ struct ManagedInstallStage {
     diag_stage: &'static str,
     /// Command line shown in progress events.
     command_line: String,
-    /// Whether to make the child a process-group leader (npm and brew need it; the script process does not).
+    /// Whether to make the child a process-group leader at this layer (npm and
+    /// brew need it; the script channel instead gets its group from
+    /// `install_script_command`'s unix branch, which sets one itself). Every
+    /// installer channel ends up a group leader either way — the armed guard's
+    /// group kill relies on that invariant.
     process_group: bool,
     spawn_context: String,
     stdout_context: &'static str,
@@ -684,9 +685,10 @@ fn brew_install_failure(
 
 /// Shared execution skeleton for managed installs. Differences are injected only via [`ManagedInstallStage`]:
 /// InstallChildGuard::register → post-spawn cancel recheck → emit_install_progress →
-/// InstallOutputReaders::spawn → 600s tokio timeout (diagnostics `<stage>:timeout`) →
-/// finish → diagnostics `<stage>:output` (output tail) → idempotent early success →
-/// cancel rewrite and the [`ManagedInstallStage::failure_detail`] bail on the failure exits.
+/// InstallOutputReaders::spawn → 600s tokio timeout (diagnostics `<stage>:timeout`, tree kill,
+/// guard settled after the reap) → finish → diagnostics `<stage>:output` (output tail) →
+/// idempotent early success (guard disarmed) → guard settled after the reap → cancel rewrite
+/// and the [`ManagedInstallStage::failure_detail`] bail on the failure exits.
 #[allow(clippy::too_many_arguments)]
 async fn run_managed_install(
     app: &AppHandle,
@@ -709,11 +711,20 @@ async fn run_managed_install(
     let mut child = command
         .spawn()
         .with_context(|| stage.spawn_context.clone())?;
-    // spawn 后登记 pid 供取消命令杀进程树；guard 在本函数任意出口注销。
-    let _child_guard = InstallChildGuard::register(install_children, backend, child.id());
-    // 取消可能发生在 spawn 与登记之间：登记后立即补检一次。
+    // Register the pid after spawn so the cancel command can kill the tree; the
+    // guard unregisters on every exit of this function. While the direct child
+    // has not been reaped by a wait (panic, wait error, early error return) the
+    // armed Drop reclaims the whole tree by pid; once a wait reaps it, the
+    // guard settles at the wait site so the Drop never kills by the freed pid.
+    let mut child_guard = InstallChildGuard::register(install_children, backend, child.id());
+    // A cancel may land between spawn and pid registration: recheck once
+    // right after registering. The Windows tree kill is a bounded (2 s)
+    // taskkill; the blocking pool keeps it off the async worker (unix is a
+    // single kill(2) syscall either way).
     if install_cancelled.lock().contains(&backend) {
-        let _ = child.kill().await;
+        if let Some(pid) = child.id() {
+            let _ = tokio::task::spawn_blocking(move || kill_install_process_tree(pid)).await;
+        }
     }
     emit_install_progress(app, backend, "command", &stage.command_line);
     let stdout = child.stdout.take().context(stage.stdout_context)?;
@@ -721,15 +732,54 @@ async fn run_managed_install(
     let output_readers = InstallOutputReaders::spawn(app, backend, stdout, stderr);
     const TIMEOUT: Duration = Duration::from_secs(600);
     let status = match tokio::time::timeout(TIMEOUT, child.wait()).await {
-        Ok(result) => result.context(stage.wait_context)?,
+        Ok(result) => {
+            let status = result.context(stage.wait_context)?;
+            // Reaped: settle before any further await or fallible step, so
+            // a panic in between can never drop the guard armed on a pid
+            // the OS may already have handed to another process.
+            child_guard.settle_reaped();
+            if !status.success() {
+                // A failed leader's group survivors are reclaimed here, not
+                // after the output tail: the tail idles up to IDLE_TIMEOUT
+                // when a descendant holds the pipes — exactly the case that
+                // has survivors — and a kill deferred behind it would fire on
+                // a pid the OS may meanwhile have handed to an unrelated
+                // group leader. An idempotent-ok run normally leaves an
+                // empty group, which the reclaim treats as ESRCH.
+                child_guard.reclaim_group_survivors();
+            }
+            status
+        }
         Err(_) => {
             diagnostics::write(
                 operation_id,
                 &format!("{}:timeout", stage.diag_stage),
                 format!("timeout_seconds={}", TIMEOUT.as_secs()),
             );
-            let _ = child.kill().await;
+            // The direct kill would orphan npm/brew descendants; reclaim the
+            // whole tree while the pid is still live, then let the wait
+            // observe the exit. After that wait the pid is reaped: settle so
+            // the Drop never re-kills, then reclaim group survivors once for
+            // descendants that outlived the leader. Like the cancel recheck,
+            // the (Windows-bounded) tree kill runs on the blocking pool.
+            // The wait itself is unbounded by design, with one trigger per
+            // platform: a stalled taskkill may leave the direct child alive
+            // (Windows), and on unix a child in uninterruptible kernel sleep
+            // (D state, e.g. NFS/FUSE mid-download) never observes SIGKILL at
+            // all — either way this parks the install task, and the install
+            // mutex with it, until the child exits on its own or the app
+            // restarts. The codebase's bounded REAP_GRACE reap is not used
+            // here because abandoning the wait early would have to settle an
+            // unreaped child to make progress, re-arming exactly the
+            // recycled-pid hazard this order exists to avoid; user cancel
+            // still reaches the tree through the registry entry, which only
+            // the settle below removes.
+            if let Some(pid) = child.id() {
+                let _ = tokio::task::spawn_blocking(move || kill_install_process_tree(pid)).await;
+            }
             let _ = child.wait().await;
+            child_guard.settle_reaped();
+            child_guard.reclaim_group_survivors();
             bail!("{}", stage.timeout_message);
         }
     };
@@ -748,6 +798,10 @@ async fn run_managed_install(
             .idempotent_ok
             .is_some_and(|is_done| is_done(&stdout, &stderr))
     {
+        // An (idempotent) success needs no further reclaim: the guard
+        // settled at the wait site, and a nonzero exit already ran the
+        // group reclaim there — for a wound-down installer it found an
+        // empty group (ESRCH-safe).
         return Ok(());
     }
     // The process was cancelled by the user (taskkill/kill) and reaches here with a failure status: rewrite to cancelled semantics.
@@ -830,9 +884,70 @@ pub(super) async fn run_official_install_script(
     )
     .await
 }
+/// [`ManagedInstallStage`] description for a single npm global upgrade
+/// attempt: the official-source run and the npmmirror mirror retry share one
+/// copy, with only the mirror flag changing the diagnostics prefix, command
+/// line, and timeout text — this avoids two hand-written structs drifting
+/// apart as fields are added or removed.
+fn npm_upgrade_stage(backend: AgentBackend, mirror: bool) -> ManagedInstallStage {
+    let (diag_stage, upgrade_kind): (&'static str, &'static str) = if mirror {
+        ("npm-mirror", "npm mirror upgrade")
+    } else {
+        ("npm", "npm global upgrade")
+    };
+    ManagedInstallStage {
+        diag_stage,
+        // Keep the display consistent with the real arguments (npm_upgrade_args'
+        // `pkg@latest`) so the command shown in the progress panel can be
+        // reproduced verbatim.
+        command_line: if mirror {
+            format!(
+                "npm install -g {}@latest --registry={NPM_MIRROR_REGISTRY}",
+                npm_package(backend).unwrap_or("")
+            )
+        } else {
+            format!(
+                "npm install -g {}@latest",
+                npm_package(backend).unwrap_or("")
+            )
+        },
+        process_group: true,
+        spawn_context: format!("failed to spawn {upgrade_kind}"),
+        stdout_context: if mirror {
+            "failed to read npm mirror stdout"
+        } else {
+            "failed to read npm stdout"
+        },
+        stderr_context: if mirror {
+            "failed to read npm mirror stderr"
+        } else {
+            "failed to read npm stderr"
+        },
+        wait_context: if mirror {
+            "failed to wait for npm mirror upgrade process"
+        } else {
+            "failed to wait for npm global upgrade process"
+        },
+        timeout_message: format!(
+            "{} {upgrade_kind} did not finish within 10 minutes; check the network and retry",
+            backend.display_name()
+        ),
+        failure_subject: format!("{upgrade_kind} of {} exited", backend.display_name()),
+        failure_hint: false,
+        idempotent_ok: None,
+        failure_detail: managed_install_failure,
+    }
+}
+
 /// Runs `npm install -g <pkg>@latest` as a global upgrade (npm.cmd via cmd on
 /// Windows), 10-minute timeout, with the output tail written to the
-/// diagnostics log.
+/// diagnostics log. On failure (and not user-cancelled), retries once against
+/// the npmmirror China mirror: registry.npmjs.org is frequently unreachable on
+/// Chinese networks. The flag is per-invocation only — the user's npm
+/// configuration is never written or modified (npm still reads its own config
+/// for prefix/cache/auth as usual). npm installs have no app-side artifact
+/// pin; integrity on this path rests on TLS plus the mirror's registry-sync
+/// fidelity.
 pub(super) async fn run_npm_global_upgrade(
     app: &AppHandle,
     backend: AgentBackend,
@@ -845,32 +960,57 @@ pub(super) async fn run_npm_global_upgrade(
     let npm = npm_executable().context("未检测到 npm，无法通过 npm 全局升级")?;
     let mut command = crate::platform::process::external_tokio_command(&npm);
     command.args(&args);
-    run_managed_install(
+    let first = run_managed_install(
         app,
         backend,
         operation_id,
         install_children,
         install_cancelled,
         command,
-        ManagedInstallStage {
-            diag_stage: "npm",
-            command_line: format!("npm install -g {}", npm_package(backend).unwrap_or("")),
-            process_group: true,
-            spawn_context: "failed to spawn npm global upgrade".to_string(),
-            stdout_context: "failed to read npm stdout",
-            stderr_context: "failed to read npm stderr",
-            wait_context: "failed to wait for npm global upgrade process",
-            timeout_message: format!(
-                "{} npm global upgrade did not finish within 10 minutes; check the network and retry",
-                backend.display_name()
-            ),
-            failure_subject: format!("npm global upgrade of {} exited", backend.display_name()),
-            failure_hint: false,
-            idempotent_ok: None,
-            failure_detail: managed_install_failure,
-        },
+        npm_upgrade_stage(backend, false),
+    )
+    .await;
+    let primary = match first {
+        Ok(()) => return Ok(()),
+        Err(primary) => primary,
+    };
+    // A user-initiated cancel is not a source failure: do not retry via the
+    // mirror (otherwise the install would keep running after the cancel).
+    if format!("{primary:#}").contains(INSTALL_CANCELLED_MARKER) {
+        return Err(primary);
+    }
+    diagnostics::write(
+        operation_id,
+        "npm:mirror_retry",
+        format!("primary failed, retrying via {NPM_MIRROR_REGISTRY}: {primary:#}"),
+    );
+    let mut mirror_command = crate::platform::process::external_tokio_command(&npm);
+    mirror_command.args(&args);
+    mirror_command.arg(format!("--registry={NPM_MIRROR_REGISTRY}"));
+    run_managed_install(
+        app,
+        backend,
+        operation_id,
+        install_children,
+        install_cancelled,
+        mirror_command,
+        npm_upgrade_stage(backend, true),
     )
     .await
+    // Keep the causal chain of the first error when the mirror retry also
+    // fails: reporting only the mirror error would hide first failures
+    // unrelated to the network (EACCES, disk full) in the diagnostics log.
+    // A user-initiated cancel during the mirror attempt is likewise not a
+    // "mirror source failure": propagate the cancel semantics as-is instead
+    // of concatenating it with the first source error (otherwise the cancel
+    // would be misreported as a double network failure).
+    .map_err(|mirror_error| {
+        if format!("{mirror_error:#}").contains(INSTALL_CANCELLED_MARKER) {
+            mirror_error
+        } else {
+            mirror_error.context(format!("first npm registry error: {primary:#}"))
+        }
+    })
 }
 
 /// brew's idempotent notices do not count as failure: install reports already installed, upgrade reports already
@@ -948,6 +1088,185 @@ pub(super) fn node_major_version(version: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// Plain long-lived fixture standing in for an installer (no real package
+    /// manager involved). Unix makes it its own process-group leader through
+    /// the platform primitive — the same contract the managed install channels
+    /// run under — so the pid-based group kill used by the guard reaches the
+    /// whole tree; Windows relies on `taskkill /T` tree semantics. Two
+    /// boundaries of what this fixture can prove: it is a single process (no
+    /// portable grandchild), so descendant-tree reach itself is delegated to
+    /// the platform kill tests; and the Windows arm executes only in the
+    /// native Windows regression filter — the Linux legs exercise the unix
+    /// arm.
+    fn spawn_install_fixture() -> (std::process::Child, u32) {
+        let (program, args): (&str, &[&str]) = if crate::platform::capabilities::is_windows() {
+            // `ping -n 30` idles ~30 seconds; there is no portable sleep.
+            ("ping", &["-n", "30", "-w", "1000", "127.0.0.1"])
+        } else {
+            ("sleep", &["30"])
+        };
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        crate::platform::process::std_process_group_leader(&mut command);
+        command.stdin(std::process::Stdio::null());
+        let child = command.spawn().expect("spawn install fixture");
+        let pid = child.id();
+        (child, pid)
+    }
+
+    /// Asserts the fixture survives a full observation window. The kills
+    /// this guards against run on detached threads, so a fixed short sleep
+    /// can false-pass a disarm regression under CI load; poll for the whole
+    /// window instead.
+    fn stay_alive(child: &mut std::process::Child, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().expect("poll install fixture").is_none(),
+                "{what} killed the install fixture"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn wait_exited(child: &mut std::process::Child, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if child.try_wait().expect("poll install fixture").is_some() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} left the install fixture running"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The failure path must reclaim group survivors BEFORE the output tail:
+    /// the tail idles up to IDLE_TIMEOUT exactly when a descendant holds the
+    /// pipes — the case that has survivors — so a kill deferred behind it
+    /// fires on a pid the OS may have handed to an unrelated group leader.
+    /// `run_managed_install`'s failure arm needs a real installer process
+    /// tree, so pin the ordering in the source (mutation-verified: moving
+    /// the reclaim behind `finish().await` turns this red).
+    #[test]
+    fn failed_install_reclaims_group_before_the_output_tail() {
+        let src = include_str!("install.rs");
+        let production = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module marker must exist")];
+        let fn_start = production
+            .find("async fn run_managed_install")
+            .expect("run_managed_install must exist");
+        let body = &production[fn_start..];
+        let tail = body
+            .find("output_readers.finish().await")
+            .expect("the output tail must exist");
+        // Both wait-exit arms (the failure arm and the timeout arm) reclaim
+        // before the tail; counting rather than slicing keeps the pin honest
+        // about the failure arm specifically, which a range check would
+        // otherwise satisfy via the timeout arm's own call.
+        assert_eq!(
+            body[..tail]
+                .matches("child_guard.reclaim_group_survivors()")
+                .count(),
+            2,
+            "the failure arm must reclaim group survivors before the output \
+             tail; deferring it kills by a possibly recycled pid"
+        );
+    }
+
+    /// Both wait-exit arms must settle the guard at the reap site: settling
+    /// disarms the Drop kill and unregisters the pid, so a settle that
+    /// silently disappears from either arm re-arms the recycled-pid hazard
+    /// on an already-reaped child while every behavioral test stays green
+    /// (the guard fixture settles explicitly, so it cannot observe the
+    /// production call sites).
+    #[test]
+    fn both_install_wait_arms_settle_the_guard_at_the_reap_site() {
+        let src = include_str!("install.rs");
+        let production = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module marker must exist")];
+        let fn_start = production
+            .find("async fn run_managed_install")
+            .expect("run_managed_install must exist");
+        let body = &production[fn_start..];
+        assert_eq!(
+            body.matches("child_guard.settle_reaped()").count(),
+            2,
+            "the Ok arm and the timeout arm must both settle the guard \
+             immediately after their wait; a missing settle leaves the Drop \
+             kill armed on a reaped (recyclable) pid"
+        );
+    }
+
+    #[test]
+    pub(super) fn install_child_guard_drop_reclaims_tree_and_settled_guards_never_rekill() {
+        let children: Arc<parking_lot::Mutex<HashMap<AgentBackend, u32>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let backend = AgentBackend::ClaudeAcp;
+
+        // Armed Drop (any unsuccessful exit) terminates the fixture and
+        // unregisters the pid.
+        let (mut child, pid) = spawn_install_fixture();
+        let guard = InstallChildGuard::register(&children, backend, Some(pid));
+        assert_eq!(children.lock().get(&backend).copied(), Some(pid));
+        drop(guard);
+        wait_exited(&mut child, "armed guard Drop");
+        assert!(
+            children.lock().get(&backend).is_none(),
+            "guard Drop must unregister the pid"
+        );
+
+        // Settled Drop (the wait returned Ok, success shape): the pid is
+        // freed, so the Drop only unregisters — on either platform it must
+        // not kill. Cleanup is an explicit tree kill, exactly like the
+        // cancel command.
+        let (mut child, pid) = spawn_install_fixture();
+        let mut guard = InstallChildGuard::register(&children, backend, Some(pid));
+        guard.settle_reaped();
+        drop(guard);
+        assert!(
+            children.lock().get(&backend).is_none(),
+            "settled guard Drop must still unregister the pid"
+        );
+        stay_alive(&mut child, "settled guard Drop");
+        kill_install_process_tree(pid);
+        let _ = child.wait();
+
+        // Settled after a reap plus the failure-path reclaim: unix reclaims
+        // the group once (survivors of a failed leader are still members),
+        // Windows must not kill at all — the pid may already belong to
+        // another process. Either way the Drop that follows is disarmed and
+        // only unregisters.
+        let (mut child, pid) = spawn_install_fixture();
+        let mut guard = InstallChildGuard::register(&children, backend, Some(pid));
+        guard.settle_reaped();
+        guard.reclaim_group_survivors();
+        if crate::platform::capabilities::is_windows() {
+            stay_alive(&mut child, "windows post-reap reclaim");
+        } else {
+            wait_exited(&mut child, "unix post-reap group reclaim");
+        }
+        drop(guard);
+        assert!(
+            children.lock().get(&backend).is_none(),
+            "settled guard Drop must still unregister the pid"
+        );
+        if crate::platform::capabilities::is_windows() {
+            stay_alive(&mut child, "windows settled guard Drop");
+            kill_install_process_tree(pid);
+        }
+        let _ = child.wait();
+
+        // A spawn without a pid registers nothing and reclaims nothing.
+        let guard = InstallChildGuard::register(&children, backend, None);
+        drop(guard);
+        assert!(children.lock().get(&backend).is_none());
+    }
+
     #[test]
     pub(super) fn managed_path_is_versioned() {
         let path = managed_adapter_path().to_string_lossy().into_owned();
@@ -1024,6 +1343,7 @@ mod tests {
             error: None,
             install_command: None,
             install_latest_line: None,
+            install_finished: None,
             setup_hint: None,
         };
         let value = serde_json::to_value(&status).expect("serialize CodexAcpStatus");
@@ -1034,6 +1354,29 @@ mod tests {
         assert_eq!(value["install_source"], json!("npm"));
         assert_eq!(value["update_available"], json!(true));
         assert_eq!(value["update_required"], json!(true));
+        // The outcome is absent from serialization by default
+        // (skip_serializing_if); when present it carries ok/cancelled, and a
+        // failed (non-cancelled) outcome adds this run's error chain (skipped
+        // on success/cancellation).
+        assert!(value.get("install_finished").is_none());
+        let mut finished = status.clone();
+        finished.install_finished = Some(install_outcome_for_result(true, false, None));
+        let value = serde_json::to_value(&finished).expect("serialize install_finished");
+        assert_eq!(
+            value["install_finished"],
+            json!({ "ok": true, "cancelled": false })
+        );
+        let mut failed = status.clone();
+        failed.install_finished = Some(install_outcome_for_result(
+            false,
+            false,
+            Some("npm install failed: EBUSY"),
+        ));
+        let value = serde_json::to_value(&failed).expect("serialize failed install_finished");
+        assert_eq!(
+            value["install_finished"],
+            json!({ "ok": false, "cancelled": false, "error": "npm install failed: EBUSY" })
+        );
 
         let mut cli_ready_without_bridge = status.clone();
         cli_ready_without_bridge.codex_available = true;
@@ -1056,6 +1399,145 @@ mod tests {
                 .is_ok(),
             "advisory latest upgrade must not fail the install when the package manager lags behind"
         );
+    }
+
+    /// Outcome mapping: success passes through as ok; on failure the cancel
+    /// marker in the error chain distinguishes "cancelled" from "failed"
+    /// (same verdict as the wait side and the frontend, no Chinese-copy
+    /// substring matching). A cancel armed but not yet consumed at record
+    /// time (a preflight-window cancel whose natural failure won the race)
+    /// counts as cancelled too. Failure (non-cancelled) carries this run's
+    /// error chain for the cross-mount heal to echo.
+    #[test]
+    pub(super) fn install_outcome_maps_success_and_cancellation() {
+        assert_eq!(
+            install_outcome_for_result(true, false, None),
+            InstallFinishedInfo {
+                ok: true,
+                cancelled: false,
+                error: None
+            }
+        );
+        assert_eq!(
+            install_outcome_for_result(true, true, None),
+            InstallFinishedInfo {
+                ok: true,
+                cancelled: false,
+                error: None
+            },
+            "a cancel that lost the race to a successful exit is not an outcome"
+        );
+        assert_eq!(
+            install_outcome_for_result(false, false, Some("install_cancelled:kimi 安装已取消")),
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: true,
+                error: None
+            }
+        );
+        assert_eq!(
+            install_outcome_for_result(false, true, Some("preflight registry unreachable")),
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: true,
+                error: None
+            },
+            "a still-armed marker at record time is a preflight-window cancel"
+        );
+        assert_eq!(
+            install_outcome_for_result(false, false, Some("npm install failed: EBUSY")),
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: false,
+                error: Some("npm install failed: EBUSY".to_string())
+            }
+        );
+        assert_eq!(
+            install_outcome_for_result(false, false, None),
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: false,
+                error: None
+            }
+        );
+    }
+
+    /// Cancellation settlement: the returned error must classify the same
+    /// way as the recorded outcome. The critical case is a preflight-window
+    /// cancel whose natural failure won the race (armed marker + unmarked
+    /// error): the outcome says cancelled, so the initiating caller must see
+    /// a marker-carrying cancelled error — the frontend's catch would
+    /// otherwise pin the card on failed + red error while every other
+    /// surface (status.install_finished, the heal, the wait side) reports a
+    /// cancellation. Pre-marked cancel errors, successes, and plain failures
+    /// pass through unchanged.
+    #[test]
+    pub(super) fn install_settlement_returns_recorded_cancellation() {
+        let (outcome, returned) = settle_install_result(
+            false,
+            true,
+            Some("preflight registry unreachable"),
+            AgentBackend::KimiAcp,
+        );
+        assert_eq!(
+            outcome,
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: true,
+                error: None
+            }
+        );
+        assert_eq!(
+            returned.as_deref(),
+            Some("install_cancelled:Kimi 安装已取消"),
+            "the return value must carry the cancellation classification the outcome recorded"
+        );
+        // An error that already carries the marker classifies by itself: no
+        // rewrite (the original chain keeps its own wording).
+        let (outcome, returned) = settle_install_result(
+            false,
+            false,
+            Some("install_cancelled:kimi 安装已取消"),
+            AgentBackend::KimiAcp,
+        );
+        assert_eq!(
+            outcome,
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: true,
+                error: None
+            }
+        );
+        assert_eq!(returned, None, "a pre-marked cancel error needs no rewrite");
+        // A cancel that lost the race to a successful exit is not a
+        // cancellation on either side.
+        let (outcome, returned) = settle_install_result(true, true, None, AgentBackend::KimiAcp);
+        assert_eq!(
+            outcome,
+            InstallFinishedInfo {
+                ok: true,
+                cancelled: false,
+                error: None
+            }
+        );
+        assert_eq!(returned, None);
+        // A plain failure is neither cancelled nor rewritten: the outcome
+        // carries the error chain, and the caller sees the original error.
+        let (outcome, returned) = settle_install_result(
+            false,
+            false,
+            Some("npm install failed: EBUSY"),
+            AgentBackend::KimiAcp,
+        );
+        assert_eq!(
+            outcome,
+            InstallFinishedInfo {
+                ok: false,
+                cancelled: false,
+                error: Some("npm install failed: EBUSY".to_string())
+            }
+        );
+        assert_eq!(returned, None);
     }
 
     #[test]
@@ -1193,6 +1675,29 @@ mod tests {
         assert!(installing_agents.read().contains(&AgentBackend::CodexAcp));
         drop(codex);
         assert!(installing_agents.read().is_empty());
+    }
+
+    #[test]
+    pub(super) fn install_active_window_is_exclusive_and_ends_at_drop() {
+        let install_active = Arc::new(parking_lot::RwLock::new(HashSet::new()));
+        let claude = InstallActiveGuard::try_start(&install_active, AgentBackend::ClaudeAcp)
+            .expect("the active window must register at entry");
+
+        assert!(install_active.read().contains(&AgentBackend::ClaudeAcp));
+        assert!(
+            InstallActiveGuard::try_start(&install_active, AgentBackend::ClaudeAcp).is_none(),
+            "a second install for the same Agent must be rejected inside the active window"
+        );
+
+        drop(claude);
+        assert!(
+            !install_active.read().contains(&AgentBackend::ClaudeAcp),
+            "the window must close at guard drop (outcome already recorded by then)"
+        );
+        assert!(
+            InstallActiveGuard::try_start(&install_active, AgentBackend::ClaudeAcp).is_some(),
+            "the next install must be able to register again"
+        );
     }
 
     #[test]
@@ -1386,6 +1891,95 @@ pub(super) fn clear_install_progress(app: &AppHandle, backend: AgentBackend) {
     }
 }
 
+/// Clears the previous install's outcome before `install_agent` starts:
+/// install_finished describes only the most recent install.
+pub(super) fn clear_install_outcome(app: &AppHandle, backend: AgentBackend) {
+    if let Some(store) = app.try_state::<InstallOutcomeStore>() {
+        store.0.write().remove(&backend);
+    }
+}
+
+/// Outcome mapping (pure, unit-testable): ok passes through; on failure the
+/// cancel marker in the error chain means "cancelled" (same verdict as the
+/// wait side, which the frontend classifies as cancelled via the structured
+/// marker — no red-error echo). `cancel_pending` is a marker still armed at
+/// record time: a preflight-window cancel whose natural failure won the race
+/// against the spawn-time recheck. Failure (non-cancelled) carries this
+/// run's error chain for the cross-mount heal to echo.
+pub(super) fn install_outcome_for_result(
+    ok: bool,
+    cancel_pending: bool,
+    error_detail: Option<&str>,
+) -> InstallFinishedInfo {
+    let cancelled = !ok
+        && (cancel_pending
+            || error_detail.is_some_and(|detail| detail.contains(INSTALL_CANCELLED_MARKER)));
+    InstallFinishedInfo {
+        ok,
+        cancelled,
+        error: if !ok && !cancelled {
+            error_detail.map(str::to_string)
+        } else {
+            None
+        },
+    }
+}
+
+/// Settles a finished install run into (outcome to record, error to return),
+/// guaranteeing both carry the same cancellation classification. A cancel
+/// armed in the preflight window whose natural failure won the race is
+/// recorded as cancelled (see [`install_outcome_for_result`]); the return
+/// value must classify the same way — ProvidersSection's initiating catch
+/// recognizes only the structured `install_cancelled` marker and would
+/// otherwise overwrite the cancelled phase with failed plus a red error
+/// banner, a wrong terminal the cross-mount heal cannot repair (it only
+/// converges the installing phase). The rewritten error mirrors the wait
+/// side's cancel wording; the incidental natural failure stays visible in
+/// the diagnostics log. An error already carrying the marker, a successful
+/// run, and a plain failure are returned unchanged.
+pub(super) fn settle_install_result(
+    ok: bool,
+    cancel_pending: bool,
+    error_detail: Option<&str>,
+    backend: AgentBackend,
+) -> (InstallFinishedInfo, Option<String>) {
+    let outcome = install_outcome_for_result(ok, cancel_pending, error_detail);
+    let rewritten_error = if outcome.cancelled
+        && !error_detail.is_some_and(|detail| detail.contains(INSTALL_CANCELLED_MARKER))
+    {
+        Some(format!(
+            "{INSTALL_CANCELLED_MARKER}{} 安装已取消",
+            backend.display_name()
+        ))
+    } else {
+        None
+    };
+    (outcome, rewritten_error)
+}
+
+/// Records the wrapped-up outcome into the shared store.
+pub(super) fn record_install_outcome(
+    app: &AppHandle,
+    backend: AgentBackend,
+    outcome: InstallFinishedInfo,
+) {
+    if let Some(store) = app.try_state::<InstallOutcomeStore>() {
+        store.0.write().insert(backend, outcome);
+    }
+}
+
+/// Fills `install_finished` into status so a remounted panel can observe the
+/// most recent outcome.
+pub(super) fn fill_install_outcome(
+    app: &AppHandle,
+    backend: AgentBackend,
+    status: &mut CodexAcpStatus,
+) {
+    if let Some(store) = app.try_state::<InstallOutcomeStore>() {
+        status.install_finished = store.0.read().get(&backend).cloned();
+    }
+}
+
 pub(super) fn emit_install_progress(
     app: &AppHandle,
     backend: AgentBackend,
@@ -1469,6 +2063,11 @@ pub(super) fn official_script_urls(backend: AgentBackend) -> (&'static str, &'st
     }
 }
 
+/// HEAD probe for script-source reachability. Transport-level success counts
+/// as reachable — any HTTP status (including 403/405) proves the source is
+/// alive and the real GET download will most likely work; tightening by
+/// status code would instead misjudge a usable source as unreachable when a
+/// CDN rejects HEAD requests, triggering unnecessary install degradation.
 pub(super) async fn script_url_reachable(url: &str) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))

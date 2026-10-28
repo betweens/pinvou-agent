@@ -20,11 +20,12 @@ const LazyToolStoreView = lazy(() => VIEW_LOADERS.toolStore().then(m => ({ defau
 const LazyCardPoolView = lazy(() => VIEW_LOADERS.cardpool().then(m => ({ default: m.CardPoolView })));
 const DetachedViewFallback = () => <div className="p-6 text-sm opacity-60">…</div>;
 import { useBridgeState } from '../hooks/useBridge.js';
+import { setStreamFadePreference } from '../features/conversation/stream-fade.js';
 import { useSystemDarkMode } from '../hooks/useSystemDarkMode.js';
-import { normalizeColorScheme, resolveTheme } from '../shared/color-scheme.js';
-import { emitTauri, isTauriAvailable, listenTauri } from '../platform/tauri/client.js';
+import { normalizeColorScheme, readStoredColorScheme, resolveTheme } from '../shared/color-scheme.js';
+import { listenTauri } from '../platform/tauri/client.js';
 import { listAcpSessions } from '../features/codex/acpClient.js';
-import { dict, ensureLanguage, initialSystemLanguage, TAG_TO_LANG } from '../shared/i18n.js';
+import { dict, ensureLanguage, initialSystemLanguage, TAG_TO_LANG, zhDict } from '../shared/i18n.js';
 import { ensurePersonaI18nOverlay } from './personas-overlay.js';
 
 function useDetachedBase() {
@@ -41,12 +42,27 @@ function useDetachedBase() {
   // Same color-scheme semantics as the main window: `system` follows the OS
   // live (light when undeterminable). Detached windows have no settings entry,
   // so the preference is read once from the main settings at bootstrap and
-  // keeps following system flips afterwards (while on `system`).
+  // keeps following system flips afterwards (while on `system`). Seed from
+  // the persisted scheme (readStoredColorScheme, same as main.jsx/ReaderApp):
+  // the detached window loads index.html, whose pre-paint script already
+  // applied the stored scheme's class, and reconciling from plain 'system'
+  // would strip it again until the bootstrap settings arrive whenever the
+  // stored pick differs from the OS.
   const systemDark = useSystemDarkMode();
-  const [colorScheme, setColorScheme] = useState('system');
+  const [colorScheme, setColorScheme] = useState(readStoredColorScheme);
   const activeTheme = resolveTheme(colorScheme, systemDark);
   const [, setPersonaI18nTick] = useState(0);
   const initRef = useRef(false);
+  // Streaming fade-in for chat responses (default on; only an explicit
+  // settings.chat.streaming_animation === false turns it off). Unlike the
+  // one-shot language/theme bootstrap below, this re-derives whenever this
+  // window's settings snapshot refreshes. Settings changes are not broadcast
+  // across windows, so an already-open detached window can lag the main
+  // window's toggle until it reloads settings (self-heals on reopen).
+  const chatStreamingAnimation = !bs || !bs.settings || !bs.settings.chat || bs.settings.chat.streaming_animation !== false;
+  useEffect(() => {
+    setStreamFadePreference(chatStreamingAnimation);
+  }, [chatStreamingAnimation]);
 
   useEffect(() => {
     if (initRef.current || !bs || !bs.settings) return;
@@ -73,8 +89,8 @@ function useDetachedBase() {
     }
   }, [language]);
 
-  // 兜底 zh:词典 chunk 装载失败时按 zh 渲染而非白屏(与 PetWindow/ReaderApp 同口径)。
-  return { bs, activeTheme, t: dict[language] || dict.zh };
+  // 兜底 zh 是活腿:入口引导失败降级装载 zh 后 zhDict() 非空(与主窗同口径)。
+  return { bs, activeTheme, t: dict[language] || zhDict() };
 }
 
 class DetachedErrorBoundary extends React.Component {
@@ -184,15 +200,6 @@ const DETACHED_KIND_LABEL_KEYS = {
 
 export function DetachedShell({ kind, id }) {
   const { bs, activeTheme, t } = useDetachedBase();
-
-  useEffect(() => {
-    const key = `${kind}:${id || ''}`;
-    const onUnload = () => {
-      if (isTauriAvailable()) void emitTauri('detach:closed', key).catch(() => {});
-    };
-    window.addEventListener('beforeunload', onUnload);
-    return () => window.removeEventListener('beforeunload', onUnload);
-  }, [kind, id]);
 
   const View = DETACHED_VIEWS[kind] || DETACHED_VIEWS.monitor;
   const kindLabelFn = DETACHED_KIND_LABEL_KEYS[kind];

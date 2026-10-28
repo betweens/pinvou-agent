@@ -71,11 +71,10 @@ impl BenchmarkAdapter for FixtureAdapter {
         Ok(BenchmarkPlan::new(vec![BenchmarkTask::new(
             "raw-task",
             None,
-            None,
             ExecutionRequest::native_turn(
                 PrivateInputHandle::new("private-input"),
                 vec![],
-                Duration::from_secs(1),
+                Some(Duration::from_secs(1)),
                 ToolPolicyId::new("fixture/v1"),
                 OutputContract::new("fixture/v1"),
             ),
@@ -93,7 +92,12 @@ impl BenchmarkAdapter for FixtureAdapter {
 
     fn score(&self, _run: &CompletedRun) -> benchmark_core::Result<OfficialScoreReport> {
         self.calls.lock().unwrap().scored += 1;
-        Ok(OfficialScoreReport::new(1, 1))
+        Ok(OfficialScoreReport::partial(
+            1,
+            1,
+            "unspecified",
+            "unspecified",
+        ))
     }
 
     fn write_submission(
@@ -452,7 +456,7 @@ fn adapter_driven_service_plans_prepares_then_runs_without_implicit_scoring() {
     )
     .unwrap();
     for (field, replacement) in [
-        ("schema_version", serde_json::json!(2)),
+        ("schema_version", serde_json::json!(3)),
         ("concurrency", serde_json::json!(2)),
         ("pass", serde_json::json!(2)),
         ("adapter_version", serde_json::json!("fixture-adapter/v2")),
@@ -464,6 +468,8 @@ fn adapter_driven_service_plans_prepares_then_runs_without_implicit_scoring() {
             serde_json::json!({"provider": "fixture", "model": "other"}),
         ),
         ("tool_policy", serde_json::json!("fixture/v2")),
+        // The recorded deadline mode joins the resume identity (matches_expected).
+        ("harness_deadline_secs", serde_json::json!(600)),
     ] {
         let mut value = serde_json::to_value(&expected).unwrap();
         value[field] = replacement;

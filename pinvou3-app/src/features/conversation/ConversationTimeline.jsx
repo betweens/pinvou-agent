@@ -1,10 +1,13 @@
-import React, { useEffect, useId, useMemo, useState, useSyncExternalStore } from 'react';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { FileTypeIcon } from '../../components/files/FileTypeIcon.jsx';
 import { StatusDot } from '../../components/StatusDot.jsx';
-import { dict } from '../../shared/i18n.js';
+import { zhDict } from '../../shared/i18n.js';
 import { renderMarkdown } from '../../shared/markdown-renderer.js';
 import { getSyntaxHighlightVersion, subscribeSyntaxHighlight } from '../../shared/syntax-highlighter.js';
+import { splitAttachmentLine } from '../attachments/attachment-message.js';
 import { useThrottledValue } from './useThrottledValue.js';
+import { useConversationSecondClock } from '../../hooks/useConversationSecondClock.js';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -21,6 +24,7 @@ import {
   externalMarkdownUrl,
   fetchToolDetails,
   isFetchTool,
+  isOperationItemType,
   isSearchTool,
   searchToolDetails,
   terminalStatus,
@@ -28,26 +32,47 @@ import {
   workspaceMarkdownResource,
 } from './conversation-model.js';
 import { AssistantMessageActions, AssistantMessageFooter } from './AssistantMessageActions.jsx';
+import {
+  codeBlockCopyLabels,
+  copyCodeBlockFromButton,
+  ensureCodeCopyButtons,
+  findCodeCopyButton,
+  observeCodeCopyButtons,
+} from './code-block-copy.js';
+import { applyStreamFade } from './stream-fade.js';
 import { createWeakCache } from '../../shared/weak-cache.js';
 import { assistantResponseAvailable, assistantResponseText } from './message-clipboard.js';
+import {
+  CONVERSATION_VIRTUALIZATION_THRESHOLD,
+  shouldVirtualizeConversationTurns,
+  splitConversationLiveTail,
+} from './conversation-virtualization.js';
 
 // Fallback copy derives from the zh dictionary instead of duplicating its strings here:
 // dictionary tweaks in shared/i18n propagate automatically, and a caller that forgets to
 // pass its own uiConversation now sees real zh strings rather than a hand-copied table.
-// Key-set diff (refactor): every key the timeline reads exists in dict.zh.uiConversation,
+// Key-set diff (refactor): every key the timeline reads exists in zhDict().uiConversation,
 // so no literal overlay is needed; the defensive `|| {}` only guards the impossible case
 // of a missing dict section (same style as other `x || {}` fallbacks in the codebase).
-const FALLBACK_COPY = dict.zh?.uiConversation || {};
+// Round-43 (zhuowp P1 class): the zh dict moved behind the lazy loader —
+// resolve at call time. `elapsed` is a FUNCTION key consumed
+// unconditionally during render, so seed a numeric formatter that covers
+// the pre-load window (the zh table's own formatter overwrites it on
+// load; browser fixtures without ensureLanguage ride this default).
+const conversationFallbackCopy = () => {
+  const zh = zhDict()?.uiConversation;
+  return zh ? { elapsed: (ms) => `${Math.max(0, Math.round(ms / 1000))}s`, ...zh } : { elapsed: (ms) => `${Math.max(0, Math.round(ms / 1000))}s` };
+};
 
 // conversationCopy(copy) merges the fallback copy table with the caller's
 // overrides; it used to run once per component per render, so long transcripts
 // rebuilt that object for every turn on every keystroke/stream chunk. The merged
 // table is immutable and `copy` identities are stable (i18n dict tables), so cache
 // the merge per source table (same WeakMap trick as ChatView's legacyMarkdownCache).
-const cachedConversationCopy = createWeakCache((copy) => ({ ...FALLBACK_COPY, ...copy }));
+const cachedConversationCopy = createWeakCache((copy) => ({ ...conversationFallbackCopy(), ...copy }));
 function conversationCopy(copy) {
   // Non-object keys never enter the WeakMap-backed cache (WeakMap contract).
-  if (!copy) return FALLBACK_COPY;
+  if (!copy) return conversationFallbackCopy();
   return cachedConversationCopy(copy);
 }
 
@@ -56,27 +81,21 @@ function conversationCopy(copy) {
 // guarantees a verbatim replay of the final full text.
 const STREAMING_MARKDOWN_THROTTLE_MS = 200;
 
+// Short conversations stay in normal document flow. The virtualizer only pays
+// for itself once history is large enough to create a material DOM and mount
+// cost; the running final turn remains outside the virtual history so streamed
+// height growth never waits for ResizeObserver before reaching the bottom.
+const CONVERSATION_ROW_ESTIMATE_PX = 240;
+const CONVERSATION_ROW_OVERSCAN = 5;
+const DEFAULT_CONVERSATION_ROW_GAP_PX = 16;
+
 // The 1s clock is scoped to the smallest display subtree: the per-second tick used to live on
 // ChatView top-level state, re-rendering the whole transcript every second while busy; now only
 // the component showing elapsed time owns the tick. On mount/activation it first syncs a baseline,
 // then starts the interval (same semantics as the old ChatView/CodexAcpView top-level ticker); no
 // timer is created while inactive, and it is cleaned up on unmount.
-// Exported for reuse by the ChatView composer activity indicator wrapper.
-/**
- * @param {boolean} active - whether the displayed duration is currently advancing
- * @returns {number} a timestamp that advances once per second while active
- */
-export function useConversationSecondClock(active) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync the clock baseline once on activation so elapsed time is correct immediately, before the first interval tick
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [active]);
-  return now;
-}
+// (Hook body lives in hooks/useConversationSecondClock.js, shared with the artifacts/monitor/
+// scheduled/chat tickers.)
 
 function localizedSemanticLabel(value, copy) {
   return {
@@ -91,7 +110,8 @@ function localizedSemanticLabel(value, copy) {
   }[value] || value;
 }
 
-export function ConversationMarkdown({ text, className = '', onOpenExternal, onOpenResource, streaming = false }) {
+export function ConversationMarkdown({ text, className = '', onOpenExternal, onOpenResource, streaming = false, copy }) {
+  const c = conversationCopy(copy);
   // lazy language registration bumps the version when it completes; the version must stay in the useMemo deps
   // (syntax-highlighter.js contract), otherwise already-rendered code stays plain text after registration completes.
   const syntaxVersion = useSyncExternalStore(subscribeSyntaxHighlight, getSyntaxHighlightVersion);
@@ -102,6 +122,27 @@ export function ConversationMarkdown({ text, className = '', onOpenExternal, onO
   const renderText = useThrottledValue(text, STREAMING_MARKDOWN_THROTTLE_MS, streaming);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- syntaxVersion is a version counter; any change requires recomputing to restore highlighting
   const html = useMemo(() => renderMarkdown(renderText), [renderText, syntaxVersion]);
+  const containerRef = useRef(null);
+  const copyLabels = useMemo(() => codeBlockCopyLabels(c), [c]);
+  // 渲染 HTML 经 dangerouslySetInnerHTML 注入,代码块复制按钮只能在提交后挂到 DOM;
+  // 流式期间 html 每次 throttle 都整体替换,ensureCodeCopyButtons 幂等补装新块。
+  // 但 innerHTML 可能在 effect 不重新触发的情况下被整体替换(冷启动语法高亮注册、
+  // Suspense/懒注册重提交等),仅靠 [html] 依赖会漏装,因此挂 MutationObserver 自愈:
+  // 容器内任何结构变化都幂等补装,卸载时断开。
+  useEffect(() => {
+    ensureCodeCopyButtons(containerRef.current, copyLabels);
+    // Wrap text streamed since the previous throttled render in one-shot fade
+    // spans; seen text never re-animates (offset bookkeeping in
+    // stream-fade.js). Runs before the observer below is (re)installed and the
+    // cleanup already disconnected the previous one, so the wrap's own
+    // mutations are not self-observed. `streaming` joins the deps because the
+    // completion flush may coincide with no html change (final text already
+    // rendered) and the streaming=false pass must still run to forget the
+    // fade bookkeeping. `html` lets the pass skip its whole-tree walk when
+    // this string is unchanged (React skipped the write, DOM is identical).
+    applyStreamFade(containerRef.current, { streaming, html });
+    return observeCodeCopyButtons(containerRef.current, copyLabels);
+  }, [html, copyLabels, streaming]);
   const openLink = (event) => {
     const anchor = event.target && event.target.closest && event.target.closest('a[href]');
     if (!anchor) return;
@@ -115,12 +156,22 @@ export function ConversationMarkdown({ text, className = '', onOpenExternal, onO
       if (resource && onOpenResource) onOpenResource(resource);
     }
   };
+  const onClick = (event) => {
+    const copyButton = findCodeCopyButton(event.target);
+    if (copyButton) {
+      event.preventDefault();
+      copyCodeBlockFromButton(copyButton, { labels: copyLabels });
+      return;
+    }
+    openLink(event);
+  };
   return (
     // biome-ignore lint/a11y/useKeyWithClickEvents: link-interception layer; the keyboard path is covered by the rendered <a>'s own focus
     // biome-ignore lint/a11y/noStaticElementInteractions: static rich-text container; onClick only intercepts links to open them externally
     <div
+      ref={containerRef}
       className={`codex-markdown conversation-markdown text-[15px] leading-7 ${className}`}
-      onClick={openLink}
+      onClick={onClick}
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
@@ -165,6 +216,16 @@ export function ConversationStatusBadge({ status, copy }) {
   );
 }
 
+// running turn 的等待判定(时间轴行与活动指示器共用同一口径):
+// turn 上的显式标记,或 permissions/elicitations 任一未决,都视为等待用户注意。
+function turnWaitingAttention(turn) {
+  const waitingPermission = turn.waitingPermission
+    || (turn.permissions || []).some(permission => !permission.resolved);
+  const waitingInput = turn.waitingInput
+    || (turn.elicitations || []).some(elicitation => !elicitation.resolved);
+  return { waitingPermission, waitingInput, waitingAttention: waitingPermission || waitingInput };
+}
+
 // Internal-only: the only consumer is LiveConversationActivityIndicator below.
 function ConversationActivityIndicator({
   turn,
@@ -178,11 +239,7 @@ function ConversationActivityIndicator({
   // eslint-disable-next-line react-hooks/purity -- elapsed time is a display value that naturally drifts over time; re-rendering is driven by the parent's polling of now
   const nowMs = now || Date.now();
   if (!turn || turn.status !== 'running') return null;
-  const waitingPermission = turn.waitingPermission
-    || (turn.permissions || []).some(permission => !permission.resolved);
-  const waitingInput = turn.waitingInput
-    || (turn.elicitations || []).some(elicitation => !elicitation.resolved);
-  const waitingAttention = waitingPermission || waitingInput;
+  const { waitingPermission, waitingInput, waitingAttention } = turnWaitingAttention(turn);
   const label = waitingPermission
     ? c.waitingPermission
     : waitingInput
@@ -246,6 +303,25 @@ function TerminalBlock({ label, text }) {
     <div className="mt-3 min-w-0 max-w-full">
       <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">{label}</div>
       <pre className="max-h-80 max-w-full overflow-auto whitespace-pre rounded-xl bg-[#F4F5F7] dark:bg-black/30 px-3 py-2.5 text-[12px] leading-5 font-mono text-gray-700 dark:text-gray-200">{text}</pre>
+    </div>
+  );
+}
+
+// search/fetch 工具卡片共用的原始输出折叠块:自带展开状态,文案走会话 copy。
+function RawOutputToggle({ rawOutput, copy }) {
+  const c = conversationCopy(copy);
+  const [rawOpen, setRawOpen] = useState(false);
+  if (!rawOutput) return null;
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={() => setRawOpen(value => !value)}
+        className="text-[10px] text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+      >
+        {rawOpen ? c.collapseRaw : c.viewRaw}
+      </button>
+      {rawOpen && <TerminalBlock label={c.rawData} text={rawOutput} />}
     </div>
   );
 }
@@ -337,7 +413,6 @@ function SearchToolItem({ item, now, onOpenExternal, copy }) {
   const details = searchToolDetails(tool);
   const state = terminalStatus(item.status);
   const [open, setOpen] = useState(false);
-  const [rawOpen, setRawOpen] = useState(false);
   const detailsId = useId();
   const duration = c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
   const query = details.query || tool.title || c.webContent;
@@ -393,18 +468,7 @@ function SearchToolItem({ item, now, onOpenExternal, copy }) {
           {details.compacted && (
             <div className="mt-2 text-[10px] text-gray-400">{c.resultSummaryOnly}</div>
           )}
-          {details.rawOutput && (
-            <div className="mt-2">
-              <button
-                type="button"
-                onClick={() => setRawOpen(value => !value)}
-                className="text-[10px] text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
-              >
-                {rawOpen ? c.collapseRaw : c.viewRaw}
-              </button>
-              {rawOpen && <TerminalBlock label={c.rawData} text={details.rawOutput} />}
-            </div>
-          )}
+          <RawOutputToggle rawOutput={details.rawOutput} copy={c} />
         </div>
       )}
     </div>
@@ -419,7 +483,6 @@ function FetchToolItem({ item, now, onOpenExternal, copy }) {
   const responseWarning = details.status != null && details.status >= 400;
   const visualState = responseWarning && state !== 'failed' ? 'warning' : state;
   const [open, setOpen] = useState(false);
-  const [rawOpen, setRawOpen] = useState(false);
   const detailsId = useId();
   const duration = c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
   const toolName = String(tool.name || '').trim() || 'fetch_url';
@@ -469,18 +532,7 @@ function FetchToolItem({ item, now, onOpenExternal, copy }) {
           {details.truncated && (
             <div className="mt-2 text-[10px] text-gray-400">{c.responseTruncated}</div>
           )}
-          {details.rawOutput && (
-            <div className="mt-2">
-              <button
-                type="button"
-                onClick={() => setRawOpen(value => !value)}
-                className="text-[10px] text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
-              >
-                {rawOpen ? c.collapseRaw : c.viewRaw}
-              </button>
-              {rawOpen && <TerminalBlock label={c.rawData} text={details.rawOutput} />}
-            </div>
-          )}
+          <RawOutputToggle rawOutput={details.rawOutput} copy={c} />
         </div>
       )}
     </div>
@@ -494,7 +546,7 @@ function WorkspaceResourceButtons({ resources, onOpenResource }) {
       {resources.map(resource => (
         <button type="button" key={resource.path} onClick={() => onOpenResource && onOpenResource(resource.path)}
           disabled={!onOpenResource} title={resource.path}
-          className="max-w-full truncate px-2 py-1 rounded-lg bg-blue-500/8 text-[10px] text-blue-600 dark:text-blue-300 font-mono enabled:hover:bg-blue-500/15 disabled:cursor-default">
+          className="max-w-full truncate px-2 py-1 rounded-lg bg-blue-500/[0.08] text-[10px] text-blue-700 dark:text-blue-300 font-mono enabled:hover:bg-blue-500/15 disabled:cursor-default">
           {resource.name}
         </button>
       ))}
@@ -736,7 +788,7 @@ function DefaultItem({
       />
     );
   }
-  if (['tool', 'command_execution', 'file_change'].includes(item.type)) {
+  if (isOperationItemType(item.type)) {
     return (
       <ToolItem
         item={item}
@@ -767,10 +819,10 @@ function DefaultItem({
     // while text can still grow, render through the throttle; when it ends, the full text is replayed verbatim.
     return commentary
       ? <ConversationMarkdown text={item.text} onOpenExternal={onOpenExternal} onOpenResource={onOpenResource}
-          streaming={item.status === 'in_progress'}
+          streaming={item.status === 'in_progress'} copy={copy}
           className="text-[13px] leading-6 text-gray-500 dark:text-gray-400" />
       : <ConversationMarkdown text={item.text} onOpenExternal={onOpenExternal} onOpenResource={onOpenResource}
-          streaming={item.status === 'in_progress'} />;
+          streaming={item.status === 'in_progress'} copy={copy} />;
   }
   return null;
 }
@@ -820,6 +872,17 @@ function isEqualConversationValue(left, right) {
   return true;
 }
 
+// Regenerate re-sends the raw turn text through editLastTurn, which has no
+// attachments surface: a turn carrying an attachment marker line would drop
+// its files and resend the marker as literal body text, and empty text has
+// nothing to re-send. Neither renders a retry control.
+function retryHandlerForTurn(onRetry, turn) {
+  const userText = String(turn.userText || '');
+  const retryable = typeof onRetry === 'function' && !!userText.trim()
+    && splitAttachmentLine(userText).attachments.length === 0;
+  return retryable ? () => onRetry(turn) : undefined;
+}
+
 /**
  * @param {Record<string, unknown>} prev - previous props
  * @param {Record<string, unknown>} next - next props
@@ -839,8 +902,30 @@ function areConversationTurnPropsEqual(prev, next) {
   return true;
 }
 
+// Aux-chat quote chips inside a user bubble (selected-text quoting).
+// Extracted from ConversationTurnView so the aux branch's conditionals do
+// not push the turn renderer over the cognitive-complexity cap.
+function ConversationUserQuotes({ quotes, hasBody }) {
+  if (!Array.isArray(quotes) || quotes.length === 0) return null;
+  return (
+    <div className={`flex flex-col gap-1.5 ${hasBody ? 'mb-2' : ''}`}>
+      {quotes.map((quote, index) => (
+        <div
+          key={`${index}-${String(quote.text || '').slice(0, 24)}`}
+          data-testid="conversation-user-quote"
+          className="rounded-lg border border-black/[0.06] bg-white/70 px-2.5 py-1.5 text-[12px] leading-5 text-gray-500 line-clamp-3 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-gray-400"
+        >
+          {String(quote.text || '')}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ConversationTurnView({
   turn,
+  virtualized = false,
+  onRetry,
   now,
   pendingByTool = EMPTY_PENDING_BY_TOOL,
   onRespond = noopOnRespond,
@@ -861,11 +946,7 @@ function ConversationTurnView({
   // internal clock drives elapsed time, re-rendering only this one turn subtree per second.
   const tickNow = useConversationSecondClock(running);
   const effectiveNow = now || tickNow;
-  const waitingPermission = turn.waitingPermission
-    || (turn.permissions || []).some(permission => !permission.resolved);
-  const waitingInput = turn.waitingInput
-    || (turn.elicitations || []).some(elicitation => !elicitation.resolved);
-  const waitingAttention = waitingPermission || waitingInput;
+  const { waitingPermission, waitingInput, waitingAttention } = turnWaitingAttention(turn);
   const duration = c.elapsed(elapsedMs(turn.startedAt, turn.completedAt, effectiveNow));
   const showTerminalDuration = Boolean(turn.startedAt && turn.completedAt);
   const presentation = turn.presentation || turn.items || [];
@@ -878,6 +959,11 @@ function ConversationTurnView({
       ? c.contextUsage(Number(turnUsage.used || 0).toLocaleString(), Number(turnUsage.size || 0).toLocaleString())
       : '';
   const userAttachments = Array.isArray(turn.userAttachments) ? turn.userAttachments : [];
+  // Aux-chat quote chips (selected-text quoting): turns projected by the aux panel carry
+  // the staged conversation excerpts in userQuotes with the inline
+  // userselect block already stripped. Main-chat projections never set the
+  // field, so this stays dead code for them.
+  const userQuotes = Array.isArray(turn.userQuotes) ? turn.userQuotes : [];
   const assistantAvailable = assistantResponseAvailable(turn);
   // Footer/visibility: a turn with no assistant content must not render an
   // avatar-only row. Live repro: a steered message sandwiched between two
@@ -888,12 +974,14 @@ function ConversationTurnView({
   const assistantFooterVisible = !running
     && (assistantAvailable || turn.lifecycleKnown || turn.completedAt || turn.error);
   const assistantRowVisible = running || presentation.length > 0 || assistantFooterVisible;
+  const retryHandler = retryHandlerForTurn(onRetry, turn);
   const userContent = renderUser && turn.userItem
     ? renderUser(turn.userItem, turn)
-    : (turn.userText || userAttachments.length)
+    : (turn.userText || userAttachments.length || userQuotes.length)
       ? (
           <div className="flex justify-end">
             <div className="max-w-[78%] rounded-[20px] rounded-br-md bg-[#E9EEF6] dark:bg-[#2A2B2E] px-4 py-3 text-[14px] leading-6 whitespace-pre-wrap break-words">
+              <ConversationUserQuotes quotes={userQuotes} hasBody={Boolean(turn.userText)} />
               {turn.userText && <div>{turn.userText}</div>}
               {userAttachments.length > 0 && (
                 <div className={`flex flex-wrap gap-1.5 ${turn.userText ? 'mt-2' : ''}`}>
@@ -914,7 +1002,11 @@ function ConversationTurnView({
       : null;
 
   return (
-    <section className="space-y-4" data-conversation-turn={turn.id} style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 600px' }}>
+    <section
+      className="space-y-4"
+      data-conversation-turn={turn.id}
+      style={virtualized ? undefined : { contentVisibility: 'auto', containIntrinsicSize: 'auto 600px' }}
+    >
       {userContent}
       {assistantRowVisible && (
       <div className="flex items-start gap-3">
@@ -954,7 +1046,11 @@ function ConversationTurnView({
           })}
           {assistantFooterVisible && <AssistantMessageFooter>
             {assistantAvailable && (
-              <AssistantMessageActions resolveText={() => assistantResponseText(turn)} copy={c} />
+              <AssistantMessageActions
+                resolveText={() => assistantResponseText(turn)}
+                copy={c}
+                onRetry={retryHandler}
+              />
             )}
             {(turn.lifecycleKnown || turn.completedAt || turn.error) && <>
               <ConversationStatusBadge status={turn.status} copy={c} />
@@ -1001,10 +1097,252 @@ function ConversationTurnView({
 // pollute the inference in reverse.
 export const ConversationTurn = React.memo(ConversationTurnView, areConversationTurnPropsEqual);
 
-export function ConversationTimeline({ turns = EMPTY_TURNS, ...props }) {
+/**
+ * @param {HTMLElement | null} timelineElement - the virtual timeline container
+ * @param {HTMLElement | null} scrollElement - the caller-owned scroll viewport
+ * @returns {number} the timeline's offset from the top of the scroll content
+ */
+function conversationTimelineScrollMargin(timelineElement, scrollElement) {
+  if (!timelineElement || !scrollElement) return 0;
+  const timelineRect = timelineElement.getBoundingClientRect();
+  const scrollRect = scrollElement.getBoundingClientRect();
+  return Math.max(0, timelineRect.top - scrollRect.top + scrollElement.scrollTop);
+}
+
+// `sessionId` only scopes virtual row keys and re-measurement; it is not a
+// ConversationTurn prop. `scrollElementRef` opts a caller into virtualization,
+// `followOutputRef` is the caller's "stick to bottom" flag, and
+// `renderBeforeTurn` renders boundary chrome (e.g. rewind chips) inside the
+// same row as the turn it precedes so measurement stays consistent.
+export function ConversationTimeline({
+  turns = EMPTY_TURNS,
+  sessionId,
+  scrollElementRef,
+  busy = false,
+  turnGapPx = DEFAULT_CONVERSATION_ROW_GAP_PX,
+  followOutputRef,
+  renderBeforeTurn,
+  ...props
+}) {
+  "use no memo";
+  const virtualized = shouldVirtualizeConversationTurns(
+    turns.length,
+    scrollElementRef,
+    CONVERSATION_VIRTUALIZATION_THRESHOLD,
+  );
+  const { historyTurns, liveTurn, liveTurnIndex } = useMemo(
+    () => splitConversationLiveTail(turns, virtualized, busy),
+    [busy, turns, virtualized],
+  );
+  const liveTailElementRef = useRef(null);
+  const measuredLiveTailRef = useRef({ key: '', height: 0 });
+  const timelineRef = useRef(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const conversationKey = sessionId || turns[0]?.id || 'conversation';
+  const getScrollElement = useCallback(
+    () => scrollElementRef?.current || null,
+    [scrollElementRef],
+  );
+  const getItemKey = useCallback(
+    /** @param {number} index - virtual history row index */
+    index => `${conversationKey}:${historyTurns[index]?.id || index}`,
+    [conversationKey, historyTurns],
+  );
+  const estimateRowSize = useCallback(
+    /** @param {number} index - virtual history row index */
+    index => {
+      const measured = measuredLiveTailRef.current;
+      return measured.key === getItemKey(index) ? measured.height : CONVERSATION_ROW_ESTIMATE_PX;
+    },
+    [getItemKey],
+  );
+  // TanStack Virtual owns row memoization and measurement; the "use no memo"
+  // directive above keeps React Compiler from compiling this timeline.
+  // eslint-disable-next-line react-hooks/incompatible-library -- see the note above
+  const virtualizer = useVirtualizer({
+    enabled: virtualized,
+    count: virtualized ? historyTurns.length : 0,
+    getScrollElement,
+    getItemKey,
+    estimateSize: estimateRowSize,
+    overscan: CONVERSATION_ROW_OVERSCAN,
+    scrollMargin,
+    gap: turnGapPx,
+    // Core writes this offset back to the scroll element whenever the
+    // threshold flip attaches it to an already-scrolled viewport (and again
+    // on every re-crossing, because a disabled instance forgets its offset).
+    // The default 0 would teleport a mid-history reader to the top.
+    initialOffset: () => getScrollElement()?.scrollTop ?? 0,
+  });
+
+  // The live tail and its later history row share one React key, so when the
+  // running turn completes React keeps the same DOM element and subtree. Its
+  // last measured height seeds the row estimate to avoid a scroll jump.
+  const liveTailKey = liveTurn ? `${conversationKey}:${liveTurn.id || liveTurnIndex}` : '';
+  useLayoutEffect(() => {
+    if (!virtualized || !liveTailKey) return;
+    const element = liveTailElementRef.current;
+    if (!element) return;
+    const rememberSize = () => {
+      const height = element.getBoundingClientRect().height;
+      if (height > 0) measuredLiveTailRef.current = { key: liveTailKey, height };
+    };
+    rememberSize();
+    const observer = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(rememberSize)
+      : null;
+    observer?.observe(element);
+    return () => observer?.disconnect();
+  }, [liveTailKey, virtualized]);
+
+  useLayoutEffect(() => {
+    if (!virtualized) return;
+    const scrollElement = getScrollElement();
+    const timelineElement = timelineRef.current;
+    if (!scrollElement || !timelineElement) return;
+    const refreshScrollMargin = () => {
+      const nextMargin = conversationTimelineScrollMargin(timelineElement, scrollElement);
+      setScrollMargin(current => Math.abs(current - nextMargin) < 0.5 ? current : nextMargin);
+    };
+    refreshScrollMargin();
+    const viewportObserver = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(refreshScrollMargin)
+      : null;
+    const layoutObserver = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(refreshScrollMargin)
+      : null;
+    viewportObserver?.observe(scrollElement);
+    if (timelineElement.parentElement) layoutObserver?.observe(timelineElement.parentElement);
+    window.addEventListener('resize', refreshScrollMargin);
+    return () => {
+      viewportObserver?.disconnect();
+      layoutObserver?.disconnect();
+      window.removeEventListener('resize', refreshScrollMargin);
+    };
+  }, [getScrollElement, sessionId, virtualized, virtualizer]);
+
+  useLayoutEffect(() => {
+    if (!virtualized) return;
+    const scrollElement = getScrollElement();
+    if (!scrollElement || followOutputRef?.current !== true) return;
+    // A long session initially has estimated rows only. Re-stick during the first two layout
+    // frames while the bottom range mounts and is measured; otherwise the first estimated
+    // scrollHeight can expose the middle of the transcript before the caller's follower runs.
+    let firstFrame = 0;
+    let secondFrame = 0;
+    const stickToBottom = () => {
+      if (followOutputRef?.current !== true) return false;
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+      return true;
+    };
+    stickToBottom();
+    firstFrame = window.requestAnimationFrame(() => {
+      if (!stickToBottom()) return;
+      secondFrame = window.requestAnimationFrame(() => {
+        stickToBottom();
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+    };
+  }, [followOutputRef, getScrollElement, historyTurns.length, sessionId, virtualized]);
+
+  // Switching conversations reuses the virtualizer instance while row keys are
+  // sessionId-prefixed, so measured sizes from the previous conversation would
+  // otherwise linger in the size cache for the view's lifetime. Dropping them
+  // per conversation keeps the cache bounded; correctness is unaffected either
+  // way because keys from different sessions never collide.
+  useLayoutEffect(() => {
+    virtualizer.measure();
+  }, [conversationKey, virtualizer]);
+
+  if (!virtualized) {
+    return (
+      <>
+        {turns.map((turn, index) => (
+          <React.Fragment key={turn.id}>
+            {renderBeforeTurn?.(turn, index)}
+            {/* Regenerate targets the newest turn only, so older turns never render a retry control. */}
+            <ConversationTurn
+              turn={turn}
+              {...props}
+              virtualized={false}
+              onRetry={index === turns.length - 1 ? props.onRetry : undefined}
+            />
+          </React.Fragment>
+        ))}
+      </>
+    );
+  }
+
+  const virtualRows = virtualizer.getVirtualItems();
+  const renderedRows = virtualRows.map(virtualRow => {
+    const turn = historyTurns[virtualRow.index];
+    if (!turn) return null;
+    const beforeTurn = renderBeforeTurn?.(turn, virtualRow.index);
+    return (
+      <div
+        key={virtualRow.key}
+        ref={virtualizer.measureElement}
+        data-index={virtualRow.index}
+        data-conversation-virtual-row=""
+        data-conversation-virtual-start={virtualRow.start}
+        data-conversation-virtual-size={virtualRow.size}
+        className={`absolute left-0 top-0 w-full ${beforeTurn ? 'flex flex-col' : ''}`}
+        style={{
+          gap: beforeTurn ? `${turnGapPx}px` : undefined,
+          transform: `translateY(${virtualRow.start - scrollMargin}px)`,
+        }}
+      >
+        {beforeTurn}
+        <ConversationTurn
+          turn={turn}
+          {...props}
+          virtualized
+          onRetry={virtualRow.index === turns.length - 1 ? props.onRetry : undefined}
+        />
+      </div>
+    );
+  });
+  if (liveTurn) {
+    renderedRows.push(
+      <div
+        key={liveTailKey}
+        ref={liveTailElementRef}
+        data-conversation-live-tail=""
+        className={renderBeforeTurn ? 'flex flex-col' : ''}
+        style={{
+          gap: renderBeforeTurn ? `${turnGapPx}px` : undefined,
+          marginTop: historyTurns.length ? `${turnGapPx}px` : undefined,
+        }}
+      >
+        {renderBeforeTurn?.(liveTurn, liveTurnIndex)}
+        <ConversationTurn
+          turn={liveTurn}
+          {...props}
+          virtualized
+          onRetry={liveTurnIndex === turns.length - 1 ? props.onRetry : undefined}
+        />
+      </div>,
+    );
+  }
   return (
-    <>
-      {turns.map(turn => <ConversationTurn key={turn.id} turn={turn} {...props} />)}
-    </>
+    <div
+      ref={timelineRef}
+      data-conversation-virtual-timeline=""
+      data-conversation-virtual-row-count={virtualRows.length}
+      data-conversation-scroll-margin={scrollMargin}
+      className="relative w-full"
+      style={{ overflowAnchor: 'none' }}
+    >
+      <div
+        data-conversation-virtual-history=""
+        aria-hidden="true"
+        className="w-full"
+        style={{ height: `${virtualizer.getTotalSize()}px` }}
+      />
+      {renderedRows}
+    </div>
   );
 }

@@ -30,6 +30,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
+use crate::features::assistant::engine_pool::TURN_GATE_AWAIT_TIMEOUT;
+use crate::features::assistant::engine_pool::turn_tool_restrict::TurnToolRestrict;
 pub(crate) use crate::features::assistant::engine_support::EngineTurnSignal;
 use crate::features::assistant::engine_support::{
     TurnCompletionTracker, apply_scheduled_turn_policy, maybe_notify_task_completed,
@@ -38,7 +40,7 @@ use crate::features::assistant::engine_support::{
 use crate::features::assistant::expert_roster::{
     ExpertRosterSnapshot, cleanup_legacy_expert_projection,
 };
-use crate::features::assistant::platform::bridge::Pinvou3Bridge;
+use crate::features::assistant::platform::bridge::{Pinvou3Bridge, persisted_provider_route};
 use crate::features::assistant::turn_shell_tasks::TurnShellTaskRegistry;
 use crate::features::sessions::{
     ChatEngineState, ScheduledEngineState, ScheduledRunProfile, ScheduledTokenAccounting,
@@ -70,9 +72,12 @@ pub struct AppEngine {
     multi_agent_enabled: bool,
     pub(crate) turn_events: broadcast::Sender<EngineTurnSignal>,
     pub(crate) scheduled_unattended: Arc<AtomicBool>,
+    pub(crate) scheduled_run_engine: bool,
     turn_lifecycle: Arc<TurnLifecycle>,
     turn_shell_tasks: Option<TurnShellTaskRegistry>,
     scheduled_disallowed_tools: Vec<String>,
+    /// Reclaim retires queued transcript writers before aborting the forwarder.
+    pub(crate) transcript_writer_active: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -1515,6 +1520,33 @@ impl TurnLifecycle {
     }
 }
 
+/// Joins a side-effect `spawn_blocking` task under a budget and detaches it
+/// on timeout (the dropped join handle lets it finish in the background).
+/// Returns `None` when the task outlived `budget`. Used for the reclaimed
+/// turn's fallback persistence (issue #525): reclaim runs inside the session
+/// turn gate, and a disk-stalled save must not extend the gate hold — the
+/// same reasoning as #483's shell-reclaim finalize bound. The caller presets
+/// the terminal to `Failed` on `None`: an unverified persistence must not be
+/// reported as clean, even though the detached save can still land later.
+/// This is the single bounded-join core of the assistant lane: the pool's
+/// [`crate::features::assistant::engine_pool::bounded_join_while_holding_turn_gate`]
+/// is a thin adapter over it.
+pub(super) async fn bounded_join_detached_on_timeout<T>(
+    what: &str,
+    budget: std::time::Duration,
+    task: tokio::task::JoinHandle<T>,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    match tokio::time::timeout(budget, task).await {
+        Ok(joined) => Some(joined),
+        Err(_) => {
+            eprintln!(
+                "[pinvou3-app] {what} did not settle within {budget:?}; letting it finish in the background (issue #525)"
+            );
+            None
+        }
+    }
+}
+
 async fn finish_reclaimed_lifecycle_turn(
     lifecycle: &TurnLifecycle,
     app: &AppHandle,
@@ -1531,17 +1563,22 @@ async fn finish_reclaimed_lifecycle_turn(
     if let Some(fallback) = transition.fallback.filter(|_| !operation_rejected) {
         let store_for_save = store.clone();
         let session_for_save = session_id.to_string();
-        let saved = tokio::task::spawn_blocking(move || {
+        let persistence = tokio::task::spawn_blocking(move || {
             store_for_save.persist_admitted_chat_display(
                 &session_for_save,
                 &fallback.baseline_revision,
                 fallback.display_message,
                 fallback.operation == TranscriptOperation::EditLast,
             )
-        })
+        });
+        let saved = bounded_join_detached_on_timeout(
+            "reclaimed transcript persistence",
+            TURN_GATE_AWAIT_TIMEOUT,
+            persistence,
+        )
         .await;
         match saved {
-            Ok(Ok(saved)) => match transcript_revision(&saved.messages) {
+            Some(Ok(Ok(saved))) => match transcript_revision(&saved.messages) {
                 Ok(revision) => {
                     emit_transcript_committed(
                         app,
@@ -1558,16 +1595,26 @@ async fn finish_reclaimed_lifecycle_turn(
                     ));
                 }
             },
-            Ok(Err(save_error)) => {
+            Some(Ok(Err(save_error))) => {
                 terminal_status = TurnOutcomeStatus::Failed;
                 terminal_error = Some(format!(
                     "Reclaimed transcript persistence failed: {save_error:#}"
                 ));
             }
-            Err(join_error) => {
+            Some(Err(join_error)) => {
                 terminal_status = TurnOutcomeStatus::Failed;
                 terminal_error = Some(format!(
                     "Reclaimed transcript persistence task failed: {join_error}"
+                ));
+            }
+            None => {
+                // The detached save may still land later, but the emitted
+                // terminal must not claim a persistence it did not see
+                // settle — the honest preset is Failed, mirroring the
+                // conservative cleanup_failed preset of the shell reclaim.
+                terminal_status = TurnOutcomeStatus::Failed;
+                terminal_error = Some(format!(
+                    "Reclaimed transcript persistence timed out after {TURN_GATE_AWAIT_TIMEOUT:?}"
                 ));
             }
         }
@@ -1600,6 +1647,79 @@ async fn finish_reclaimed_lifecycle_turn(
     Some(transition.terminal)
 }
 
+/// Bounds the reserved-submit op send (issue #525, the submit-side residual
+/// of #255/#483): the caller holds the session turn gate across this send,
+/// and a wedged engine (ops channel full, never drained) never grants it
+/// capacity — one in-flight submit would then wedge evict/delete behind the
+/// same gate, the exact hole #483 closed on the cancel side. On timeout the
+/// send future is dropped, which fails the reservation cleanly through its
+/// `Drop` (rolling back the prepared transcript rule) and lets the prepared
+/// shell scope abandon itself; the gate stays responsive for
+/// evict/delete/reclaim. A timed-out send was never enqueued (tokio's
+/// bounded `reserve`/`send` is cancel-safe), so the turn verifiably never
+/// started and the surfaced failure is truthful.
+async fn bounded_reserved_submit_send<Fut>(send: Fut) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(TURN_GATE_AWAIT_TIMEOUT, send).await {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!(
+                "[pinvou3-app] reserved turn submit did not settle within {TURN_GATE_AWAIT_TIMEOUT:?}; the engine may be wedged - failing the turn instead of holding the gate (issue #525)"
+            );
+            anyhow::bail!(
+                "the engine did not accept the submitted turn within {TURN_GATE_AWAIT_TIMEOUT:?}; the turn was not started, please retry"
+            );
+        }
+    }
+}
+
+/// Tools denied on an unattended scheduled-run turn (evals never receive
+/// this list — they are bounded by the EvalTurnPolicy allowlist instead).
+/// One automation run owns exactly one engine turn; goal tools can
+/// enqueue autonomous continuation turns after TurnComplete, and the
+/// scheduled-task write tools would let the run mutate the task family
+/// recursively (review R4-M1). This channel — not the typed Ask rules — is
+/// the deterministic recursion shield: the engine consults ask rules for
+/// `exec_shell` and the file tools only, and mutating MCP tools resolve to
+/// silent Allow under the current full-auto approval (contract §9). Applied
+/// only to the unattended turn; a later interactive continuation gets a
+/// fresh engine with the ordinary catalog.
+pub(crate) fn unattended_disallowed_tools(disallowed: &[String]) -> Vec<String> {
+    let mut list = disallowed.to_vec();
+    for tool in [
+        "create_goal",
+        "update_goal",
+        crate::features::assistant::platform::bridge::SCHEDULED_TASK_CREATE_TOOL,
+        crate::features::assistant::platform::bridge::SCHEDULED_TASK_UPDATE_TOOL,
+        crate::features::assistant::platform::bridge::SCHEDULED_TASK_DELETE_TOOL,
+        // Round-9 M2(a) (#628): the send tool is the messaging-indirection
+        // bypass — an unattended run injecting a turn into ANY plain session
+        // gives that turn the ordinary catalog (the shield does not cross
+        // sessions), and its from_session is optional/unauthenticated, so
+        // the target-side layers never see an unattended sender. An
+        // unattended run has no business starting turns elsewhere.
+        crate::features::assistant::platform::bridge::MESSAGING_SEND_TOOL,
+        // Round-30 REQUIRED-2 (#628): the registry launchers are a THIRD
+        // unattended channel — both ride the app allowlist (sched- engines
+        // keep it), auto-approval Allows them, and the foundation's
+        // full-access hold list names only start_mcp_server, so
+        // start_registry_mcp_server launched a user-cached registry
+        // candidate whose mcp_<name>_* tools joined the SAME turn under
+        // identities this name-keyed shield cannot see. The deny list is
+        // the PR's own mechanism; the hold-list addition is tracked
+        // upstream per the fork boundary.
+        "registry_sync",
+        "start_registry_mcp_server",
+    ] {
+        if !list.iter().any(|blocked| blocked == tool) {
+            list.push(tool.to_string());
+        }
+    }
+    list
+}
+
 impl AppEngine {
     /// 为指定 session spawn 一个**独立** engine:绑定该 session 专属的 workspace +
     /// instructions(spawn 时由 [`build_engine_config_for_session`] 固化进 config,
@@ -1622,6 +1742,7 @@ impl AppEngine {
         shell_manager: SharedShellManager,
         turn_shell_tasks: TurnShellTaskRegistry,
         steer_id_generation: u64,
+        scheduled_unattended_spawn: bool,
     ) -> Result<(Self, tauri::async_runtime::JoinHandle<()>)> {
         // Instructions 走 Inline，不写入远端工作区。所有会话共享产品工具面；
         // 子智能体仍由 CodeWhale 的通用角色与运行时策略进一步收窄。
@@ -1691,6 +1812,9 @@ impl AppEngine {
             }
             None => bridge.build_engine_config_for_session_roots(session_id, roots),
         };
+        if scheduled_unattended_spawn {
+            engine_config.subagents_enabled = false;
+        }
         engine_config.runtime_services.shell_manager = Some(shell_manager.clone());
         // Agentic RAG:给该 session 的 engine 注入 kb_search + kb_open_source(都持
         // session_id,execute 时只访问该会话挂载的知识集)。工具常驻所有会话,挂没挂集由
@@ -1702,19 +1826,10 @@ impl AppEngine {
         //
         // 该列表来自 compute_disallowed_tools；多智能体会话不改写它，
         // 工具面与普通会话保持一致。
-        let mut scheduled_disallowed_tools = disallowed.clone();
-        // One automation run owns exactly one engine turn. Goal tools can
-        // enqueue autonomous continuation turns after TurnComplete. Apply this
-        // list only to the unattended turn; a later interactive continuation
-        // gets a fresh engine with the ordinary catalog.
-        for tool in ["create_goal", "update_goal"] {
-            if !scheduled_disallowed_tools
-                .iter()
-                .any(|blocked| blocked == tool)
-            {
-                scheduled_disallowed_tools.push(tool.to_string());
-            }
-        }
+        // One automation run owns exactly one engine turn. Apply the
+        // unattended deny list only to that turn; a later interactive
+        // continuation gets a fresh engine with the ordinary catalog.
+        let scheduled_disallowed_tools = unattended_disallowed_tools(&disallowed);
         engine_config.disallowed_tools = if disallowed.is_empty() {
             None
         } else {
@@ -1734,8 +1849,40 @@ impl AppEngine {
 
         let workspace = engine_config.workspace.clone();
         let handle = spawn_engine(engine_config, &dt_config);
+        // Record the provider route this spawn resolved onto the session
+        // record. These two fields are not wire-inert diagnostics: the
+        // foundation's CLI resume path (`resolve_exec_resume_route`) reads
+        // them when no `--provider` is passed, so this stamp is what keeps a
+        // later resume on the route the spawn actually rode. The foundation's
+        // create path stamps the engine default ("deepseek") into every new
+        // record, which misleads diagnosis when the session rides another
+        // vendor's route. The canonical (kind, exact id) pair comes from
+        // `persisted_provider_route` (kind resolved via `dt_config`) so the
+        // record stays resolvable by the foundation's fail-closed identity
+        // resolver even when a shared-home CLI record already carries an
+        // exact id naming the previous route. Fail-soft by contract: a stamp
+        // failure must never break or abort the spawn.
+        if let Some(provider) = dt_config
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+        {
+            let (kind, provider_id) = persisted_provider_route(&dt_config, provider);
+            if let Err(error) =
+                store.stamp_resolved_provider(session_id, &kind, provider_id.as_deref())
+            {
+                // eprintln, not log: the headless host installs no logger, so
+                // stderr is this file's diagnostic channel (the dominant
+                // existing pattern here).
+                eprintln!(
+                    "[pinvou3-app] session {session_id} resolved-provider stamp failed: {error:#}"
+                );
+            }
+        }
         let (turn_events, _) = broadcast::channel(32);
         let scheduled_unattended = Arc::new(AtomicBool::new(false));
+        let transcript_writer_active = Arc::new(AtomicBool::new(true));
         let forwarder = spawn_event_forwarder(
             app,
             handle.clone(),
@@ -1751,6 +1898,7 @@ impl AppEngine {
             shell_manager,
             turn_shell_tasks.clone(),
             steer_id_generation,
+            transcript_writer_active.clone(),
         );
 
         Ok((
@@ -1762,9 +1910,11 @@ impl AppEngine {
                 multi_agent_enabled,
                 turn_events,
                 scheduled_unattended,
+                scheduled_run_engine: scheduled_unattended_spawn,
                 turn_lifecycle,
                 turn_shell_tasks: Some(turn_shell_tasks),
                 scheduled_disallowed_tools,
+                transcript_writer_active,
             },
             forwarder,
         ))
@@ -1805,50 +1955,98 @@ impl AppEngine {
             multi_agent_enabled: false,
             turn_events,
             scheduled_unattended: Arc::new(AtomicBool::new(false)),
+            scheduled_run_engine: false,
             turn_lifecycle: Arc::new(TurnLifecycle::default()),
             turn_shell_tasks: None,
             scheduled_disallowed_tools,
+            transcript_writer_active: Arc::new(AtomicBool::new(true)),
         })
     }
 
-    /// 发用户消息给 Engine。Engine 内部自管 session，多轮自然累积。
+    /// Turn submission for headless harnesses (L1 integration harness, live
+    /// tests). Mirrors the production path: reserve the turn slot first, then
+    /// submit through `Self::send_reserved_user_message`, the same shape as
+    /// `EnginePool::send_user_message`. Production session turns call the
+    /// reservation API through `EnginePool` instead; the reservation types are
+    /// `pub(crate)`, so the integration-test process goes through this wrapper.
+    /// No `#[cfg(test)]`: integration tests link this library as an external
+    /// crate and cannot see `cfg(test)` items.
     ///
-    /// `mode` + `phase` 由 commands::chat 从 SessionStore 取当前 session 的
-    /// mode_state，注入 Op::SendMessage。底座按 mode 自动切工具白名单 + sandbox。
-    /// M1 弱模型加固:bridge 按 phase 在 user content 前 prepend `<system-reminder>`。
-    pub async fn send_user_message(
+    /// `mode` is supplied by the caller from the session's mode_state in the
+    /// SessionStore and injected into `Op::SendMessage`; the base switches the
+    /// tool allowlist + sandbox by mode, and the bridge prepends the
+    /// multi-agent `<system-reminder>` envelope to the user content (M1
+    /// weak-model hardening).
+    #[allow(dead_code)] // headless harnesses are the only callers; no production caller
+    pub async fn send_headless_user_message(
         &self,
         content: String,
         mode: AppMode,
         persona_reminder: Option<String>,
         restrict_tools: bool,
     ) -> Result<()> {
+        let reservation = self.turn_lifecycle.reserve()?;
         let expert_snapshot = self.multi_agent_enabled.then(ExpertRosterSnapshot::capture);
-        let op = self.build_interactive_send_message_op(
-            content,
-            mode,
-            persona_reminder,
+        // 候选行必须与快照同源（同一次 capture 产出），对齐
+        // commands::multiagent::prepare_delegation_turn 的计算；
+        // 带快照却传空候选会让该轮静默退化为名册兜底提示。注意：这里的
+        // 匹配输入是 `content` 本身——生产路径用 `MatchSource` 把「匹配看
+        // 原文、发送看组装稿」钉成编译期约束，本测试入口没有那层类型
+        // 保护，调用方必须传用户原文，传组装稿会复现「注入文本抬升无关
+        // 专家卡得分」的旧缺陷。
+        let expert_candidates = expert_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.available_role_lines(&content))
+            .unwrap_or_default();
+        // The per-turn restriction crosses this seam as the pool's
+        // `TurnToolRestrict` token, not the caller's `bool` (main #596 added
+        // this wrapper against the pre-token signature; the rebase union
+        // adapted it). Minting here keeps the wrapper's public `bool`
+        // signature for the external harnesses while the last-mile policy —
+        // and the aux scoped-tool reminder merge, a no-op for headless ids —
+        // stays in the one place it is enforced.
+        super::engine_pool::forward_forced_turn_restrict(
+            &self.session_id,
+            false,
             restrict_tools,
-            expert_snapshot,
-        )?;
-        self.send_turn_op(op).await
+            persona_reminder,
+            |restrict_tools, persona_reminder| {
+                self.send_reserved_user_message(
+                    content,
+                    mode,
+                    persona_reminder,
+                    restrict_tools,
+                    expert_snapshot,
+                    expert_candidates,
+                    reservation,
+                )
+            },
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_reserved_user_message(
         &self,
         content: String,
         mode: AppMode,
         persona_reminder: Option<String>,
-        restrict_tools: bool,
+        // Proof token, not the caller's `bool`: only the pool's policy
+        // (`turn_restrict_tools`) can mint it (PR #433 review S2(b)). The value
+        // is re-checked against THIS engine's session id, so a bogus token can
+        // never un-restrict an aux session.
+        restrict_tools: TurnToolRestrict,
         expert_snapshot: Option<std::sync::Arc<ExpertRosterSnapshot>>,
+        expert_candidates: Vec<String>,
         reservation: TurnReservation,
     ) -> Result<()> {
         let op = self.build_interactive_send_message_op(
             content,
             mode,
             persona_reminder,
-            restrict_tools,
+            restrict_tools.restricts_tools_for(&self.session_id),
             expert_snapshot,
+            expert_candidates,
         )?;
         self.send_reserved_turn_op(op, reservation).await
     }
@@ -1873,6 +2071,7 @@ impl AppEngine {
         persona_reminder: Option<String>,
         restrict_tools: bool,
         expert_snapshot: Option<std::sync::Arc<ExpertRosterSnapshot>>,
+        expert_candidates: Vec<String>,
     ) -> Result<Op> {
         if self.multi_agent_enabled {
             let snapshot = expert_snapshot
@@ -1886,11 +2085,15 @@ impl AppEngine {
                 restrict_tools,
                 &self.workspace,
                 snapshot,
+                &expert_candidates,
             )
         } else {
-            if expert_snapshot.is_some() {
-                anyhow::bail!("ordinary turn must not carry a multi-agent expert snapshot");
-            }
+            // 普通会话不吃候选行：候选只随多智能体快照同源产生。误传与快照
+            // 误传同等对待（hard-error），保持消息与普通对话逐字一致的不变式。
+            validate_ordinary_turn_has_no_expert_material(
+                expert_snapshot.is_some(),
+                expert_candidates.len(),
+            )?;
             self.bridge.build_send_message_op(
                 &self.session_id,
                 content,
@@ -2038,7 +2241,7 @@ impl AppEngine {
             ),
             None => None,
         };
-        match self.handle.send(op).await {
+        match bounded_reserved_submit_send(self.handle.send(op)).await {
             Ok(()) => {
                 if let Some(scope) = shell_scope {
                     scope.commit();
@@ -2165,18 +2368,53 @@ impl AppEngine {
     /// `{{PINVOU3_WORKSPACE}}` 占位符。原先 sync 时重写 disk + 传 SystemPrompt::Text
     /// 都是 disk-API-限制的副作用,现在彻底走掉。
     pub async fn sync_session(&self, session_id: String, messages: Vec<Message>) -> Result<()> {
-        self.handle
-            .send(Op::SyncSession {
-                session_id: Some(session_id),
-                messages,
-                system_prompt: None,
-                system_prompt_override: false,
-                model: self.bridge.model(),
-                workspace: self.workspace.clone(),
-                mode: AppMode::Agent,
-            })
-            .await?;
+        // Round-31 minor 9: aux exclusion parity with the spawn lane's pin
+        // (bridge.rs) — a stray aux-id snapshot must not reach a live aux
+        // engine through the hydration/align push either; all in-repo
+        // writers are aux-guarded, this is the backstop the bridge comment
+        // has claimed all along.
+        let roots = if crate::features::sessions::is_aux_session_id(&session_id) {
+            Vec::new()
+        } else {
+            self.bridge.session_workspace_roots(&session_id)
+        };
+        let op = Self::sync_session_op(
+            &session_id,
+            messages,
+            self.bridge.model(),
+            self.workspace.clone(),
+            // Restore-path keychain backfill (§6): the full roots locked at
+            // creation are not lost across session restarts; no snapshot
+            // (legacy/temporary sessions) = empty = single root, the base normalizes by cwd.
+            roots,
+        );
+        self.handle.send(op).await?;
         Ok(())
+    }
+
+    /// Payload construction for `sync_session` (review #484 round-13 M4 extracted
+    /// & pinned): the only channel by which the keychain backfill enters the base —
+    /// deleting/altering field names, serde shapes, or the backfill behavior fails
+    /// compilation or turns tests red. EngineHandle is not constructible across
+    /// crates, so pin at the payload layer; call sites pass the bridge-resolved
+    /// snapshot through unchanged.
+    pub(crate) fn sync_session_op(
+        session_id: &str,
+        messages: Vec<Message>,
+        model: String,
+        workspace: std::path::PathBuf,
+        workspace_roots: Vec<std::path::PathBuf>,
+    ) -> Op {
+        Op::SyncSession {
+            session_id: Some(session_id.to_string()),
+            messages,
+            system_prompt: None,
+            system_prompt_override: false,
+            model,
+            workspace,
+            workspace_roots,
+            mode: AppMode::Agent,
+        }
     }
 }
 
@@ -3173,10 +3411,9 @@ mod turn_lifecycle_tests {
     }
 
     #[test]
-    fn concurrent_rejection_happens_before_one_shot_state_is_consumed() {
+    fn concurrent_rejection_happens_before_admission_is_consumed() {
         let lifecycle = Arc::new(TurnLifecycle::default());
         let first = lifecycle.reserve().expect("first admission");
-        let mut one_shot = Some("skill body".to_string());
 
         let rejected = lifecycle.reserve();
         assert!(
@@ -3184,10 +3421,7 @@ mod turn_lifecycle_tests {
                 .as_ref()
                 .is_err_and(|error| error.to_string().contains("session_turn_in_progress"))
         );
-        assert_eq!(one_shot.as_deref(), Some("skill body"));
 
-        let consumed_after_admission = one_shot.take();
-        assert_eq!(consumed_after_admission.as_deref(), Some("skill body"));
         drop(first);
         assert!(lifecycle.reserve().is_ok(), "drop restores admission");
     }
@@ -3857,7 +4091,7 @@ mod live_tests {
     use crate::features::sessions::SerializableMode;
     use crate::platform::test_support::EnvRestore;
 
-    // RAII 恢复 env 原值的要求（本模块 #[ignore] 真机测试写 DEEPSEEK_*/PINVOU3_*
+    // RAII 恢复 env 原值的要求（本模块 #[ignore] 真机测试写 DEEPSEEK_*
     // env,须保证退出时恢复——含 panic 路径,避免 `cargo test -- --ignored` 合跑时
     // 污染）由 `platform::test_support::EnvRestore` 承担（快照为 OsString，
     // 恢复语义与原 String 版一致），与 engine_pool / multiagent 回归测试共用。
@@ -3873,23 +4107,18 @@ mod live_tests {
     #[ignore]
     #[tokio::test]
     async fn self_metrics_populates_from_real_turn() {
-        // 写 DEEPSEEK_*/PINVOU3_* env:虽 #[ignore] 不入默认套件,仍须持 crate 级
+        // 写 DEEPSEEK_* env:虽 #[ignore] 不入默认套件,仍须持 crate 级
         // ENV_LOCK 串行并保证退出恢复,避免被 `cargo test -- --ignored` 一起跑时污染
         // 其它测试(或本测试 panic 后留下脏 env)。
         let _lock = crate::bridge::paths::tests::ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let _restore = EnvRestore::capture(&[
-            "DEEPSEEK_ALLOW_INSECURE_HTTP",
-            "DEEPSEEK_FORCE_HTTP1",
-            "PINVOU3_SKIP_WARMUP",
-        ]);
+        let _restore =
+            EnvRestore::capture(&["DEEPSEEK_ALLOW_INSECURE_HTTP", "DEEPSEEK_FORCE_HTTP1"]);
         // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
         unsafe { std::env::set_var("DEEPSEEK_ALLOW_INSECURE_HTTP", "1") };
         // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
         unsafe { std::env::set_var("DEEPSEEK_FORCE_HTTP1", "1") };
-        // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
-        unsafe { std::env::set_var("PINVOU3_SKIP_WARMUP", "1") };
 
         let bridge = Pinvou3Bridge::boot().expect("boot bridge");
         let engine = AppEngine::spawn_headless(bridge)
@@ -3900,16 +4129,18 @@ mod live_tests {
         let sid = "live-test";
         let prompts = ["用一句话介绍你自己。", "再用一句话讲个冷笑话。"];
 
-        // 跑两轮:首轮 = 冷/warmup(A 跳过 TTFT/TPS),二轮 = 暖(记)。
+        // Run two turns: the first is a cold start, the second is warm. Record TTFT/TPS for
+        // both — the old "skip first turn" branch, along with the warmed_sessions set it
+        // read, was removed long ago; do not assume it still exists here.
         engine
-            .send_user_message(
+            .send_headless_user_message(
                 prompts[0].to_string(),
                 SerializableMode::Yolo.to_app_mode(),
                 None,
                 false,
             )
             .await
-            .expect("send_user_message #1");
+            .expect("send_headless_user_message #1");
 
         let mut rx = engine.handle.rx_event.write().await;
         let mut turns_done = 0usize;
@@ -3948,14 +4179,14 @@ mod live_tests {
                     turns_done += 1;
                     if turns_done == 1 {
                         engine
-                            .send_user_message(
+                            .send_headless_user_message(
                                 prompts[1].to_string(),
                                 SerializableMode::Yolo.to_app_mode(),
                                 None,
                                 false,
                             )
                             .await
-                            .expect("send_user_message #2");
+                            .expect("send_headless_user_message #2");
                     } else {
                         break;
                     }
@@ -3979,7 +4210,7 @@ mod live_tests {
         );
         if s.ttft_count > 0 {
             eprintln!(
-                "[live] → 稳态 TTFT={:.3}s  TPS={:.1} tok/s (已排除首轮冷启)",
+                "[live] → avg TTFT={:.3}s  TPS={:.1} tok/s (incl. first-turn cold start)",
                 s.ttft_sum_s / s.ttft_count as f64,
                 if s.tps_time_s > 0.0 {
                     s.tps_tokens as f64 / s.tps_time_s
@@ -3994,13 +4225,432 @@ mod live_tests {
             s.gen_tokens_total > 0,
             "无 output token 累加(usage 空?) seq={seq:?}"
         );
-        // 二轮纯文本(无工具)才断言:首轮已被 A 跳过,TTFT 应只来自二轮。
+        // Only assert when turn 2 is plain text (no tools): each of the two turns records
+        // one TTFT.
         if !tool_in_turn2 {
             assert_eq!(
-                s.ttft_count, 1,
-                "二轮应恰好记 1 次 TTFT(首轮跳过) seq={seq:?}"
+                s.ttft_count, 2,
+                "both turns should record 1 TTFT each seq={seq:?}"
             );
             assert!(s.tps_time_s > 0.0, "TPS 时长未记 seq={seq:?}");
         }
+    }
+}
+
+/// 普通引擎不得携带多智能体装配材料（快照或候选行）：候选只随多智能体快照
+/// 同源产生。误传与快照误传同等对待（hard-error），与多智能体 turn 缺快照的
+/// hard-error 双向对称（生产调用点：[`Self::build_interactive_send_message_op`]）。
+fn validate_ordinary_turn_has_no_expert_material(
+    carries_snapshot: bool,
+    candidate_lines: usize,
+) -> Result<()> {
+    if carries_snapshot {
+        anyhow::bail!("ordinary turn must not carry a multi-agent expert snapshot");
+    }
+    if candidate_lines > 0 {
+        anyhow::bail!("ordinary turn must not carry expert candidate lines");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod expert_turn_invariant_tests {
+    use super::validate_ordinary_turn_has_no_expert_material;
+
+    /// 普通轮 hard-error 不变式（双向对称性的普通侧）：不带任何专家材料时
+    /// 放行；带快照、带候选行分别硬错，且快照守卫先触发。
+    #[test]
+    fn ordinary_turn_rejects_snapshot_and_candidate_lines_symmetrically() {
+        assert!(
+            validate_ordinary_turn_has_no_expert_material(false, 0).is_ok(),
+            "普通轮不带专家材料必须放行"
+        );
+        let snapshot_error =
+            validate_ordinary_turn_has_no_expert_material(true, 0).expect_err("快照误传必须硬错");
+        assert!(
+            snapshot_error.to_string().contains("expert snapshot"),
+            "错误信息必须点明快照误传: {snapshot_error}"
+        );
+        let candidates_error = validate_ordinary_turn_has_no_expert_material(false, 2)
+            .expect_err("候选行误传必须硬错");
+        assert!(
+            candidates_error.to_string().contains("candidate lines"),
+            "错误信息必须点明候选行误传: {candidates_error}"
+        );
+        let both = validate_ordinary_turn_has_no_expert_material(true, 2)
+            .expect_err("双材料同传也必须硬错");
+        assert!(
+            both.to_string().contains("expert snapshot"),
+            "快照守卫必须先于候选行守卫（与生产装配顺序一致）: {both}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-34 M4: the delegation-disable leg is the deterministic defense
+    /// for unattended turns (the typed Ask rules never fire for MCP tools),
+    /// and it had NO pin — deleting the `subagents_enabled = false` arm at
+    /// the unattended spawn site kept the whole serial suite green
+    /// (reviewer mutation). Source-pin the disable at its production site:
+    /// engine.rs scatters its cfg(test) modules, so the span runs from the
+    /// unattended spawn gate to the shell-manager injection (the split
+    /// itself proves the gate exists; the arm inside it proves the disable).
+    #[test]
+    fn unattended_spawn_disables_subagents_in_source() {
+        let source = include_str!("engine.rs");
+        // Round-36 review hardening: strip line comments before matching —
+        // a commented-out disable arm must not satisfy the pin (the same
+        // mutation class the lib_rs dead-tool pin defends against).
+        let live = source
+            .split('\n')
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let production = live
+            .split("mod tests {")
+            .next()
+            .expect("the production half of engine.rs present");
+        let span = production
+            .split("if scheduled_unattended_spawn {")
+            .nth(1)
+            .expect("the unattended spawn gate present")
+            .split("engine_config.runtime_services.shell_manager")
+            .next()
+            .expect("the disable arm is bounded by the shell-manager injection");
+        assert!(
+            span.contains("engine_config.subagents_enabled = false;"),
+            "the unattended spawn must disable subagents — the deterministic \
+             delegation-disable leg of the recursion shield (round-34 M4)"
+        );
+    }
+
+    #[test]
+    fn sync_session_op_carries_the_keychain_backfill() {
+        // Round-13 M4: the SyncSession payload is the keychain backfill's only
+        // channel into the foundation — the builder pins the field's presence
+        // and serde shape (deleting the field fails to compile here, renaming
+        // it reds this assert). The call site passes the bridge-resolved
+        // snapshot through unchanged.
+        let op = AppEngine::sync_session_op(
+            "s-backfill",
+            Vec::new(),
+            "test-model".to_string(),
+            std::path::PathBuf::from("/w"),
+            vec![
+                std::path::PathBuf::from("/w"),
+                std::path::PathBuf::from("/x"),
+            ],
+        );
+        match op {
+            Op::SyncSession {
+                session_id,
+                messages,
+                workspace_roots,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("s-backfill"));
+                assert!(messages.is_empty());
+                assert_eq!(
+                    workspace_roots,
+                    vec![
+                        std::path::PathBuf::from("/w"),
+                        std::path::PathBuf::from("/x")
+                    ]
+                );
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod submit_gate_bound_tests {
+    use super::Op;
+    use super::bounded_join_detached_on_timeout;
+    use super::bounded_reserved_submit_send;
+    use crate::features::assistant::engine_pool::TURN_GATE_AWAIT_TIMEOUT;
+
+    // issue #525: the reserved-submit send must give up within the
+    // turn-gate bound when the engine ops channel is full and never
+    // drained, and the timed-out op must verifiably never reach the
+    // channel (tokio reserve/send cancel-safety), so the surfaced failure
+    // is truthful: the turn did not start. The forkguard_ prefix registers
+    // it as a fork-guard layer-3 behavior test (fork-policy §3).
+    #[tokio::test]
+    async fn forkguard_reserved_submit_send_fails_cleanly_on_wedged_engine() {
+        // Capacity 1, filled and never drained: the gate-held submit send
+        // parks exactly like on a wedged engine.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Op>(1);
+        tx.send(Op::CancelSubAgents)
+            .await
+            .expect("wedged slot filled");
+        // Measured from before the call: elapsed >= the bound pins "the
+        // submit really waited the full budget" (an unbounded regression
+        // hangs the 2× wrapper as a fast red; a silently shrunken bound
+        // fails this assert).
+        let started = std::time::Instant::now();
+        // The submit keeps its own sender clone: dropping the last Sender
+        // would close the channel and turn the cancel-safety probe below
+        // into a Closed instead of an Empty.
+        let submit_tx = tx.clone();
+        let result = tokio::time::timeout(
+            2 * TURN_GATE_AWAIT_TIMEOUT,
+            bounded_reserved_submit_send(async move {
+                submit_tx
+                    .send(Op::Shutdown)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }),
+        )
+        .await
+        .expect(
+            "the bounded submit must settle within twice the gate bound; an unbounded regression would hang here",
+        );
+        assert!(
+            started.elapsed() >= TURN_GATE_AWAIT_TIMEOUT,
+            "the submit must wait the full budget"
+        );
+        let error = result.expect_err("a wedged engine must fail the reserved submit cleanly");
+        assert!(
+            error.to_string().contains("the turn was not started"),
+            "the failure must state that the turn never started: {error:#}"
+        );
+        // Cancel-safety: the only buffered op is the filler — the timed-out
+        // submit never entered the channel, so no turn can start late.
+        assert!(matches!(rx.try_recv(), Ok(Op::CancelSubAgents)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    // Control for the wedge test: a healthy engine accepts the submit and
+    // the op is delivered — the helper bounds the wait, it does not skip
+    // the send.
+    #[tokio::test]
+    async fn reserved_submit_send_delivers_when_engine_accepts() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Op>(1);
+        let result = bounded_reserved_submit_send(async move {
+            tx.send(Op::Shutdown).await.map_err(anyhow::Error::from)
+        })
+        .await;
+        assert!(result.is_ok(), "an accepting engine must deliver the op");
+        assert!(matches!(rx.recv().await, Some(Op::Shutdown)));
+    }
+
+    // issue #525: the reclaimed turn's fallback persistence join must not
+    // wait on a disk-stalled save past the budget — the join is detached
+    // (the save keeps running) and the caller presets the terminal to
+    // Failed instead of claiming a persistence it did not see settle.
+    #[tokio::test]
+    async fn forkguard_reclaimed_persistence_join_detaches_task_that_outlives_budget() {
+        let started = std::time::Instant::now();
+        let joined = bounded_join_detached_on_timeout(
+            "test persistence",
+            std::time::Duration::from_millis(50),
+            tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(1))),
+        )
+        .await;
+        assert!(
+            joined.is_none(),
+            "an over-budget save must be reported as detached"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+
+        // Control: a save that settles in time is joined, not detached.
+        let joined = bounded_join_detached_on_timeout(
+            "test persistence",
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| 7_u32),
+        )
+        .await;
+        assert!(matches!(joined, Some(Ok(7))));
+    }
+}
+
+// Wiring pins (review #463 round-14 R2 precedent): the behavioral tests in
+// `submit_gate_bound_tests` cover the bounded helpers, but the production
+// call sites need an AppEngine / a full reclaim and cannot be
+// unit-constructed — pin the wiring in the production bodies so deleting
+// the bound ships red instead of green. The source is cut at the first
+// test module so the probes' own assertion strings can never self-match.
+#[cfg(test)]
+mod submit_gate_bound_wiring_tests {
+    /// Cut the source at the body of the function named by `signature`.
+    /// Ends at the next item (method or free item), not at the next `pub `
+    /// token, so a `pub(crate)` item cannot dilute the span.
+    fn production_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).expect("production fn must exist");
+        let rest = &src[start + signature.len()..];
+        let end = [
+            "\n    pub ",
+            "\n    pub(crate) ",
+            "\n    pub(super) ",
+            "\n    fn ",
+            "\n    async fn ",
+            "\n    ///",
+            "\nasync fn ",
+            "\nimpl ",
+        ]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .map_or(src.len(), |offset| start + signature.len() + offset);
+        &src[start..end]
+    }
+
+    fn production_source() -> String {
+        let src = include_str!("engine.rs");
+        // Column-0 anchor: indented `#[cfg(test)]` attributes mark test-only
+        // methods inside the production region and must not cut it.
+        let cut = src
+            .find("\n#[cfg(test)]")
+            .expect("a column-0 test module marker must exist");
+        src[..cut].to_string()
+    }
+
+    #[test]
+    fn reserved_submit_send_is_bounded_in_production() {
+        let src = production_source();
+        let body = production_body(
+            &src,
+            "async fn send_reserved_turn_op(&self, op: Op, reservation: TurnReservation) -> Result<()> {",
+        );
+        assert!(
+            body.contains("bounded_reserved_submit_send(self.handle.send(op))"),
+            "the reserved submit must route through the gate-bounded send (issue #525)"
+        );
+        assert!(
+            !body.contains("self.handle.send(op).await"),
+            "no direct unbounded ops send may remain in the reserved submit path"
+        );
+    }
+
+    #[test]
+    fn reclaimed_persistence_join_is_bounded_in_production() {
+        let src = production_source();
+        let body = production_body(src.as_str(), "async fn finish_reclaimed_lifecycle_turn(");
+        let spawn_at = body
+            .find("tokio::task::spawn_blocking(")
+            .expect("the fallback persistence must run as a blocking task");
+        let join_at = body
+            .find("bounded_join_detached_on_timeout(")
+            .expect("the persistence join must be bounded (issue #525)");
+        assert!(
+            spawn_at < join_at,
+            "the blocking task must be handed to the bounded join, not awaited directly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unattended_shield_tests {
+    use super::unattended_disallowed_tools;
+
+    /// The recursion shield (review R4-M1): an unattended automation turn
+    /// must deny the scheduled-task write family deterministically — the
+    /// engine-level tool list, not an Ask rule (which mutating MCP tools
+    /// never consult under the current full-auto approval).
+    #[test]
+    fn unattended_turn_denies_scheduled_task_write_family() {
+        let caller = vec![
+            "mcp_fixture_disabled".to_string(),
+            "create_goal".to_string(),
+        ];
+        let list = unattended_disallowed_tools(&caller);
+        assert!(
+            list.contains(&caller[0]),
+            "caller-supplied feature disables survive composition"
+        );
+        assert_eq!(list.iter().filter(|tool| *tool == "create_goal").count(), 1);
+        for tool in [
+            "create_goal",
+            "update_goal",
+            "mcp_app-automations_create_scheduled_task",
+            "mcp_app-automations_update_scheduled_task",
+            "mcp_app-automations_delete_scheduled_task",
+            // Round-30 REQUIRED-2: the registry launchers — a third
+            // unattended channel (the foundation hold list names only
+            // start_mcp_server, and the launched server's mcp_<name>_*
+            // tools ride the same turn under identities the name-keyed
+            // deny list cannot see). Removing either entry turns this
+            // red.
+            "registry_sync",
+            "start_registry_mcp_server",
+        ] {
+            assert!(
+                list.iter().any(|blocked| blocked == tool),
+                "{tool} must be denied"
+            );
+        }
+    }
+
+    /// Connector-disabled tools ride along (the unattended deny is additive),
+    /// and pre-existing entries are not duplicated.
+    /// R5 strongly-recommended pin: the shield's only runtime channel is the
+    /// `Op::SetDisallowedTools` send ahead of every scheduled turn op — the
+    /// Ask rules are documented latent. Deleting the send (or detaching it
+    /// from the shield list) turns this red.
+    /// Round-6 MAJOR 3: the pin is scoped to the PRODUCTION span — slice the
+    /// source between `fn send_scheduled_message` and the next `fn `, so the
+    /// test module's own literals cannot satisfy it — and asserts BOTH the
+    /// composition in the spawn path (`unattended_disallowed_tools(&disallowed)`,
+    /// the wiring a bare `disallowed.clone()` revert would delete) and the
+    /// `Op::SetDisallowedTools` send carrying the shield list before the
+    /// turn op inside the send function. Deleting either turns this red.
+    /// Round-9 M2(a) (#628): the send tool is IN the unattended deny list —
+    /// the messaging-indirection route (unattended run → send_message_to_
+    /// session → ordinary-catalog turn elsewhere → create_scheduled_task)
+    /// closes with one entry. Removing the entry turns this red.
+    #[test]
+    fn unattended_deny_list_covers_the_messaging_send_route() {
+        let list = unattended_disallowed_tools(&[]);
+        assert!(
+            list.iter()
+                .any(|tool| tool == "mcp_session-reader_send_message_to_session"),
+            "the send tool must be denied on unattended turns: {list:?}"
+        );
+    }
+
+    #[test]
+    fn scheduled_sends_carry_the_shield_via_set_disallowed_tools() {
+        let source = include_str!("engine.rs");
+        // Round-36 review hardening: strip line comments before matching —
+        // a commented-out shield send must not satisfy the pin.
+        let live = source
+            .split('\n')
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let send_start = live
+            .find("fn send_scheduled_message")
+            .expect("production send must exist");
+        let send_end = live[send_start..]
+            .find("\n    fn ")
+            .map(|offset| send_start + offset)
+            .unwrap_or(live.len());
+        let send_body = &live[send_start..send_end];
+        let op = send_body
+            .find("Op::SetDisallowedTools {")
+            .expect("the shield send must exist in the production span");
+        let carries = send_body[op..]
+            .find("self.scheduled_disallowed_tools.clone()")
+            .expect("the send must carry the shield list");
+        let turn_op = send_body[op..]
+            .find("self.send_turn_op(op).await")
+            .expect("the disallowed-tools send must precede the turn op");
+        assert!(carries < turn_op, "shield list carried before the turn op");
+        // The wiring: the field is composed through the unattended shield
+        // (a revert to `disallowed.clone()` deletes this line).
+        let spawn_body = &live[..send_start];
+        assert!(
+            spawn_body.contains(
+                "let scheduled_disallowed_tools = unattended_disallowed_tools(&disallowed);"
+            ),
+            "the engine's shield field must be composed through unattended_disallowed_tools"
+        );
     }
 }

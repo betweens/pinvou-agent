@@ -12,27 +12,31 @@ mod events;
 mod install;
 mod introspect;
 mod latest;
+mod lifecycle;
 mod login;
 mod operation_gate;
 mod platform;
 mod providers;
 pub(crate) mod reader_window;
+mod resource_ledger;
 mod runtime;
+mod stall;
 mod store;
-pub(crate) mod workspace;
+pub mod workspace;
 
 // 纯提取：连接池自身仍是本 facade 的 impl 块；安装、登录与 Kimi 内省的
 // 无副作用自由函数已迁入对应子模块，这里显式引入 mod.rs 实际使用的符号。
 use install::{
     brew_install_args, brew_package_installed, bundled_adapter_candidates,
-    claude_version_supported, clear_install_progress, codex_path_for_adapter,
-    codex_upgrade_required, codex_version_changed, command_version_output, detect_install_source,
-    fill_install_progress, find_in_path, install_action_for, installed_node_version,
-    kill_install_process_tree, kimi_version_supported, move_official_binaries_aside,
-    node_major_version, npm_executable, npm_package, official_script_supported,
-    official_script_urls, parse_install_action, path_install_source, resolve_adapter_from,
-    resolve_claude_adapter_from, resolve_claude_cli, resolve_codex_cli, resolve_kimi_path,
-    run_brew_install, run_npm_global_upgrade, run_official_install_script, script_url_reachable,
+    claude_version_supported, clear_install_outcome, clear_install_progress,
+    codex_path_for_adapter, codex_upgrade_required, codex_version_changed, command_version_output,
+    detect_install_source, fill_install_outcome, fill_install_progress, find_in_path,
+    install_action_for, installed_node_version, kill_install_process_tree, kimi_version_supported,
+    move_official_binaries_aside, node_major_version, npm_executable, npm_package,
+    official_script_supported, official_script_urls, parse_install_action, path_install_source,
+    record_install_outcome, resolve_adapter_from, resolve_claude_adapter_from, resolve_claude_cli,
+    resolve_codex_cli, resolve_kimi_path, run_brew_install, run_npm_global_upgrade,
+    run_official_install_script, script_url_reachable, settle_install_result,
     stale_official_target,
 };
 use introspect::{kimi_diagnostic_cursor, kimi_failure_after};
@@ -42,7 +46,6 @@ use login::{
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -54,7 +57,7 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
     ElicitationContentValue, ElicitationFormCapabilities, Implementation, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, PromptCapabilities, PromptRequest,
+    LoadSessionRequest, NewSessionRequest, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
     SessionModeState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
@@ -62,14 +65,14 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
 use agent_probe::{CliProbeCache, CliProbeGates, ResolvedCli};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use auth_probe::{AgentAuthProbeState, CachedAuthStatus};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, MutexGuard, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wait_timeout::ChildExt;
 
@@ -84,9 +87,14 @@ use crate::features::sessions::SessionStore;
 use crate::core::reaper::{
     IDLE_EVICT_AFTER_SECS, IdleReaperGuard, should_reap_idle, take_session_if_still_idle,
 };
-use attachments::{CodexDisplayAttachment, prepare_codex_prompt};
+use attachments::prepare_codex_prompt;
 use deepseek_tui::session_manager::SessionMetadata;
 pub(crate) use events::project_acp_value_for_web;
+// `pub` for the headless CLI (`pinvou projects rebind`): the GUI's rebind
+// runs this storage pass per session, and the CLI's mirror must run the same
+// half or an untranslated acp-state workspace resurrects the vanished root
+// on boot recovery.
+pub use events::translate_acp_state_workspace;
 pub use events::{
     AcpEventEnvelope, project_acp_elicitation_request_for_web,
     project_acp_permission_request_for_web,
@@ -95,44 +103,216 @@ use events::{
     EventBridge, WebAcpTimelineSlice, load_timeline, load_web_timeline_page, persist_acp_state,
 };
 use latest::LatestVersionProbe;
+use lifecycle::{
+    RuntimeCrashBudget, RuntimeLifecycle, RuntimeLookup, SpawnAdmission, resolve_runtime,
+    runtime_is_stable,
+};
 use operation_gate::admit_prompt_turn;
 pub use providers::{
     AcpProvidersView, ImportResult, ProviderManager, ProviderRecord, ProviderWireApi,
 };
-use runtime::{
-    MIN_CODEX_VERSION, ResolvedCodex, codex_version, probe_codex_runtime, version_at_least,
-};
+// `CLAUDE_MODEL_SLOTS` 通过本 facade 公开再导出：同仓 `pinvou-cli` 的
+// `providers add` 预检与 `ProviderManager::save` 共用同一 claude 模型槽位
+// 列表，消除手工副本漂移；行为不变。
+pub use providers::CLAUDE_MODEL_SLOTS;
+use resource_ledger::{AcpResourceLedger, RuntimeResourceRoot};
+// `GIT_OVERRIDE_KEYS` (from `platform::process`) is published through this
+// facade re-export: the workspace git env scrubbing in the same-repo
+// `pinvou-cli` shares the exact key list with `strip_git_override_env`,
+// eliminating hand-copied drift (the CLI-side copy had drifted by three
+// keys); behavior is unchanged.
+pub use crate::platform::process::GIT_OVERRIDE_KEYS;
+// `GIT_IDENTITY_KEYS` (from `platform::process`) is published through this
+// facade re-export for the same reason: the CLI's `--mode commit` lane strips
+// the exact identity list the GUI's commit lane strips, eliminating the
+// hand-copied drift window; behavior is unchanged.
+pub use crate::platform::process::GIT_IDENTITY_KEYS;
+// `MIN_CODEX_VERSION` 通过本 facade 公开再导出：同仓 `pinvou-cli` 与运行时共用
+// 同一最低版本约束，消除手工副本漂移；行为不变。
+pub use runtime::MIN_CODEX_VERSION;
+// kimi 登录失败脱敏的凭据标记表经本 facade 公开再导出：headless CLI 的登录
+// 回显 withholding 门直接复用同一列表（原先 CLI 逐字手抄、无对齐测试）。
+pub use login::KIMI_CREDENTIAL_MARKERS;
+/// The comparison itself, not only the constants: `pinvou-cli`'s `code`
+/// gates (`agents status`, override resolution) consume this so a
+/// comparison-semantics change app-side cannot drift behind a CLI-local
+/// copy (round-27 review; the fn's module stays private — the re-export is
+/// the sanctioned surface, same as the constants beside it).
+pub use runtime::version_at_least;
+use runtime::{ResolvedCodex, codex_version, probe_codex_runtime};
 use store::{AcpConfigDefaultsStore, SessionAgentRecord, SessionMode};
 pub use store::{
-    AgentBackend, CodexWorkspaceKind, SessionAgentStore, validate_codex_project_workspace,
+    AgentBackend, CodexWorkspaceKind, RebindWorkspacePrefixOutcome, SessionAgentStore,
+    validate_codex_project_workspace,
 };
 
+/// How long a store's cross-process section lock waits for a peer's
+/// reload→mutate→persist section before degrading to unlocked operation
+/// (with a warning). Generous against human-frequency contention; the bound
+/// exists so a peer wedged or SIGSTOP'd inside its section cannot park the
+/// GUI's settings worker forever (round-37 review, concurrency lane).
+pub(crate) const SECTION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cross-process advisory lock over a store's reload→mutate→persist
+/// section, shared by the acp stores (`acp-providers.json`,
+/// `acp-agent-defaults.json`). The lock file carries no state and the OS
+/// releases it when the holder dies, so a crash cannot wedge the store.
+/// Best-effort with an observable degrade (round-37 review): if the lock
+/// file cannot be opened, the lock syscall fails, or a peer holds the
+/// section longer than [`SECTION_LOCK_TIMEOUT`], the caller proceeds
+/// unlocked — the pre-lock behavior — but every degrade warns, so the
+/// lost-update window is never silent. `label` names the store in warnings.
+///
+/// Round-46 review: the known hold-length aggravator is keychain I/O
+/// inside a section — a parked keychain prompt extends the hold past the
+/// timeout by minutes, and only the WAITING side sees the warning.
+/// `ProviderManager::switch` therefore fetches its key before the section
+/// (providers/mod.rs); `save`'s active-provider re-apply and `delete`'s
+/// best-effort keychain delete keep their short reads/writes inside, with
+/// the residual named at those sites.
+pub(crate) fn cross_process_section_lock(lock_path: &Path, label: &str) -> Option<std::fs::File> {
+    // The lock file is a sibling of the store file, so on a first-ever
+    // mutation in a fresh home its parent does not exist yet — the open
+    // below would ENOENT and every mutator would silently degrade to
+    // unlocked exactly once, at the moment cross-process exclusion matters
+    // most (the write that creates the store). Create the parent first and
+    // degrade on a genuine failure the same way the open path does; the
+    // persist sites run the same `create_dir_all` afterwards.
+    if let Some(parent) = lock_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "[pinvou3-app] Unable to create the {label} section lock directory {}: {error}; proceeding without cross-process exclusion",
+                parent.display()
+            );
+            return None;
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "[pinvou3-app] Unable to open the {label} section lock {}: {error}; proceeding without cross-process exclusion",
+                lock_path.display()
+            );
+            return None;
+        }
+    };
+    // Poll instead of one blocking `lock()`: mutators are human-frequency
+    // and the section is a read + a small rename, so contention costs
+    // milliseconds — but a peer wedged INSIDE its section (or SIGSTOP'd)
+    // must not park a GUI settings action indefinitely, and a refusal on a
+    // busy store would surface as a settings error for a transient
+    // cross-process race. Past the deadline the window reopens, loudly.
+    let deadline = Instant::now() + SECTION_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "[pinvou3-app] The {label} section lock {} stayed held for over {}s; proceeding without cross-process exclusion — a concurrent write on the other surface may be lost",
+                        lock_path.display(),
+                        SECTION_LOCK_TIMEOUT.as_secs()
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                eprintln!(
+                    "[pinvou3-app] The {label} section lock {} could not be locked: {error}; proceeding without cross-process exclusion",
+                    lock_path.display()
+                );
+                return None;
+            }
+        }
+    }
+}
+
+/// Run one provider/store section on a blocking worker and map the join
+/// failure onto the shared command-surface error. The provider commands'
+/// `spawn_blocking` sites repeated the identical clone → spawn → await →
+/// join-error chain; this keeps the error string (and therefore every
+/// user-visible message) byte-identical while collapsing the repetition.
+/// Closures that do not themselves return `Result` translate their
+/// fallible half inside (context included) so the join mapping stays
+/// shared.
+async fn on_blocking<T, F>(f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    on_blocking_labeled("provider task join error", f).await
+}
+
+/// [`on_blocking`] with a caller-chosen join-error label. Holds the single
+/// `spawn_blocking` body so the clone → spawn → await → join-error chain
+/// stays written exactly once: a join failure maps onto
+/// `{join_error_label}: {error}`, keeping every caller's user-visible
+/// message byte-identical. `pub(crate)`: shared with the codex command
+/// surface, whose session-index joins carry their own label.
+pub(crate) async fn on_blocking_labeled<T, F>(join_error_label: &str, f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|error| anyhow::anyhow!("{join_error_label}: {error}"))?
+}
+
+/// Managed-runtime directory schema retained for compatibility with installs
+/// created before the bundled bridge moved past 1.1.5. This is not the
+/// bundled adapter version and must not be written to `acp-state.json`.
 pub const CODEX_ACP_VERSION: &str = "1.1.5";
-pub const CODEX_ACP_SESSION_MODEL: &str = "Codex (ACP)";
 const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
-pub const CLAUDE_ACP_VERSION: &str = "0.62.0";
+/// Bundled codex-acp adapter pin. Kept separate from the legacy managed
+/// runtime directory schema above so session diagnostics report the truth.
+const CODEX_ACP_ADAPTER_VERSION: &str = "2.2.2";
+/// Bundled `claude-agent-acp` version. It must match the pin in
+/// `scripts/codex-bridge-runtime/package.json` and its lockfile because this
+/// value is written to session `acp-state.json` as the declared adapter version.
+/// `forkguard_declared_adapter_versions_match_the_bridge_pin` pins the invariant.
+pub const CLAUDE_ACP_VERSION: &str = "0.95.0";
 const CLAUDE_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-const CLAUDE_ACP_SESSION_MODEL: &str = "Claude Code (ACP)";
 const KIMI_ACP_PACKAGE: &str = "kimi acp";
-const KIMI_ACP_SESSION_MODEL: &str = "Kimi (ACP)";
+/// Single source of the persisted ACP session-model string
+/// (`"{display_name} (ACP)"`): the session creator in `app/commands/codex`
+/// writes it, `acp_session_backend` parses it back, and the headless CLI's
+/// `code sessions` family consumes it through the facade instead of a
+/// hand-copied table (the drift class the GIT_OVERRIDE_KEYS re-exports
+/// eliminate). Round-trip pinned by
+/// `acp_session_model_name_round_trips_through_acp_session_backend`.
+pub fn acp_session_model_name(backend: AgentBackend) -> String {
+    format!("{} (ACP)", backend.display_name())
+}
 /// claude-agent-acp 要求的最低 claude CLI 版本（输出形如 `2.1.163 (Claude Code)`）。
-const MIN_CLAUDE_VERSION: &str = "2.0.0";
+/// `pub` 导出供同仓 `pinvou-cli` 直接引用：CLI 的 `agents status/login` 与本
+/// 运行时使用同一最低版本，消除手工副本漂移；GUI 语义不变。
+pub const MIN_CLAUDE_VERSION: &str = "2.0.0";
+/// npm China mirror registry (Alibaba npmmirror, a syncing mirror of the
+/// official registry). Defined in [`crate::platform::download`] (the
+/// connector-side tmeet uses it too; platform is the shared downward
+/// dependency of both features, avoiding a reverse feature dependency).
+/// Used only as the `--registry` retry source for that install/upgrade call
+/// and as the latest-version probe fallback when the official
+/// registry.npmjs.org is unreachable; it is never written into and does not
+/// change the user's npm configuration.
+pub(crate) use crate::platform::download::NPM_MIRROR_REGISTRY;
 /// Kimi ACP 要求的最低 kimi CLI 版本（裸 semver；旧 Python 版 kimi-cli 已废弃）。
-const MIN_KIMI_VERSION: &str = "0.9.0";
+/// `pub` 导出理由同 `MIN_CLAUDE_VERSION`。
+pub const MIN_KIMI_VERSION: &str = "0.9.0";
 const CODEX_INSTALL_SCRIPT_UNIX: &str = "https://chatgpt.com/codex/install.sh";
 const CODEX_INSTALL_SCRIPT_WINDOWS: &str = "https://chatgpt.com/codex/install.ps1";
 const CLAUDE_INSTALL_SCRIPT_UNIX: &str = "https://claude.ai/install.sh";
 const CLAUDE_INSTALL_SCRIPT_WINDOWS: &str = "https://claude.ai/install.ps1";
 const KIMI_INSTALL_SCRIPT_UNIX: &str = "https://code.kimi.com/kimi-code/install.sh";
 const KIMI_INSTALL_SCRIPT_WINDOWS: &str = "https://code.kimi.com/kimi-code/install.ps1";
-
-// ACP 空闲回收阈值/巡检间隔（IDLE_EVICT_AFTER_SECS / REAP_INTERVAL_SECS）、
-// 回收判定本体、锁内复核 + 原子移除（take_session_if_still_idle）与巡检
-// 句柄/循环（IdleReaperGuard / start_idle_reaper）收敛到 `core::reaper`：
-// 每个空闲会话都是一个活的 node/codex/kimi 子进程（spawn 带 kill_on_drop），
-// 池无上限、内存随会话数线性涨。空闲超过阈值且无在跑 turn / 配置同步 /
-// 非 active 会话时回收。回收只是回到 lazy spawn 语义（下次 get_or_spawn
-// 重新起进程），30 分钟取偏保守值：宁可少回收也不误杀刚要被使用的会话。
 
 /// codex_acp 测试共用的临时目录夹具（attachments / workspace 的 tests 模块
 /// 复用）：`create_dir_all` 建目录，Drop 时 `remove_dir_all` 清理；目录名按
@@ -224,12 +404,25 @@ impl Drop for PromptAdmissionGuard<'_> {
         // stuck above zero merely keeps the runtime un-evictable (the
         // conservative direction), while a wrap to usize::MAX would corrupt
         // the count for every later guard pair.
+        //
+        // Rust 1.99 deprecated fetch_update (renamed to try_update); the MSRV
+        // (1.89) predates the new name, so keep the old call.
+        #[allow(deprecated)]
         let _ = self
             .pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 Some(count.saturating_sub(1))
             });
     }
+}
+
+/// The shared "runtime must not be disturbed" flag set (review #463
+/// round-13): a prompt in flight, a config sync, or a resolved-but-not-yet-
+/// admitted prompt (`prompt_pending`) all count. Single source for the
+/// turn-active probe, the rebind busy fence and the rebind eviction
+/// predicate — the three had drifted into four hand-encoded copies.
+fn rebind_busy_flags(busy: bool, configuring: bool, prompt_pending: bool) -> bool {
+    busy || configuring || prompt_pending
 }
 
 /// Rebind eviction recheck predicate (pure function, unit-testable; review
@@ -245,16 +438,68 @@ fn rebind_evictable(
     prompt_pending: bool,
     idle_for: Duration,
 ) -> bool {
-    !busy && !configuring && !prompt_pending && idle_for >= REBIND_EVICT_IDLE_EPSILON
+    !rebind_busy_flags(busy, configuring, prompt_pending) && idle_for >= REBIND_EVICT_IDLE_EPSILON
+}
+
+/// Bound on the rebind path's waits for the pool's `sessions` lock (review #463
+/// round-10 T13, restored by round-11 B2). `get_or_spawn` holds that lock
+/// across the WHOLE cold spawn — including the ACP ready handshake — so an
+/// unbounded wait here stalls `rebind_workspace_root` (and the process-wide
+/// rebind gate it holds) for as long as some unrelated session takes to
+/// start. Mirrors the engine lane's `REBIND_EVICT_GATE_TIMEOUT`: a timeout is
+/// reported as busy / "not idle", never as success, and the user's retry
+/// converges once the spawn settles.
+const REBIND_ACP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Retry hints of at least this many milliseconds are phrased in seconds
+/// instead of raw ms, so long backoffs read as actionable waits.
+const RETRY_HINT_SECONDS_MIN_MS: u128 = 2_000;
+
+/// Complete a claimed turn in the shared order: timing, then admission gate.
+///
+/// The claim itself is performed by the caller because it also emits the
+/// timeline event. A losing path must not close timing or release `busy`: a
+/// newer turn may already own both session-level slots.
+fn finalize_claimed_turn(busy: &AtomicBool, claimed: bool, close_timing: impl FnOnce()) -> bool {
+    if !claimed {
+        return false;
+    }
+    close_timing();
+    busy.store(false, Ordering::Release);
+    true
+}
+
+/// A delayed stop fallback may act only on the exact turn and runtime that
+/// were active when Stop was pressed. The sessions lock is held by the caller
+/// while evaluating and acting on this result, so replacement cannot race the
+/// session-level timing close.
+fn cancel_settle_matches<T>(
+    registered: Option<&Arc<T>>,
+    expected_runtime: &Arc<T>,
+    current_turn_id: Option<&str>,
+    expected_turn_id: &str,
+) -> bool {
+    registered.is_some_and(|runtime| Arc::ptr_eq(runtime, expected_runtime))
+        && current_turn_id == Some(expected_turn_id)
+}
+
+/// The stall ladder belongs to one exact turn. Once another closer removes or
+/// replaces that turn, the abandoned prompt future may keep awaiting its ACP
+/// response but must never emit another notice or cancellation request.
+fn stall_guard_owns_turn(current_turn_id: Option<&str>, expected_turn_id: &str) -> bool {
+    current_turn_id == Some(expected_turn_id)
 }
 
 /// Result of the rebind eviction take: distinguishes "no resident runtime"
 /// (trivially idle — nothing to reclaim, eviction counts as done) from
 /// "busy" (in-flight prompt/config sync — the caller must not evict and
 /// reports the session as post-busy). `take_session_if_still_idle`'s bare
-/// `Option` cannot express that difference.
-enum RebindEvictTake<T> {
-    Reclaimed(T),
+/// `Option` cannot express that difference. The `Reclaimed` arm hands back
+/// the sessions lock still held, so the caller can settle the keyed
+/// retirement bookkeeping and flush the journal inside the take's critical
+/// section (same contract as `take_session_if_still_idle`).
+enum RebindEvictTake<'a, T> {
+    Reclaimed(T, MutexGuard<'a, HashMap<String, T>>),
     Busy,
     NoRuntime,
 }
@@ -267,37 +512,63 @@ enum RebindEvictTake<T> {
 /// the snapshot (busy set) or that is mid config-sync is kept untouched and
 /// reported by the command layer as post-busy — an in-flight prompt is never
 /// killed as a rebind side effect.
-async fn take_session_for_rebind<T>(
-    sessions: &Mutex<HashMap<String, T>>,
+async fn take_session_for_rebind<'a, T>(
+    sessions: &'a Mutex<HashMap<String, T>>,
     session_id: &str,
     is_rebind_evictable: impl Fn(&T) -> bool,
-) -> RebindEvictTake<T> {
-    let mut sessions = sessions.lock().await;
+) -> RebindEvictTake<'a, T> {
+    // The lock wait is bounded (review #463 round-10 T13): a timeout is
+    // treated as busy, so a concurrent cold spawn cannot hang the rebind.
+    // Cancelling a `Mutex::lock` future never leaves the lock held — no
+    // permit was acquired.
+    let Ok(mut sessions) = tokio::time::timeout(REBIND_ACP_LOCK_TIMEOUT, sessions.lock()).await
+    else {
+        return RebindEvictTake::Busy;
+    };
     let Some(entry) = sessions.get(session_id) else {
         return RebindEvictTake::NoRuntime;
     };
     if !is_rebind_evictable(entry) {
         return RebindEvictTake::Busy;
     }
-    sessions
-        .remove(session_id)
-        .map_or(RebindEvictTake::NoRuntime, RebindEvictTake::Reclaimed)
-}
-
-fn backend_for_session_model(model: &str) -> Option<AgentBackend> {
-    match model {
-        CODEX_ACP_SESSION_MODEL => Some(AgentBackend::CodexAcp),
-        CLAUDE_ACP_SESSION_MODEL => Some(AgentBackend::ClaudeAcp),
-        KIMI_ACP_SESSION_MODEL => Some(AgentBackend::KimiAcp),
-        _ => None,
+    match sessions.remove(session_id) {
+        Some(taken) => RebindEvictTake::Reclaimed(taken, sessions),
+        None => RebindEvictTake::NoRuntime,
     }
 }
 
+/// The fence decision of [`AcpPool::rebind_blocking_sessions`], extracted as
+/// a generic so bare components give deterministic tests (same shape as
+/// [`take_session_for_rebind`]): one bounded acquisition decides the whole
+/// set; a timeout reads as `None` — refuse, never guess.
+async fn rebind_blocking_from_sessions<T>(
+    sessions: &Mutex<HashMap<String, T>>,
+    session_ids: &[String],
+    is_blocking: impl Fn(&T) -> bool,
+) -> Option<Vec<String>> {
+    let sessions = tokio::time::timeout(REBIND_ACP_LOCK_TIMEOUT, sessions.lock())
+        .await
+        .ok()?;
+    Some(
+        session_ids
+            .iter()
+            .filter(|session_id| {
+                sessions
+                    .get(session_id.as_str())
+                    .is_some_and(|runtime| is_blocking(runtime))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+/// 会话类型判定：ACP 后端直接生效；否则按创建时持久化的 `* (ACP)` 模型串兜底。
 fn acp_session_backend(backend: AgentBackend, model: &str) -> Option<AgentBackend> {
-    backend
-        .is_acp()
-        .then_some(backend)
-        .or_else(|| backend_for_session_model(model))
+    backend.is_acp().then_some(backend).or_else(|| {
+        AgentBackend::ACP_BACKENDS
+            .into_iter()
+            .find(|&candidate| acp_session_model_name(candidate) == model)
+    })
 }
 
 fn same_workspace(left: &Path, right: &Path) -> bool {
@@ -458,6 +729,37 @@ fn acp_recovery_record(
         }
         None => CodexWorkspaceKind::Project,
     };
+    // Keychain snapshot source = the workspace.roots spawn writes to acp-state.json
+    // (review #484 round-11 M8): old files lack the key → empty = single-root
+    // semantics, the base normalizes by cwd; alignment converges in place via
+    // set_session_workspace_roots and never revives a wider set. Non-string /
+    // non-absolute entries drop (fail-closed, same absolute-path rule as intake).
+    let workspace_roots = state["workspace"]["roots"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(PathBuf::from)
+                .filter(|root| root.is_absolute())
+                .collect::<Vec<PathBuf>>()
+        })
+        .unwrap_or_default();
+    // Round-37 M6: the align convergence patch persists the granted
+    // ancestors beside the roots — carry them into the recovery record so an
+    // index loss no longer revokes them (bounded by the keychain, same as
+    // the native sidecar's field; absent key = no grants, fail-safe).
+    let explicit_ancestor_roots = state["workspace"]["explicit_ancestor_roots"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(PathBuf::from)
+                .filter(|root| root.is_absolute() && workspace_roots.contains(root))
+                .collect::<Vec<PathBuf>>()
+        })
+        .unwrap_or_default();
     Ok(SessionAgentRecord {
         backend: expected_backend,
         acp_session_id: Some(acp_session_id),
@@ -468,6 +770,8 @@ fn acp_recovery_record(
         acp_config_values: acp_config_values_from_state(state),
         workspace_kind,
         workspace_path: (workspace_kind == CodexWorkspaceKind::Project).then_some(workspace_path),
+        workspace_roots,
+        explicit_ancestor_roots,
         mode: SessionMode::Plain,
     })
 }
@@ -521,6 +825,77 @@ struct SidecarRecoverySummary {
     backfilled: usize,
     /// 已被 ACP 会话占用、作为残留清理的 sidecar 数。
     cleaned: usize,
+    /// Dead index entries removed: code entries whose durable session record
+    /// (`sessions/<id>.json`) is gone.
+    pruned_dead_entries: usize,
+    /// Ghost sidecars removed: sidecar files of record-less dirs whose owner
+    /// record is also gone (the emptied dir is then removed best-effort; a
+    /// dir holding other content survives).
+    cleaned_ghost_sidecars: usize,
+}
+
+/// Owner liveness probe for deletions: does the durable record
+/// `sessions/<id>.json` still exist? Delegates to the shared
+/// `SessionAgentStore::owner_record_state` core (same path and stat judgment
+/// as the private store.rs probe `binding_owner_exists`, enforced by code),
+/// with a more conservative disposition: invalid ids and probe errors count
+/// as ALIVE — the caller decides deletions from this probe, and a deletion
+/// must never rest on "uncertain"; the read side's "invalid id ⇒ no owner"
+/// disposition does not apply to deletion. Only a genuine NotFound (including
+/// a non-file entry at the record path) counts as dead.
+fn code_session_owner_alive(agents: &SessionAgentStore, session_id: &str) -> bool {
+    match agents.owner_record_state(session_id) {
+        store::OwnerRecordState::Live => true,
+        // Only a real NotFound counts as dead: it is better to miss a
+        // deletion than to make a wrong one.
+        store::OwnerRecordState::NotFound => false,
+        store::OwnerRecordState::InvalidId => true,
+        store::OwnerRecordState::ProbeError(kind) => {
+            eprintln!(
+                "[pinvou3-app] code session owner probe failed, treating {session_id} as live (io kind: {kind})"
+            );
+            true
+        }
+    }
+}
+
+/// Boot-time prune of dead index entries: retention evictions delete the
+/// `sessions/<id>.json` record and the `<id>/` directory but never touch
+/// `session-agents.json`, so code entries in the index can outlive their
+/// owner — the backfill would rebuild a sidecar dir for them on every boot,
+/// and a sidecar surviving next to a lost index entry would be restored
+/// into the index again: a ghost factory repeating on every boot. Code
+/// entries whose owner is dead (only a real NotFound counts as dead, see
+/// `code_session_owner_alive`) are removed together with their sidecar/dir:
+/// `remove` does index removal + persist + sidecar cleanup in one step
+/// (NotFound tolerated). Only code-mode entries are handled: ACP leftovers
+/// are cleaned by the scan's existing branch. Returns the number of removed
+/// entries. Iteration runs over the in-memory index (see
+/// `SessionAgentStore::session_ids`), so an unparsable index file simply
+/// leaves nothing to iterate and no deletion is ever based on a state that
+/// would not be persisted.
+fn prune_dead_code_index_entries(agents: &SessionAgentStore) -> usize {
+    let mut pruned = 0usize;
+    for session_id in agents.session_ids() {
+        if !agents.get(&session_id).mode.is_code() {
+            continue;
+        }
+        if code_session_owner_alive(agents, &session_id) {
+            continue;
+        }
+        match agents.remove(&session_id) {
+            Ok(()) => {
+                pruned += 1;
+                eprintln!(
+                    "[pinvou3-app] pruned dead native code session index record for {session_id}"
+                );
+            }
+            Err(error) => eprintln!(
+                "[pinvou3-app] native code session {session_id} index prune failed: {error:#}"
+            ),
+        }
+    }
+    pruned
 }
 
 /// 扫描 session 私有目录中的原生代码会话权威 sidecar，恢复辅助索引缺失的
@@ -531,35 +906,74 @@ struct SidecarRecoverySummary {
 /// （均由辅助索引路径派生，见 `store::code_session_sidecar_root`），避免两处
 /// 根定义漂移。对每个 sidecar：索引已持有 code 模式记录时跳过（不误报
 /// 恢复）；会话已被 ACP 占用时 sidecar 属历史残留，直接清理而非反复重试；
-/// 其余情况据 sidecar 恢复索引。
+/// a record-less dir whose owner record is also gone is deletion leftover —
+/// disposed as a ghost without resurrecting the index (once the owner is
+/// gone, the sidecar's readability does not matter). The dead-index prune
+/// (see `prune_dead_code_index_entries`) runs before the scan so the scan
+/// and the backfill cannot resurrect deleted sessions' index entries or
+/// rebuild their sidecar dirs.
 fn restore_code_native_sessions_from_sidecars(
     agents: &SessionAgentStore,
 ) -> SidecarRecoverySummary {
     let mut summary = SidecarRecoverySummary::default();
+    // Dead index entries go first: retention deletes records and dirs but
+    // never the agents index, so pruning first cuts the backfill's "rebuild
+    // a sidecar dir for a dead entry" leg of the ghost-factory loop.
+    summary.pruned_dead_entries = prune_dead_code_index_entries(agents);
     // Shared iterator (review #463 round-8 elegance): the scan root, the
     // "no sessions directory is normal" case and the unreadable-entry logging
     // are defined once next to the sidecar readers, so the boot restore and
     // both rebind scans cannot drift apart again.
     for session_id in store::code_session_dir_ids(agents.path(), "native code session restore") {
-        let Some(sidecar) = store::read_code_session_sidecar(agents.path(), &session_id) else {
-            continue;
-        };
         let record = agents.get(&session_id);
         if record.mode.is_code() {
             // 索引完好无需恢复：不计入 restored，避免每次启动误报恢复信号。
             continue;
         }
         if record.backend.is_acp() {
-            // 会话已被 ACP 绑定：sidecar 是历史残留，恢复必然被拒，直接清理并
-            // 如实记日志，而不是每次启动重复报 degraded。
-            store::remove_code_session_sidecar(agents.path(), &session_id);
-            summary.cleaned += 1;
-            eprintln!(
-                "[pinvou3-app] removed leftover native code session sidecar for ACP session {session_id}"
-            );
+            // The session is already ACP-bound: the sidecar is a historical
+            // leftover, restoring it would be rejected, so dispose of it and
+            // log truthfully instead of re-reporting degraded on every boot.
+            // Count and log only when the sidecar file was really removed: a
+            // normal ACP session's dir holds no code-session.json, so an
+            // unconditional count would turn every boot into a false cleanup
+            // report.
+            if store::remove_code_session_sidecar(agents.path(), &session_id) {
+                summary.cleaned += 1;
+                eprintln!(
+                    "[pinvou3-app] removed leftover native code session sidecar for ACP session {session_id}"
+                );
+            }
             continue;
         }
-        match agents.restore_missing_code_session_record(&session_id, sidecar) {
+        // Ghost dir: no index record and the durable record is gone —
+        // deletion leftover. Restoring from it would only resurrect a ghost
+        // index entry; like the ACP-leftover branch above, dispose instead
+        // of resurrecting. Checked before the sidecar read on purpose: a
+        // corrupt or future-version `code-session.json` in a dead owner's
+        // dir must converge too, not log a parse error every boot forever.
+        // Only the sidecar file plus the now-empty dir are removed, so a
+        // leftover dir holding other content survives untouched. The count
+        // and log fire only when the sidecar file was really removed: a
+        // dead owner's bare dir (no sidecar) removes nothing, and counting
+        // it would repeat a false report on every boot forever.
+        if !code_session_owner_alive(agents, &session_id) {
+            if store::remove_code_session_sidecar(agents.path(), &session_id) {
+                summary.cleaned_ghost_sidecars += 1;
+                eprintln!(
+                    "[pinvou3-app] removed ghost native code session sidecar for deleted session {session_id}"
+                );
+            }
+            continue;
+        }
+        // Round-44 review: the sidecar content is re-read under the section
+        // lock inside the restore (the enumeration snapshot can be stale in
+        // both directions), so the scan only needs its existence as a
+        // pre-filter.
+        if store::read_code_session_sidecar(agents.path(), &session_id).is_none() {
+            continue;
+        }
+        match agents.restore_missing_code_session_record(&session_id) {
             Ok(true) => {
                 summary.restored += 1;
                 eprintln!("[pinvou3-app] recovered native code session index for {session_id}");
@@ -571,8 +985,15 @@ fn restore_code_native_sessions_from_sidecars(
         }
     }
     // 回填自愈：索引在而 sidecar 缺失（修复前构建的存量会话，或绑定时 sidecar
-    // 写失败）时按索引补写 sidecar，写失败逐条记日志。
-    summary.backfilled = agents.backfill_missing_code_session_sidecars();
+    // 写失败）时按索引补写 sidecar，写失败逐条记日志。Round-43 review：回填
+    // 与恢复同走 section 锁，索引损坏时拒绝（fail-closed）而不是对不可读表
+    // 回填，处理方式与上方恢复臂一致。
+    match agents.backfill_missing_code_session_sidecars() {
+        Ok(backfilled) => summary.backfilled = backfilled,
+        Err(error) => {
+            eprintln!("[pinvou3-app] native code session sidecar backfill skipped: {error:#}")
+        }
+    }
     if summary.restored > 0 {
         eprintln!(
             "[pinvou3-app] recovered {} native code session index record(s) from sidecars",
@@ -583,6 +1004,18 @@ fn restore_code_native_sessions_from_sidecars(
         eprintln!(
             "[pinvou3-app] backfilled {} missing native code session sidecar(s) from index",
             summary.backfilled
+        );
+    }
+    if summary.pruned_dead_entries > 0 {
+        eprintln!(
+            "[pinvou3-app] pruned {} dead native code session index record(s)",
+            summary.pruned_dead_entries
+        );
+    }
+    if summary.cleaned_ghost_sidecars > 0 {
+        eprintln!(
+            "[pinvou3-app] removed {} ghost native code session sidecar(s)",
+            summary.cleaned_ghost_sidecars
         );
     }
     summary
@@ -629,11 +1062,41 @@ pub struct CodexAcpStatus {
     /// 安装进行中的输出最新一行（同样供重挂载恢复展示）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_latest_line: Option<String>,
+    /// The outcome of the most recent install/upgrade (recorded when
+    /// `install_agent` wraps up, cleared when the next install starts). An
+    /// install spanning a settings-panel close/section switch outlives the
+    /// initiating frontend instance, so the command return value reaches no
+    /// mounted component — the remounted panel converges the restored
+    /// in-progress phase from this field instead of stranding forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_finished: Option<InstallFinishedInfo>,
     pub error: Option<String>,
     /// 稳定的英文提示代码，前端映射 i18n 文案：
     /// "kimi_cli_missing" / "kimi_auth_required" / "claude_auth_required"。
     pub setup_hint: Option<&'static str>,
 }
+
+/// Overall install/upgrade outcome: the frontend maps `ok=false` to "failed"
+/// and `cancelled=true` to "cancelled" (no red-error echo, matching the
+/// await-side cancel handling). On failure (non-cancelled) `error` carries
+/// this run's error chain for the cross-mount heal to echo — some failure
+/// paths never write `runtime_errors`, so `status.error` is not necessarily
+/// this run's cause.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InstallFinishedInfo {
+    pub ok: bool,
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Shared install-outcome store (tauri managed state): `install_agent`
+/// records the backend's most recent install/upgrade outcome when it wraps
+/// up. Complements the one-shot command return value, which only reaches the
+/// frontend instance alive at initiation time — after unmount/remount the
+/// outcome is only observable through status.
+#[derive(Default)]
+struct InstallOutcomeStore(parking_lot::RwLock<HashMap<AgentBackend, InstallFinishedInfo>>);
 
 /// 安装进度共享 store（tauri managed state）：安装子进程逐行 emit 时同步记录
 /// 执行命令与最新一行，status 查询时带回——前端设置页/App 关闭重开后从
@@ -732,12 +1195,68 @@ pub struct CodexAcpPendingElicitation {
 struct PendingPermission {
     view: CodexAcpPendingPermission,
     option_ids: Vec<String>,
+    activity: stall::ActivityClock,
+    generation: u64,
     response_tx: oneshot::Sender<RequestPermissionResponse>,
 }
 
 struct PendingElicitation {
     view: CodexAcpPendingElicitation,
+    activity: stall::ActivityClock,
+    generation: u64,
     response_tx: oneshot::Sender<CreateElicitationResponse>,
+}
+
+/// Whether a card for `session_id` from exactly `generation` awaits the user.
+/// Cards left by an older generation must not count: a dead generation's
+/// handler can still be polled after the cancel sweeps, and its late insert
+/// would otherwise hold the replacement's stall watchdog open until the user
+/// answers a card for a runtime that no longer exists.
+fn generation_awaits_user_decision(
+    generation: u64,
+    session_id: &str,
+    pending_permissions: &HashMap<String, PendingPermission>,
+    pending_elicitations: &HashMap<String, PendingElicitation>,
+) -> bool {
+    pending_permissions
+        .values()
+        .any(|pending| pending.generation == generation && pending.view.session_id == session_id)
+        || pending_elicitations.values().any(|pending| {
+            pending.generation == generation && pending.view.session_id == session_id
+        })
+}
+
+async fn take_pending_permission(
+    pending: &Mutex<HashMap<String, PendingPermission>>,
+    key: String,
+    option_id: &str,
+) -> Result<PendingPermission> {
+    let mut pending = pending.lock().await;
+    let request = pending
+        .remove(&key)
+        .context("权限请求已过期、已回复或不属于当前会话")?;
+    if !request
+        .option_ids
+        .iter()
+        .any(|candidate| candidate == option_id)
+    {
+        pending.insert(key, request);
+        bail!("权限选项不属于该请求");
+    }
+    stall::mark_activity(&request.activity);
+    Ok(request)
+}
+
+async fn take_pending_elicitation(
+    pending: &Mutex<HashMap<String, PendingElicitation>>,
+    key: &str,
+) -> Result<PendingElicitation> {
+    let mut pending = pending.lock().await;
+    let request = pending
+        .remove(key)
+        .context("输入请求已过期、已回复或不属于当前会话")?;
+    stall::mark_activity(&request.activity);
+    Ok(request)
 }
 
 struct AcpSession {
@@ -759,9 +1278,38 @@ struct AcpSession {
     kimi_session_id: Option<String>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     child: Mutex<Child>,
+    /// PID of the process directly spawned by Pinvou. Resource sampling walks
+    /// descendants from this stable ownership anchor and never records argv.
+    root_pid: u32,
+    /// Static agent id (`codex`/`claude`/`kimi`) kept only as the resource
+    /// ledger's per-role aggregation label; it carries no process details.
+    resource_role: &'static str,
+    /// Lifecycle of this spawned runtime generation (running / expected
+    /// shutdown / unexpected exit). `get_or_spawn` consults it under the pool
+    /// lock so a dead runtime is reclaimed instead of reused blindly, and its
+    /// exit feeds the session's crash budget exactly once.
+    lifecycle: Arc<RuntimeLifecycle>,
     /// 最近一次请求/响应时刻（空闲回收巡检用）。任何直接到达该会话的请求
     /// （发消息、改配置、状态查询复用）与 prompt 响应返回都会刷新。
     last_activity: parking_lot::Mutex<Instant>,
+    /// Turn activity clock shared with the event bridge. Agent events and host
+    /// delivery of card answers or cancellation advance it; timeline output
+    /// does not. The watchdog uses it independently from the idle-reaping clock.
+    activity: stall::ActivityClock,
+    /// Session-level pending permission and elicitation maps shared by the pool.
+    /// While a user is answering, silence is human think time, not an agent stall.
+    pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
+    /// Stall-settlement history; repeated stalls in the window trigger a runtime restart.
+    stall_settles: parking_lot::Mutex<stall::StallSettleTracker>,
+    /// A previous settlement requested replacement. `get_or_spawn` evicts and
+    /// respawns on the next access, restoring context through `session/load`.
+    restart_requested: AtomicBool,
+    /// Whether this spawn resumed an existing ACP session; see `spawn_session`.
+    resumed_session: bool,
+    /// Turns awaiting the Stop grace period. Deduplicate per turn so an older
+    /// poller cannot prevent the next turn from installing its own fallback.
+    cancel_settle_turns: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl AcpSession {
@@ -787,23 +1335,12 @@ impl AcpSession {
         .await
     }
 
-    async fn prompt(
-        self: Arc<Self>,
-        content: String,
-        blocks: Vec<ContentBlock>,
-        attachments: Vec<CodexDisplayAttachment>,
-    ) -> bool {
-        let turn_id = self.bridge.begin_turn(&content, &attachments);
+    async fn prompt(self: Arc<Self>, turn_id: String, blocks: Vec<ContentBlock>) -> bool {
         let kimi_diagnostic_cursor = match self.kimi_session_id.as_deref() {
             Some(session_id) => Some(kimi_diagnostic_cursor(session_id).await),
             None => None,
         };
-        let result = self
-            .connection
-            .send_request(PromptRequest::new(self.acp_session_id.clone(), blocks))
-            .block_task()
-            .await;
-        self.busy.store(false, Ordering::Release);
+        let result = self.await_prompt_with_stall_guard(&turn_id, blocks).await;
         // 响应返回也算一次活动：长时间流式输出的 turn 结束后重新计空闲。
         self.note_activity();
         match result {
@@ -815,12 +1352,7 @@ impl AcpSession {
                     Some(cursor) => kimi_failure_after(&cursor).await,
                     None => None,
                 } {
-                    crate::features::assistant::timing::finish_turn(
-                        &self.bridge_session_id(),
-                        "Failed",
-                        Some(&error),
-                    );
-                    self.bridge.finish_turn(&turn_id, "Failed", Some(&error));
+                    self.settle_turn_once(&turn_id, "Failed", Some(&error), None);
                     return false;
                 }
                 let status = match response.stop_reason {
@@ -830,26 +1362,154 @@ impl AcpSession {
                     StopReason::Refusal => "Refused",
                     _ => "Completed",
                 };
-                crate::features::assistant::timing::finish_turn(
-                    &self.bridge_session_id(),
-                    status,
-                    None,
-                );
-                self.bridge.finish_turn(&turn_id, status, None);
+                // The watchdog may already have settled this silent turn.
+                // The winning claimant owns timing and busy as well.
+                self.settle_turn_once(&turn_id, status, None, None);
                 false
             }
             Err(error) => {
                 let message = format!("ACP Agent: {error}");
-                let upgrade_required = codex_upgrade_required(&message);
-                crate::features::assistant::timing::finish_turn(
-                    &self.bridge_session_id(),
-                    "Failed",
-                    Some(&message),
-                );
-                self.bridge.finish_turn(&turn_id, "Failed", Some(&message));
-                upgrade_required
+                let claimed = self.settle_turn_once(&turn_id, "Failed", Some(&message), None);
+                claimed && codex_upgrade_required(&message)
             }
         }
+    }
+
+    /// After claiming the timeline turn, close timing and release busy last.
+    ///
+    /// A late path that loses the claim must not touch session-level timing or
+    /// busy because the user may already have started another turn. Responses,
+    /// watchdogs, and Stop fallbacks all use this order to prevent reopening
+    /// admission before the old turn is claimed.
+    fn settle_turn_once(
+        &self,
+        turn_id: &str,
+        status: &str,
+        error: Option<&str>,
+        recovery_reason: Option<&str>,
+    ) -> bool {
+        let claimed = self
+            .bridge
+            .finish_turn_once(turn_id, status, error, recovery_reason);
+        let session_id = self.bridge_session_id();
+        finalize_claimed_turn(&self.busy, claimed, || {
+            crate::features::assistant::timing::finish_turn(&session_id, status, error);
+        })
+    }
+
+    /// Wait for `session/prompt` and guard against an agent that never responds.
+    ///
+    /// This response is the host's only terminal signal. An upstream adapter can
+    /// omit it when a background notification starts a turn and absorbs the host
+    /// prompt as `absorbed_mid_turn` (for example, claude-agent-acp#896), leaving
+    /// the UI running until application restart. Escalate silence from notice to
+    /// cancellation and then local settlement after a grace period. Keep the SDK
+    /// request alive because dropping it cancels ACP and creates misleading
+    /// "response never received" noise.
+    async fn await_prompt_with_stall_guard(
+        &self,
+        turn_id: &str,
+        blocks: Vec<ContentBlock>,
+    ) -> std::result::Result<PromptResponse, agent_client_protocol::Error> {
+        let request = self
+            .connection
+            .send_request(PromptRequest::new(self.acp_session_id.clone(), blocks));
+        let mut request = std::pin::pin!(request.block_task());
+        let mut ticker = tokio::time::interval(stall::STALL_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut noticed = false;
+        let mut cancel_sent_at: Option<Instant> = None;
+        let mut previous_quiet: Option<Duration> = None;
+        let mut settled = false;
+        loop {
+            tokio::select! {
+                result = &mut request => return result,
+                _ = ticker.tick(), if !settled => {
+                    if !stall_guard_owns_turn(
+                        self.bridge.current_turn_id().as_deref(),
+                        turn_id,
+                    ) {
+                        // Stop's delayed fallback or another closer already
+                        // settled this exact turn. Keep awaiting the ACP
+                        // response, but permanently disable this future's
+                        // notice/cancel ladder so it cannot act on stale state.
+                        settled = true;
+                        continue;
+                    }
+                    if self.awaiting_user_decision().await {
+                        // The user is answering a permission or elicitation
+                        // card, so silence belongs to the human, not the agent.
+                        continue;
+                    }
+                    if !stall_guard_owns_turn(
+                        self.bridge.current_turn_id().as_deref(),
+                        turn_id,
+                    ) {
+                        // The card lookup above awaits two shared maps. Recheck
+                        // ownership after that yield before emitting any side
+                        // effect for the turn.
+                        settled = true;
+                        continue;
+                    }
+                    let quiet = stall::quiet_for(&self.activity);
+                    if stall::activity_resumed(previous_quiet, quiet) {
+                        noticed = false;
+                        cancel_sent_at = None;
+                    }
+                    previous_quiet = Some(quiet);
+                    match stall::stall_step(quiet, noticed, cancel_sent_at.map(|at| at.elapsed())) {
+                        stall::StallStep::Idle => {}
+                        stall::StallStep::Notice => {
+                            noticed = true;
+                            self.bridge.emit(
+                                "runtime_notice",
+                                json!({ "kind": "agent_stall" }),
+                            );
+                        }
+                        stall::StallStep::Cancel => {
+                            cancel_sent_at = Some(Instant::now());
+                            self.cancel();
+                            self.bridge.emit("runtime_notice", json!({ "kind": "agent_stall_cancel" }));
+                        }
+                        stall::StallStep::Settle => {
+                            settled = true;
+                            let claimed = self.settle_turn_once(
+                                turn_id,
+                                "Interrupted",
+                                None,
+                                Some("agent_stall_timeout"),
+                            );
+                            if claimed {
+                                // Restart only after repeated stalls in one session.
+                                // Losing the claim means a Stop fallback or response
+                                // already settled the turn, so do not count a phantom
+                                // stall or clear the next turn's busy flag.
+                                let restart = self.stall_settles.lock().record(Instant::now());
+                                if restart {
+                                    self.restart_requested.store(true, Ordering::Release);
+                                }
+                                let kind = if restart { "agent_stall_restart" } else { "agent_stall_settled" };
+                                self.bridge.emit("runtime_notice", json!({ "kind": kind }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether a permission or elicitation card awaits the user. Agent silence
+    /// is expected while a human reads the card and must not count as a stall.
+    async fn awaiting_user_decision(&self) -> bool {
+        let session_id = self.bridge.pinvou_session_id();
+        let permissions = self.pending_permissions.lock().await;
+        let elicitations = self.pending_elicitations.lock().await;
+        generation_awaits_user_decision(
+            self.lifecycle.generation(),
+            session_id,
+            &permissions,
+            &elicitations,
+        )
     }
 
     fn bridge_session_id(&self) -> String {
@@ -873,6 +1533,9 @@ impl AcpSession {
     }
 
     async fn shutdown(&self) {
+        // An explicit shutdown is expected: the connection task must not
+        // record this completion as an unexpected exit into the crash budget.
+        self.lifecycle.begin_expected_shutdown();
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(());
         }
@@ -923,6 +1586,15 @@ impl AcpSession {
     }
 }
 
+/// 临时会话的执行目录：由 `SessionStore::session_roots` 按会话推导。
+/// 代码模块原生会话与 ACP 临时会话共用同一推导与错误语义。
+fn session_execution_workspace(session_store: &SessionStore, session_id: &str) -> Result<PathBuf> {
+    session_store
+        .session_roots(session_id)
+        .map(|roots| roots.execution)
+        .with_context(|| format!("解析会话 {session_id} 临时工作目录失败"))
+}
+
 /// “代码”模块原生（品悟 Engine）会话的工作区信息。
 ///
 /// 临时会话执行目录与 ACP 临时会话一样由 `SessionStore::session_roots` 推导；
@@ -943,10 +1615,7 @@ fn code_native_workspace_info(
             workspace_path: path.to_string_lossy().into_owned(),
         });
     }
-    let path = session_store
-        .session_roots(session_id)
-        .map(|roots| roots.execution)
-        .with_context(|| format!("解析会话 {session_id} 临时工作目录失败"))?;
+    let path = session_execution_workspace(session_store, session_id)?;
     Ok(CodexAcpWorkspaceInfo {
         workspace_kind: CodexWorkspaceKind::Temporary,
         workspace_path: path.to_string_lossy().into_owned(),
@@ -957,6 +1626,15 @@ fn code_native_workspace_info(
 /// 安装已取消的结构化错误标记：前端按它收口「已取消」阶段，不依赖中文
 /// 文案子串匹配（复审低危 5）。
 pub(crate) static INSTALL_CANCELLED_MARKER: &str = "install_cancelled:";
+
+/// Which kind of reclaim is awaiting its replacement notice for a session.
+/// The notice kind itself derives from `resumed_session` at publish time;
+/// this only records that a disclosure is still owed.
+#[derive(Clone, Copy)]
+enum RuntimeRestart {
+    Stall,
+    Crash,
+}
 
 #[derive(Clone)]
 pub struct AcpPool {
@@ -969,10 +1647,36 @@ pub struct AcpPool {
     acp_metadata_backends: Arc<parking_lot::RwLock<HashMap<String, AgentBackend>>>,
     session_store: SessionStore,
     installing_agents: Arc<parking_lot::RwLock<HashSet<AgentBackend>>>,
+    /// Active-window registry for `install_agent` (registered at entry,
+    /// unregistered after the outcome is recorded): covers the preflight
+    /// window and the post-command probe/finalize window. Together with
+    /// `installing_agents` it keeps `status.installing` up so that
+    /// `installing=false` implies `install_finished` is already in place,
+    /// and the remounted panel's install poller never stops in the gap (see
+    /// the ProvidersSection heal effect).
+    install_active: Arc<parking_lot::RwLock<HashSet<AgentBackend>>>,
     /// 安装子进程 pid 注册表：取消安装时按 pid 杀进程树。
     install_children: Arc<parking_lot::Mutex<HashMap<AgentBackend, u32>>>,
     /// 取消标记：取消命令写入，安装等待侧在失败出口消费并以「安装已取消」收尾。
     install_cancelled: Arc<parking_lot::Mutex<HashSet<AgentBackend>>>,
+    /// Monotonic runtime generation counter: every spawned ACP child gets a
+    /// fresh generation so per-instance lifecycle state can never be confused
+    /// with a replacement's.
+    runtime_generation: Arc<AtomicU64>,
+    /// Crash budgets per session: repeated unexpected runtime exits inside the
+    /// window back off respawns and finally pause automatic rebuilds until the
+    /// window clears. Cleared whenever a runtime is deliberately discarded
+    /// (evict / rebind / idle reap / stable reuse).
+    runtime_crash_budgets: Arc<parking_lot::Mutex<HashMap<String, RuntimeCrashBudget>>>,
+    /// Restart disclosures awaiting publication: sessions whose runtime was
+    /// reclaimed (stall or crash) whose replacement has not yet emitted the
+    /// `agent_session_restarted[_fresh]` notice. The throttled replacement is
+    /// published by a later `get_or_spawn` call — the crash budget bails
+    /// before spawning — so the disclosure must live in the pool, not in one
+    /// call frame (round-3 review MAJOR-1). Cleared by the same deliberate
+    /// retirements that clear the crash budget, and consumed at the publish
+    /// site together with the call-local restart flags.
+    runtime_restart_disclosures: Arc<parking_lot::Mutex<HashMap<String, RuntimeRestart>>>,
     login_states: Arc<parking_lot::RwLock<HashMap<AgentBackend, AgentLoginState>>>,
     login_inputs: Arc<Mutex<HashMap<AgentBackend, ChildStdin>>>,
     codex_upgrade_required: Arc<AtomicBool>,
@@ -989,21 +1693,29 @@ pub struct AcpPool {
     bundled_claude_adapter: Option<PathBuf>,
     bundled_node: Option<PathBuf>,
     /// 第三方 Provider（中转）管理：store + 凭据 + 三写入器。
-    providers: ProviderManager,
+    /// Arc is for the command boundary's `spawn_blocking`: the manager's
+    /// sync methods poll the section lock and do keychain I/O, which must
+    /// leave the async runtime workers (round-46 review).
+    providers: Arc<ProviderManager>,
     /// 空闲回收巡检任务句柄。放在 Arc 里由所有 pool clone 共享：pool 本身是
     /// Clone（Tauri State 每次命令取的都是 clone），不能直接 impl Drop，否则
     /// 任一 clone 释放都会误停巡检。pool 是进程级 managed state，巡检随进程
     /// 退出自然终止；guard 的 Drop 清理仅作防御（见 start_idle_reaper 注释）。
     idle_reaper: Arc<parking_lot::Mutex<Option<IdleReaperGuard>>>,
+    /// ACP runtime resource ledger: aggregates process count and RSS of the
+    /// resident ACP process trees and writes one local diagnostics line only
+    /// when the aggregates change enough (no upload, no cmdline/env/path or
+    /// any other process detail). Arc + parking_lot mutex so the inspection
+    /// tick can sample on a blocking thread.
+    resource_ledger: Arc<parking_lot::Mutex<AcpResourceLedger>>,
 }
 
-/// `IdleReaperGuard`（Drop 时先 cancel 再 abort，双保险停止巡检，参考
-/// scheduled/tasks.rs ScheduledTaskState 的 Drop 清理模式）收敛到
-/// `core::reaper`，与 EnginePool 侧共用同一实现。
-
-/// 同一 Agent 的安装/升级互斥，不同 Agent 的状态与任务彼此隔离。
-/// guard 在外部命令完成后显式 drop，使随后返回的 status 已恢复 installing=false；
-/// 提前返回或 panic 时 Drop 仍会兜底清理。
+/// Mutually exclusive install/upgrade per Agent; different Agents stay
+/// isolated. The guard only covers the external command itself and is
+/// dropped explicitly once it finishes: the authenticated gate lifts with it,
+/// while `status.installing` keeps being covered by the `install_active`
+/// active-window registry until the outcome is recorded (see
+/// `install_agent`); Drop still cleans up on early returns and panics.
 struct AgentInstallGuard {
     installing_agents: Arc<parking_lot::RwLock<HashSet<AgentBackend>>>,
     backend: AgentBackend,
@@ -1030,11 +1742,73 @@ impl Drop for AgentInstallGuard {
     }
 }
 
-/// 安装子进程 pid 登记 guard：spawn 成功后登记，drop 时（完成/失败/超时/取消
-/// 任意出口）统一注销，避免残留 pid 在后续取消时误杀被系统复用的进程。
+/// Active-window guard for `install_agent`: registers at the entry and is
+/// unregistered after the outcome is recorded (Drop also covers early
+/// returns and panics). Complements `AgentInstallGuard`, which only covers
+/// the external command itself — this guard keeps `status.installing` up
+/// from the command entry to the recorded outcome.
+struct InstallActiveGuard {
+    install_active: Arc<parking_lot::RwLock<HashSet<AgentBackend>>>,
+    backend: AgentBackend,
+}
+
+impl InstallActiveGuard {
+    /// Registers the backend for its whole install lifecycle. `None` when an
+    /// install for the same backend is already inside its active window: the
+    /// caller must then reject without clearing that run's outcome or cancel
+    /// marker, and without recording an outcome of its own — a rejected call
+    /// never installed anything, so the stored outcome keeps describing the
+    /// most recent real install.
+    fn try_start(
+        install_active: &Arc<parking_lot::RwLock<HashSet<AgentBackend>>>,
+        backend: AgentBackend,
+    ) -> Option<Self> {
+        if !install_active.write().insert(backend) {
+            return None;
+        }
+        Some(Self {
+            install_active: install_active.clone(),
+            backend,
+        })
+    }
+}
+
+impl Drop for InstallActiveGuard {
+    fn drop(&mut self) {
+        self.install_active.write().remove(&self.backend);
+    }
+}
+
+/// Registration guard for the install child process: registers the pid after a
+/// successful spawn and unregisters it on every exit path (completion, failure,
+/// timeout, cancel) so a stale pid never kills a process the OS has since reused.
+///
+/// Reclaim semantics follow whether the direct child has been reaped by a wait:
+/// - Not yet reaped (early error return, a panic before the wait, a wait that
+///   returned `Err`): the reap state is unknown — the pid may still name a live
+///   process, or may already have been freed. The armed `Drop` still reclaims
+///   the whole tree by pid as a best effort, because after such an exit nobody
+///   can cancel the descendants spawned by npm / the vendor script. Unix kills
+///   the process group (the installer runs as its own group leader; ESRCH-safe,
+///   at worst a no-op); Windows uses the bounded `taskkill /T`, the same path
+///   the cancel command uses — there a freed-and-recycled pid could hit an
+///   unrelated tree, accepted because this arm only fires on exits that never
+///   reached a terminal wait.
+/// - Reaped (the wait returned `Ok`): settle immediately at the wait site
+///   through [`InstallChildGuard::settle_reaped`] — after a reap the pid may
+///   already be recycled and the `Drop` must never kill by it. The failure and
+///   timeout exits then call [`InstallChildGuard::reclaim_group_survivors`]
+///   once: unix reclaims the process group (survivors of the leader are still
+///   members, an empty group is ESRCH-safe); Windows skips the kill
+///   (`taskkill /T` on a dead root cannot reach its orphans).
+/// - Explicit success (including the idempotent kind): settled at the same
+///   wait site and nothing is reclaimed — the installer wound down its own
+///   children.
 struct InstallChildGuard {
     install_children: Arc<parking_lot::Mutex<HashMap<AgentBackend, u32>>>,
     backend: AgentBackend,
+    pid: Option<u32>,
+    armed: bool,
 }
 
 impl InstallChildGuard {
@@ -1049,6 +1823,36 @@ impl InstallChildGuard {
         Self {
             install_children: install_children.clone(),
             backend,
+            pid,
+            armed: true,
+        }
+    }
+
+    /// The caller's wait returned `Ok`: the direct child has been reaped and
+    /// its pid no longer names a live process. Settle immediately at the wait
+    /// site — before any further await or fallible step — so a panic in
+    /// between can never drop the guard armed on a pid the OS may already
+    /// have handed to another process.
+    fn settle_reaped(&mut self) {
+        self.armed = false;
+        // The reaped pid no longer names a live process: drop the registry
+        // entry now so a user cancel during the post-wait tail cannot
+        // tree-kill by the freed pid (the Drop's removal then finds nothing).
+        self.install_children.lock().remove(&self.backend);
+    }
+
+    /// Best-effort reclaim of process-group survivors after the leader was
+    /// reaped on a failure/timeout exit. Survivors that outlived the leader
+    /// are still group members, so one group kill reaches them; an empty
+    /// group is ESRCH-safe. Windows skips the kill: `taskkill /T` walks the
+    /// parent-child snapshot from the given root, a dead root's orphans are
+    /// re-parented and unreachable, and by a possibly recycled pid the kill
+    /// would hit an unrelated process tree.
+    fn reclaim_group_survivors(&self) {
+        if !crate::platform::capabilities::is_windows() {
+            if let Some(pid) = self.pid {
+                kill_install_process_tree(pid);
+            }
         }
     }
 }
@@ -1056,6 +1860,16 @@ impl InstallChildGuard {
 impl Drop for InstallChildGuard {
     fn drop(&mut self) {
         self.install_children.lock().remove(&self.backend);
+        // Unregistering must not keep the entry alive, but an armed Drop — an
+        // exit that never reached a terminal wait — still reclaims the whole
+        // child tree outside the registry lock. Detached: the Windows kill is
+        // bounded (2 s) but must not stall the runtime worker that is
+        // unwinding this frame.
+        if self.armed {
+            if let Some(pid) = self.pid {
+                std::thread::spawn(move || kill_install_process_tree(pid));
+            }
+        }
     }
 }
 
@@ -1079,6 +1893,88 @@ fn remove_agent_paths(paths: Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 升级失败（含用户取消）时恢复移开的旧二进制：仅在备份仍存在且原路径已空时
+/// rename 回去，避免覆盖并发方刚写入的文件。npm 与官方脚本两条升级通道共用。
+fn restore_moved_aside_backups(moved_backups: &[(PathBuf, PathBuf)]) {
+    for (original, backup) in moved_backups {
+        if backup.is_file() && !original.exists() {
+            let _ = std::fs::rename(backup, original);
+        }
+    }
+}
+
+/// 升级验证通过后清理 .pre-upgrade 备份，释放磁盘空间（先验证后删除，假成功
+/// 时旧二进制备份保留）。
+fn discard_moved_aside_backups(moved_backups: &[(PathBuf, PathBuf)]) {
+    for (_, backup) in moved_backups {
+        let _ = std::fs::remove_file(backup);
+    }
+}
+
+/// Degradation decision for the `official_script` action (pure-function core,
+/// for unit testing):
+/// - script source reachable → `official_script` as-is;
+/// - unreachable and a local npm fallback exists (matching npm package and a
+///   runnable npm) → `npm_upgrade`
+///   (`run_npm_global_upgrade` has built-in npmmirror mirror retry);
+/// - unreachable and no npm fallback → `None`; the caller reports the
+///   original network error and the manual-install hint.
+///
+/// The same applies to kimi's official_script action: degrade only when its
+/// official source (code.kimi.com, reachable from China) is truly
+/// unreachable; the normal path is unaffected. This does not contradict the
+/// latest probe excluding the npmmirror fallback for kimi — what is excluded
+/// there is the version-probe fallback on the normal path, while this is the
+/// install fallback when reachability fails (npm is a legitimate install
+/// channel for kimi in the first place).
+fn official_script_degrade(
+    script_reachable: bool,
+    npm_fallback_available: bool,
+) -> Option<&'static str> {
+    if script_reachable {
+        Some("official_script")
+    } else if npm_fallback_available {
+        Some("npm_upgrade")
+    } else {
+        None
+    }
+}
+
+/// Whether an npm fallback exists when the script source is unreachable
+/// (pure-function core, for unit testing): a matching npm package **and**
+/// a findable npm executable — both are required. With a package but no npm,
+/// degrading would only fail mid-install with "npm not detected"; the
+/// preflight is better off reporting the original network error plus the
+/// manual-install hint up front.
+fn npm_fallback_available(npm_package: Option<&str>, npm_executable: bool) -> bool {
+    npm_package.is_some() && npm_executable
+}
+
+/// Whether the official script binary must be moved aside before the npm
+/// upgrade (pure-function core, for unit testing): only when the script path
+/// is the currently resolved, effective CLI does the script file shadow the
+/// new version npm installs into the global directory, making the move
+/// meaningful. Sources with higher resolution priority (`PINVOU3_*_CLI_PATH`
+/// overrides, the agent SDK binary bundled with the Claude bridge, PATH hits)
+/// are not shadowed by the script file — moving aside would not make the
+/// upgrade more effective there, and under the ordering where finalize only
+/// verifies what is installed and effectiveness validation runs after backup
+/// cleanup, it would permanently delete the user's script install (backups
+/// are cleaned up once finalize passes, while version effectiveness
+/// validation only runs at the install finalize step).
+fn npm_move_aside_needed(resolved: Option<&Path>, script_paths: &[PathBuf]) -> bool {
+    match resolved {
+        Some(path) => script_paths
+            .iter()
+            .any(|candidate| candidate.as_path() == path),
+        // Still move aside when no usable CLI can be resolved: a leftover
+        // script is a bad file the resolver does not recognize, and clearing
+        // it aside is what lets the post-upgrade probe hit the new version
+        // npm installed.
+        None => true,
+    }
 }
 
 impl AcpPool {
@@ -1127,13 +2023,22 @@ impl AcpPool {
             if agents.backend(session_id).is_acp() {
                 continue;
             }
-            match load_acp_recovery_record(session_id, *backend, &session_store)
-                .and_then(|record| agents.restore_missing_acp_record(session_id, record))
-            {
-                Ok(()) => eprintln!(
+            match load_acp_recovery_record(session_id, *backend, &session_store).and_then(
+                |record| {
+                    // Round-44 review: re-load the recovery source under the
+                    // store's section lock; a `sessions delete` landing between
+                    // the boot-pass read and the lock must not leave an orphan
+                    // ACP index record behind.
+                    agents.restore_missing_acp_record(session_id, record, || {
+                        load_acp_recovery_record(session_id, *backend, &session_store).is_ok()
+                    })
+                },
+            ) {
+                Ok(true) => eprintln!(
                     "[pinvou3-app] recovered {} ACP session index for {session_id}",
                     backend.display_name()
                 ),
+                Ok(false) => {}
                 Err(error) => eprintln!(
                     "[pinvou3-app] {} ACP session {session_id} remains read-only until its index can be recovered: {error:#}",
                     backend.display_name()
@@ -1182,6 +2087,7 @@ impl AcpPool {
             }
         }
         app.manage(InstallProgressStore::default());
+        app.manage(InstallOutcomeStore::default());
         Ok(Self {
             app,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1192,8 +2098,12 @@ impl AcpPool {
             acp_metadata_backends: Arc::new(parking_lot::RwLock::new(acp_metadata_backends)),
             session_store,
             installing_agents: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            install_active: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             install_children: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             install_cancelled: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            runtime_generation: Arc::new(AtomicU64::new(0)),
+            runtime_crash_budgets: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            runtime_restart_disclosures: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             login_states: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             login_inputs: Arc::new(Mutex::new(HashMap::new())),
             codex_upgrade_required: Arc::new(AtomicBool::new(false)),
@@ -1209,10 +2119,11 @@ impl AcpPool {
             bundled_adapter,
             bundled_claude_adapter,
             bundled_node,
-            providers: ProviderManager::new(
+            providers: Arc::new(ProviderManager::new(
                 crate::platform::credential_store::SystemCredentialStore::new(),
-            )?,
+            )?),
             idle_reaper: Arc::new(parking_lot::Mutex::new(None)),
+            resource_ledger: Arc::new(parking_lot::Mutex::new(AcpResourceLedger::default())),
         })
     }
 
@@ -1222,25 +2133,62 @@ impl AcpPool {
 
     /// Whether this ACP session has a prompt turn in flight or admitted-but-
     /// not-yet-started (`prompt_pending`, same predicate the rebind eviction
-    /// uses). Operations that rewrite workspace bindings (directory rebind)
-    /// use this to reject busy sessions (same semantics as
-    /// EnginePool::is_turn_active, giving the command layer one uniform
-    /// fence). Sessions without a runtime (never spawned) return false.
+    /// and fence use). Sessions without a runtime (never spawned) return
+    /// false.
+    ///
+    /// Directory rebind does NOT fence through this accessor: its wait for
+    /// the sessions lock is unbounded, and rebind holds the process-wide gate
+    /// across the call — the rebind fences go through
+    /// [`Self::rebind_blocking_sessions`] instead (review #463 round-10
+    /// T13/T16).
     pub async fn is_turn_active(&self, session_id: &str) -> bool {
         self.sessions
             .lock()
             .await
             .get(session_id)
             .is_some_and(|runtime| {
-                runtime.busy.load(std::sync::atomic::Ordering::Acquire)
-                    || runtime
+                rebind_busy_flags(
+                    runtime.busy.load(std::sync::atomic::Ordering::Acquire),
+                    runtime
                         .configuring
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    || runtime
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    runtime
                         .prompt_pending
                         .load(std::sync::atomic::Ordering::Acquire)
-                        > 0
+                        > 0,
+                )
             })
+    }
+
+    /// Rebind fence (review #463 round-10 T13/T16, restored by round-11 B2):
+    /// the subset of `session_ids` that must block a directory rebind,
+    /// decided under ONE bounded acquisition of the pool's sessions lock.
+    /// `None` means the state could not be read inside
+    /// `REBIND_ACP_LOCK_TIMEOUT` — a concurrent cold spawn holds that lock
+    /// across its handshake — and the caller must refuse the run instead of
+    /// stalling. One lock for the whole set rather than one per session: a
+    /// per-session bound would multiply the same stall by the number of
+    /// affected sessions.
+    ///
+    /// The busy predicate is the shared `rebind_busy_flags` (round-13): like
+    /// [`Self::is_turn_active`] and the rebind eviction it counts a prompt
+    /// that has been resolved but not yet admitted (`prompt_pending`), which
+    /// closes the pre-admission window the eviction already guards against
+    /// being killed.
+    pub async fn rebind_blocking_sessions(&self, session_ids: &[String]) -> Option<Vec<String>> {
+        rebind_blocking_from_sessions(&self.sessions, session_ids, |runtime| {
+            rebind_busy_flags(
+                runtime.busy.load(std::sync::atomic::Ordering::Acquire),
+                runtime
+                    .configuring
+                    .load(std::sync::atomic::Ordering::Acquire),
+                runtime
+                    .prompt_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    > 0,
+            )
+        })
+        .await
     }
 
     /// 会话类型以 ACP 辅助索引为主，并用 SavedSession 中持久化的 Agent 模型类型兜底。
@@ -1249,6 +2197,14 @@ impl AcpPool {
     /// / Claude / Kimi 会话掉回普通聊天列表；创建会话时写入的 `* (ACP)` 元数据
     /// 是长期兼容依据。列表调用已经持有 metadata，应使用本方法避免重复读取 transcript。
     pub fn is_acp_metadata(&self, metadata: &SessionMetadata) -> bool {
+        // Defense-in-depth (round-36 minor 5): an aux of an ACP main inherits
+        // the exact ACP model string, so model-string sniffing alone would
+        // classify it ACP and let a raw-metadata scan feed a full-tool ACP
+        // agent an aux id outside the EnginePool pins. Aux sessions are never
+        // ACP: their lifecycle and tool posture are aux-owned.
+        if crate::features::sessions::is_aux_session_id(&metadata.id) {
+            return false;
+        }
         let backend = self.agents.backend(&metadata.id);
         let Some(backend) = acp_session_backend(backend, &metadata.model) else {
             return false;
@@ -1262,6 +2218,9 @@ impl AcpPool {
     }
 
     pub fn is_acp(&self, session_id: &str) -> bool {
+        if crate::features::sessions::is_aux_session_id(session_id) {
+            return false;
+        }
         self.agents.backend(session_id).is_acp()
             || self.acp_metadata_backends.read().contains_key(session_id)
     }
@@ -1313,11 +2272,9 @@ impl AcpPool {
             CodexWorkspaceKind::Project => record
                 .workspace_path
                 .context("Codex 项目会话缺少工作目录记录")?,
-            CodexWorkspaceKind::Temporary => self
-                .session_store
-                .session_roots(session_id)
-                .map(|roots| roots.execution)
-                .with_context(|| format!("解析会话 {session_id} 临时工作目录失败"))?,
+            CodexWorkspaceKind::Temporary => {
+                session_execution_workspace(&self.session_store, session_id)?
+            }
         };
         let available = match record.workspace_kind {
             CodexWorkspaceKind::Project => path.is_dir(),
@@ -1348,19 +2305,13 @@ impl AcpPool {
                     )
                 });
             }
-            return self
-                .session_store
-                .session_roots(session_id)
-                .map(|roots| roots.execution)
-                .with_context(|| format!("解析会话 {session_id} 临时工作目录失败"));
+            return session_execution_workspace(&self.session_store, session_id);
         }
         let record = self.acp_record(session_id)?;
         match record.workspace_kind {
-            CodexWorkspaceKind::Temporary => self
-                .session_store
-                .session_roots(session_id)
-                .map(|roots| roots.execution)
-                .with_context(|| format!("解析会话 {session_id} 临时工作目录失败")),
+            CodexWorkspaceKind::Temporary => {
+                session_execution_workspace(&self.session_store, session_id)
+            }
             CodexWorkspaceKind::Project => {
                 let path = record.workspace_path.with_context(|| {
                     format!("{} 项目会话缺少工作目录记录", record.backend.display_name())
@@ -1436,7 +2387,13 @@ impl AcpPool {
             .unwrap_or_default();
         if backend == AgentBackend::KimiAcp {
             let kimi = self.cli_probe_for(backend);
-            let installing = self.installing_agents.read().contains(&backend);
+            // status.installing covers the whole install_agent lifecycle
+            // (preflight and the post-command probe/finalize window alike);
+            // the authenticated gate keeps looking at the install lock only —
+            // probes keep running inside the active window and an installed,
+            // authenticated agent must not flash as unauthenticated.
+            let guard_installing = self.installing_agents.read().contains(&backend);
+            let installing = guard_installing || self.install_active.read().contains(&backend);
             let kimi_version = kimi.as_ref().and_then(|cli| cli.version.clone());
             let install_source = kimi
                 .as_ref()
@@ -1448,7 +2405,7 @@ impl AcpPool {
             let cli_ready = kimi.is_some() && version_supported;
             let installed = cli_ready;
             let authenticated = !login.in_progress
-                && !installing
+                && !guard_installing
                 && kimi
                     .as_ref()
                     .is_some_and(|cli| self.cached_agent_authenticated(backend, &cli.path));
@@ -1487,6 +2444,7 @@ impl AcpPool {
                 error: login.error.or_else(|| self.runtime_errors.get(backend)),
                 install_command: None,
                 install_latest_line: None,
+                install_finished: None,
                 setup_hint: if !cli_ready {
                     Some("kimi_cli_missing")
                 } else if !authenticated {
@@ -1496,6 +2454,7 @@ impl AcpPool {
                 },
             };
             fill_install_progress(&self.app, backend, &mut status);
+            fill_install_outcome(&self.app, backend, &mut status);
             return status;
         }
 
@@ -1577,9 +2536,16 @@ impl AcpPool {
         };
         // 登录命令运行期间不要再启动同一 CLI 的 auth status。部分 CLI 会让两条
         // 命令争用凭证锁，原来的 750ms 状态轮询因此可能拖住 Tauri 的 IPC/UI。
-        let installing = self.installing_agents.read().contains(&backend);
+        // status.installing covers the whole install_agent lifecycle (preflight
+        // and the post-command probe/finalize window alike) so that
+        // `installing=false` implies `install_finished` is already in place;
+        // the authenticated gate keeps looking at the install lock only —
+        // probes keep running inside the active window and an authenticated
+        // agent must not flash as unauthenticated.
+        let guard_installing = self.installing_agents.read().contains(&backend);
+        let installing = guard_installing || self.install_active.read().contains(&backend);
         let authenticated = !login.in_progress
-            && !installing
+            && !guard_installing
             && match backend {
                 AgentBackend::CodexAcp => codex.as_ref().is_some_and(|resolved| {
                     self.cached_agent_authenticated(backend, &resolved.probe_path)
@@ -1649,8 +2615,10 @@ impl AcpPool {
             },
             install_command: None,
             install_latest_line: None,
+            install_finished: None,
         };
         fill_install_progress(&self.app, backend, &mut status);
+        fill_install_outcome(&self.app, backend, &mut status);
         status
     }
 
@@ -1856,8 +2824,6 @@ impl AcpPool {
             );
             bail!("{} 正在通过 Homebrew 安装，请稍候", backend.display_name());
         };
-        // 清掉上一次安装可能残留的取消标记：本次失败语义只来自本次取消。
-        self.install_cancelled.lock().remove(&backend);
         diagnostics::write(
             &operation_id,
             "homebrew:start",
@@ -1922,16 +2888,26 @@ impl AcpPool {
     /// 安装前自检：把「脚本源不可达」和「目标路径存在不可用的坏残留」挡在
     /// 安装开始前，避免安装跑到一半才失败，或覆盖坏安装后依旧不可用。
     ///
+    /// Returns the actually effective install action: when the official_script
+    /// script source is unreachable and local npm is available, it
+    /// automatically degrades to `npm_upgrade` (`run_npm_global_upgrade` has
+    /// built-in npmmirror mirror retry) instead of failing outright on script
+    /// sources like chatgpt.com/claude.ai that are unreachable from China.
+    ///
     /// - official_script：HEAD 探测脚本 URL（连接 3s / 总 5s 超时，传输层失败
     ///   即视为不可达）；并检查官方脚本目标路径的残留是否可用——存在但探测
     ///   没解析到它（或该文件本身跑不起 `--version`）就是半成品/被替换的坏
-    ///   文件，覆盖安装未必能修复，先拦截并提示删除。
+    ///   file; a covering install may not fix it, so intercept up front and
+    ///   prompt for deletion. The bad-leftover check also runs when degraded
+    ///   to the npm install: bad files from early script installs shadow the
+    ///   npm-installed version on PATH, and letting them through would make
+    ///   the upgrade effectiveness validation misreport.
     /// - npm_upgrade：npm 可执行存在性由 run_npm_global_upgrade 保证；npm
     ///   全局安装幂等，半装残留会由 npm 自身收敛，不做额外检测。
     /// - brew_upgrade：brew 自身处理幂等与升级，无需预检。
-    async fn preflight_install(&self, backend: AgentBackend, action: &str) -> Result<()> {
+    async fn preflight_install(&self, backend: AgentBackend, action: &str) -> Result<String> {
         if action != "official_script" {
-            return Ok(());
+            return Ok(action.to_string());
         }
         let (unix_url, windows_url) = official_script_urls(backend);
         let url = if crate::platform::capabilities::is_windows() {
@@ -1939,14 +2915,33 @@ impl AcpPool {
         } else {
             unix_url
         };
-        if !script_url_reachable(url).await {
-            let npm_pkg = npm_package(backend).unwrap_or("");
-            bail!(
-                "无法连接 {} 官方安装脚本（{url}），请检查网络或稍后重试；\
-                 也可手动安装：npm install -g {npm_pkg}",
-                backend.display_name()
+        let script_reachable = script_url_reachable(url).await;
+        let npm_fallback_available =
+            npm_fallback_available(npm_package(backend), npm_executable().is_some());
+        let effective = official_script_degrade(script_reachable, npm_fallback_available)
+            .ok_or_else(|| {
+                let npm_pkg = npm_package(backend).unwrap_or("");
+                anyhow::anyhow!(
+                    "cannot reach the {} official install script ({url}); \
+                     check your network or retry later, or install manually: \
+                     npm install -g {npm_pkg}",
+                    backend.display_name()
+                )
+            })?;
+        self.ensure_no_stale_official_install(backend).await?;
+        if effective != action {
+            diagnostics::write(
+                "install-preflight",
+                "preflight:script_source_unreachable_degrade_npm",
+                format!("url={url} npm_pkg={}", npm_package(backend).unwrap_or("")),
             );
         }
+        Ok(effective.to_string())
+    }
+
+    /// Bad-leftover check on the official script target path (shared by the
+    /// script install and the degraded npm install).
+    async fn ensure_no_stale_official_install(&self, backend: AgentBackend) -> Result<()> {
         let pool = self.clone();
         let stale_install =
             tokio::task::spawn_blocking(move || pool.stale_official_install(backend))
@@ -2015,16 +3010,78 @@ impl AcpPool {
         if !backend.is_acp() {
             bail!("Agent 不是 ACP 后端: {agent_id}");
         }
+        // Register the active window before touching any shared install
+        // state: status.installing must stay up from the entry to the
+        // recorded outcome, so the remounted panel's poller never stops
+        // before the heal data exists (see the ProvidersSection cross-mount
+        // heal). A second install for the same backend is rejected here
+        // without clearing the running one's outcome or cancel marker and
+        // without recording an outcome — a rejected call never installed
+        // anything, so install_finished keeps describing the most recent
+        // real install.
+        let Some(install_active_guard) =
+            InstallActiveGuard::try_start(&self.install_active, backend)
+        else {
+            bail!("{} 正在安装，请稍候", backend.display_name());
+        };
+        // Clear the previous outcome and any stale cancel marker before this
+        // run starts: install_finished describes only the most recent
+        // install, and a marker left over by an earlier run whose window
+        // ended abnormally must not kill this run at the spawn-time recheck.
+        clear_install_outcome(&self.app, backend);
+        self.install_cancelled.lock().remove(&backend);
+        let result = self.install_agent_inner(backend, action).await;
+        // Record the real outcome when wrapping up. The command return value
+        // only reaches the frontend instance alive at initiation time — once
+        // the panel is closed/switched away mid-install that instance is
+        // unmounted, and the remounted panel learns the outcome only from
+        // install_finished in status (see the ProvidersSection cross-mount
+        // heal). Record before leaving the active window: installing=false
+        // and a missing outcome never coexist. Also consume a cancel marker
+        // still armed here: it can only come from a preflight-window cancel
+        // whose natural failure won the race against the spawn-time recheck,
+        // so the run reports cancelled per user intent (an in-command cancel
+        // has already consumed the marker to rewrite its own failure).
+        let cancel_pending = self.install_cancelled.lock().remove(&backend);
+        let error_detail = result.as_ref().err().map(|error| format!("{error:#}"));
+        let (outcome, returned_error) = settle_install_result(
+            result.is_ok(),
+            cancel_pending,
+            error_detail.as_deref(),
+            backend,
+        );
+        record_install_outcome(&self.app, backend, outcome);
+        drop(install_active_guard);
+        match returned_error {
+            // Cancellation settlement: the recorded outcome says cancelled,
+            // so the return value must classify the same way — the
+            // initiating instance's catch classifies via the structured
+            // marker and would otherwise overwrite the cancelled phase with
+            // failed plus a red error (see settle_install_result).
+            Some(detail) => Err(anyhow!(detail)),
+            None => result,
+        }
+    }
+
+    async fn install_agent_inner(
+        &self,
+        backend: AgentBackend,
+        action: Option<&str>,
+    ) -> Result<CodexAcpStatus> {
         // 分派前强制刷新探测，确保 install_action 基于当前真实环境。
         self.refresh_agent_cli_probe(backend).await;
         let status = self.status_for_async(backend).await;
-        let action = match action {
+        let requested_action = match action {
             Some(action) => parse_install_action(action)?,
             None => status.install_action,
         };
         // 安装前自检：把网络不可达与坏残留挡在开始前（见 preflight_install）。
         // 必须放在停会话之前——自检失败时不要白白关掉用户运行中的会话。
-        self.preflight_install(backend, action).await?;
+        // When the official script source is unreachable and npm is available,
+        // the preflight degrades the action to npm_upgrade (with built-in
+        // npmmirror mirror retry) instead of failing outright on the
+        // unreachable script source.
+        let action = self.preflight_install(backend, requested_action).await?;
         // 安装/升级前停掉该 Agent 的运行中会话：Windows 下被会话占用的
         // CLI 二进制无法替换（npm EBUSY / 脚本覆盖失败），先 shutdown 再安装，
         // 与卸载的前置检查同一原则。
@@ -2037,7 +3094,7 @@ impl AcpPool {
         let operation_id = diagnostics::operation_id("install");
         let previous_version = status.version.clone();
         let previous_installed = status.installed;
-        let result = match action {
+        let result = match action.as_str() {
             "none" => Ok(status),
             "brew_upgrade" => self.upgrade_via_homebrew(backend).await,
             "npm_upgrade" => self.upgrade_via_npm(backend).await,
@@ -2143,6 +3200,22 @@ impl AcpPool {
         }
     }
 
+    /// Resolves the currently effective CLI path for a backend (the same
+    /// resolution priority as each Agent's probe/login entry points). Used
+    /// only for the move-aside decision before the npm upgrade; `None` means
+    /// no usable CLI could be resolved on this machine.
+    fn resolved_agent_cli_path(&self, backend: AgentBackend) -> Option<PathBuf> {
+        match backend {
+            AgentBackend::CodexAcp => resolve_codex_cli(),
+            AgentBackend::ClaudeAcp => {
+                let adapter = self.resolve_claude_adapter();
+                resolve_claude_cli(adapter.as_deref())
+            }
+            AgentBackend::KimiAcp => resolve_kimi_path(),
+            AgentBackend::Deepseek => None,
+        }
+    }
+
     /// 通过 npm 全局升级 Agent CLI（`npm install -g <pkg>@latest`），输出写诊断日志。
     async fn upgrade_via_npm(&self, backend: AgentBackend) -> Result<CodexAcpStatus> {
         let operation_id = diagnostics::operation_id("npm-upgrade");
@@ -2156,8 +3229,68 @@ impl AcpPool {
             diagnostics::write(&operation_id, "npm:already_installing", "result=rejected");
             bail!("{} 正在升级，请稍候", backend.display_name());
         };
-        // 清掉上一次安装可能残留的取消标记：本次失败语义只来自本次取消。
-        self.install_cancelled.lock().remove(&backend);
+        // Rename the old binary installed by the official script and move it
+        // aside first: only when the script path is the currently resolved,
+        // effective CLI is the new version npm installs into the global
+        // directory shadowed by the old file (the upgrade would never take
+        // effect, and effectiveness validation would only misreport as
+        // "in use / blocked by security software"). Degrading to npm_upgrade
+        // when the official script source is unreachable always hits this
+        // scenario. Sources with higher resolution priority (environment
+        // variable overrides, the SDK bundled with the Claude bridge) are not
+        // shadowed by the script file, so skip the move-aside: moving aside
+        // would not make the upgrade more effective there, and would
+        // permanently delete the user's script install once the backup is
+        // cleaned up. The mechanism matches the script path: abort on backup
+        // failure, restore the old file on command failure, clean up the
+        // backup only after validation passes; a fresh install (no old file)
+        // moves no files.
+        let script_paths = providers::lifecycle::official_script_paths(backend);
+        let resolved_cli = self.resolved_agent_cli_path(backend);
+        let moved_backups = if npm_move_aside_needed(resolved_cli.as_deref(), &script_paths) {
+            match move_official_binaries_aside(backend) {
+                Ok(moved) => {
+                    if !moved.is_empty() {
+                        diagnostics::write(
+                            &operation_id,
+                            "npm:move_aside",
+                            format!(
+                                "agent={} backups={}",
+                                backend.agent_id().unwrap_or("unknown"),
+                                moved
+                                    .iter()
+                                    .map(|(_, backup)| backup.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            ),
+                        );
+                    }
+                    moved
+                }
+                Err(error) => {
+                    diagnostics::write(
+                        &operation_id,
+                        "npm:move_aside_failed",
+                        format!("{error:#}"),
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            diagnostics::write(
+                &operation_id,
+                "npm:move_aside_skipped",
+                format!(
+                    "agent={} resolved={}",
+                    backend.agent_id().unwrap_or("unknown"),
+                    resolved_cli
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                ),
+            );
+            Vec::new()
+        };
         diagnostics::write(
             &operation_id,
             "npm:start",
@@ -2171,14 +3304,37 @@ impl AcpPool {
             &self.install_cancelled,
         )
         .await;
+        if result.is_err() && !moved_backups.is_empty() {
+            // npm install failed (including user cancel): restore the old
+            // files so the previous version is not lost.
+            restore_moved_aside_backups(&moved_backups);
+            diagnostics::write(
+                &operation_id,
+                "npm:restore_backups",
+                format!(
+                    "agent={} restored={}",
+                    backend.agent_id().unwrap_or("unknown"),
+                    moved_backups.len()
+                ),
+            );
+        }
         drop(install_guard);
         // 无论成败都强制重新探测：npm 可能部分完成（已写入二进制但链接失败）。
         self.refresh_agent_cli_probe(backend).await;
         match result {
             Ok(()) => {
                 diagnostics::write(&operation_id, "npm:complete", "result=success");
-                self.finalize_agent_install(backend, previous_codex_version)
-                    .await
+                // Backups are not deleted here: finalize does the
+                // version/readiness validation and **cleans up** the
+                // .pre-upgrade backups only after validation passes (the same
+                // verify-then-delete principle as the script path).
+                let finalized = self
+                    .finalize_agent_install(backend, previous_codex_version)
+                    .await;
+                if finalized.is_ok() {
+                    discard_moved_aside_backups(&moved_backups);
+                }
+                finalized
             }
             Err(error) => {
                 let detail = format!("{error:#}");
@@ -2214,8 +3370,6 @@ impl AcpPool {
             );
             bail!("{} 正在安装，请稍候", backend.display_name());
         };
-        // 清掉上一次安装可能残留的取消标记：本次失败语义只来自本次取消。
-        self.install_cancelled.lock().remove(&backend);
         // 升级前把官方脚本目标路径的旧二进制改名移开：Claude 官方 install
         // 子命令检测到「已存在 native installation」时会跳过覆盖却仍输出成功
         // （假成功，实测）。移开后脚本走全新安装路径；脚本失败时恢复旧文件，
@@ -2263,11 +3417,7 @@ impl AcpPool {
         .await;
         if result.is_err() && !moved_backups.is_empty() {
             // 脚本失败（含用户取消）：恢复旧文件，避免旧版本丢失。
-            for (original, backup) in &moved_backups {
-                if backup.is_file() && !original.exists() {
-                    let _ = std::fs::rename(backup, original);
-                }
-            }
+            restore_moved_aside_backups(&moved_backups);
             diagnostics::write(
                 &operation_id,
                 "script:restore_backups",
@@ -2293,9 +3443,7 @@ impl AcpPool {
                     .finalize_agent_install(backend, previous_codex_version)
                     .await;
                 if finalized.is_ok() {
-                    for (_, backup) in &moved_backups {
-                        let _ = std::fs::remove_file(backup);
-                    }
+                    discard_moved_aside_backups(&moved_backups);
                 }
                 finalized
             }
@@ -2312,19 +3460,35 @@ impl AcpPool {
         }
     }
 
-    /// 取消正在进行的 Agent CLI 安装：写入取消标记并按登记的 pid 杀进程树。
-    /// 等待侧检测到取消标记后以「安装已取消」收尾，installing 随其出口恢复 false。
+    /// Cancels a running Agent CLI install: arms the cancel marker and kills
+    /// the registered process tree by pid. The wait side sees the marker and
+    /// wraps up as cancelled, and `installing` drops when that run exits.
+    /// The preflight / post-command finalize window (active window already
+    /// registered, external command not yet spawned or already exited) has
+    /// no pid to kill: the marker is left for the spawn-time recheck to
+    /// consume, or is consumed when the outcome is recorded.
     pub async fn cancel_agent_install(&self, agent_id: &str) -> Result<CodexAcpStatus> {
         let backend = AgentBackend::parse(Some(agent_id))?;
         if !backend.is_acp() {
             bail!("Agent 不是 ACP 后端: {agent_id}");
         }
-        if !self.installing_agents.read().contains(&backend) {
+        let guard_held = self.installing_agents.read().contains(&backend);
+        if !guard_held && !self.install_active.read().contains(&backend) {
             bail!("{} 当前没有正在进行的安装", backend.display_name());
         }
         self.install_cancelled.lock().insert(backend);
-        if let Some(pid) = self.install_children.lock().get(&backend).copied() {
-            kill_install_process_tree(pid);
+        if guard_held {
+            // Bind before awaiting: an `if let` scrutinee temporary (the
+            // parking_lot guard here) lives to the end of the statement, and
+            // a non-Send guard held across the await below would make this
+            // future !Send.
+            let pid = self.install_children.lock().get(&backend).copied();
+            if let Some(pid) = pid {
+                // Same blocking-pool discipline as the install-lane kills:
+                // the Windows taskkill wait is budgeted (2 s) and must not
+                // stall an async runtime worker from the cancel command.
+                let _ = tokio::task::spawn_blocking(move || kill_install_process_tree(pid)).await;
+            }
         }
         Ok(self.status_for_async(backend).await)
     }
@@ -2412,23 +3576,32 @@ impl AcpPool {
                 .filter(|session_id| self.agents.backend(session_id) == backend)
                 .cloned()
                 .collect::<Vec<_>>();
-            session_ids
-                .iter()
-                .filter_map(|session_id| {
-                    sessions
-                        .remove(session_id)
-                        .map(|runtime| (session_id.clone(), runtime))
-                })
-                .collect::<Vec<_>>()
+            let mut runtimes = Vec::with_capacity(session_ids.len());
+            for session_id in session_ids {
+                let Some(runtime) = sessions.remove(&session_id) else {
+                    continue;
+                };
+                // A completed install/upgrade restart is not a crash: the
+                // rebuilt runtime must start with a clean crash budget.
+                // The clears, the card settlement and the journal flush all
+                // stay inside this take's critical section: they are keyed
+                // by session id, and the sessions lock is what orders them
+                // against a concurrent `get_or_spawn` — a clear (or a
+                // buffered drop-flush) running after that call re-seeded the
+                // session could erase the successor's fresh crash state or
+                // regress its journal sequence.
+                self.clear_retirement_bookkeeping(&session_id);
+                self.cancel_runtime_pending_cards(&session_id, Some(&runtime.bridge))
+                    .await;
+                // runtime 已从共享表移除，避免新请求继续复用旧账号进程；显式使用旧
+                // runtime 的 bridge 记录取消事件，让 timeline、acp-state 与前端 pending
+                // 状态同时收口。
+                runtime.bridge.flush_journal();
+                runtimes.push((session_id, runtime));
+            }
+            runtimes
         };
-        for (session_id, runtime) in runtimes {
-            // runtime 已从共享表移除，避免新请求继续复用旧账号进程；显式使用旧
-            // runtime 的 bridge 记录取消事件，让 timeline、acp-state 与前端 pending
-            // 状态同时收口。
-            self.cancel_pending_permissions_with_bridge(&session_id, Some(&runtime.bridge))
-                .await;
-            self.cancel_pending_elicitations_with_bridge(&session_id, Some(&runtime.bridge))
-                .await;
+        for (_session_id, runtime) in runtimes {
             runtime.shutdown().await;
         }
     }
@@ -2437,13 +3610,29 @@ impl AcpPool {
     // 第三方 Provider（中转）管理
     // ------------------------------------------------------------------
 
-    pub fn list_acp_providers(&self, agent: &str) -> Result<AcpProvidersView> {
-        self.providers.list(agent)
+    pub async fn list_acp_providers(&self, agent: &str) -> Result<AcpProvidersView> {
+        // Round-46 review: the sync body polls the cross-process section
+        // lock (up to SECTION_LOCK_TIMEOUT) and reads the keychain — both
+        // blocking; keep them off the async runtime workers, which also
+        // drive the ACP engine session pumps.
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        on_blocking(move || providers.list(&agent)).await
     }
 
     /// 读取 Provider 的 API key（明文，仅编辑弹窗「显示密钥」按需调用）。
-    pub fn get_acp_provider_key(&self, agent: &str, provider_id: &str) -> Result<Option<String>> {
-        self.providers.api_key(agent, provider_id)
+    pub async fn get_acp_provider_key(
+        &self,
+        agent: &str,
+        provider_id: &str,
+    ) -> Result<Option<String>> {
+        // Round-46 review: keychain I/O — this used to be a synchronous
+        // command executed on the main thread (the original freeze class);
+        // the blocking read now runs on a blocking worker.
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        let provider_id = provider_id.to_string();
+        on_blocking(move || providers.api_key(&agent, &provider_id)).await
     }
 
     /// 保存 Provider。若保存的是**生效中**的 Provider，配置已重写但运行中的
@@ -2464,21 +3653,42 @@ impl AcpPool {
         api_key_action: crate::platform::credential_store::CredentialEditAction,
     ) -> Result<ProviderRecord> {
         let backend = AgentBackend::parse(Some(agent))?;
-        let record = self.providers.save(
-            agent,
-            provider_id,
-            name,
-            base_url,
-            model,
-            model_slots,
-            context_window,
-            wire_api,
-            api_key,
-            api_key_action,
-        )?;
-        // 保存的是生效中 Provider：配置已重写，重启该 Agent 会话使新配置生效
-        // （与 switch/delete/official 同一链路；codex 的 key 在 spawn 时注入）。
-        if self.providers.store().current(agent).as_deref() == Some(record.id.as_str()) {
+        // Round-46 review: the sync save polls the section lock, does
+        // keychain work, and writes vendor configs — run it on a blocking
+        // worker (M3).
+        let providers = self.providers.clone();
+        let agent_owned = agent.to_string();
+        let provider_id = provider_id.map(str::to_string);
+        let (record, is_current) = on_blocking(move || {
+            let record = providers.save(
+                &agent_owned,
+                provider_id.as_deref(),
+                name,
+                base_url,
+                model,
+                model_slots,
+                context_window,
+                wire_api,
+                api_key,
+                api_key_action,
+            )?;
+            // 保存的是生效中 Provider：配置已重写，重启该 Agent 会话使新配置生效
+            // （与 switch/delete/official 同一链路；codex 的 key 在 spawn 时注入）。
+            // 判定走 reload 后的 fresh read：reload-on-mutator 落地后，CLI 进程
+            // 可以在本 GUI 启动后改写 current，读内存会把「当前 Provider」判错，
+            // 该重启的会话不重启（或反之）。
+            // The fresh read polls the cross-process section lock (up to
+            // SECTION_LOCK_TIMEOUT) and reloads the store from disk — blocking,
+            // so it stays on the same blocking worker as the save above.
+            let is_current = providers
+                .store()
+                .current_after_reload(&agent_owned)
+                .as_deref()
+                == Some(record.id.as_str());
+            Ok((record, is_current))
+        })
+        .await?;
+        if is_current {
             self.invalidate_auth_cache(backend);
             self.restart_agent_sessions(backend).await;
         }
@@ -2493,8 +3703,20 @@ impl AcpPool {
         provider_id: &str,
     ) -> Result<CodexAcpStatus> {
         let backend = AgentBackend::parse(Some(agent))?;
-        let was_current = self.providers.store().current(agent).as_deref() == Some(provider_id);
-        self.providers.delete(agent, provider_id)?;
+        // 与 save 同一 fresh-read 纪律：CLI 在本 GUI 背后的 switch 不得让
+        // 重启判定沿用启动时的内存值。Round-46 review: both the fresh read
+        // (section lock) and the delete (keychain) are blocking — run the
+        // pair on a blocking worker in decision order.
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        let provider_id = provider_id.to_string();
+        let was_current = on_blocking(move || {
+            let was_current = providers.store().current_after_reload(&agent).as_deref()
+                == Some(provider_id.as_str());
+            providers.delete(&agent, &provider_id)?;
+            Ok(was_current)
+        })
+        .await?;
         if was_current {
             self.invalidate_auth_cache(backend);
             self.restart_agent_sessions(backend).await;
@@ -2510,7 +3732,12 @@ impl AcpPool {
         provider_id: &str,
     ) -> Result<CodexAcpStatus> {
         let backend = AgentBackend::parse(Some(agent))?;
-        self.providers.switch(agent, provider_id)?;
+        // Round-46 review: the switch body can park on a keychain prompt —
+        // blocking worker (M3).
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        let provider_id = provider_id.to_string();
+        on_blocking(move || providers.switch(&agent, &provider_id)).await?;
         self.invalidate_auth_cache(backend);
         self.restart_agent_sessions(backend).await;
         Ok(self.status_for_async(backend).await)
@@ -2519,18 +3746,26 @@ impl AcpPool {
     /// 恢复官方登录：只删除本功能写入的键/表，然后走同一套重启链路。
     pub async fn switch_acp_provider_official(&self, agent: &str) -> Result<CodexAcpStatus> {
         let backend = AgentBackend::parse(Some(agent))?;
-        self.providers.switch_official(agent)?;
+        // Round-46 review: same blocking-worker discipline as `switch`.
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        on_blocking(move || providers.switch_official(&agent)).await?;
         self.invalidate_auth_cache(backend);
         self.restart_agent_sessions(backend).await;
         Ok(self.status_for_async(backend).await)
     }
 
-    pub fn export_acp_providers(&self, agent: &str) -> Result<String> {
-        self.providers.export(agent)
+    pub async fn export_acp_providers(&self, agent: &str) -> Result<String> {
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        on_blocking(move || providers.export(&agent)).await
     }
 
-    pub fn import_acp_providers(&self, agent: &str, json: &str) -> Result<ImportResult> {
-        self.providers.import(agent, json)
+    pub async fn import_acp_providers(&self, agent: &str, json: &str) -> Result<ImportResult> {
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        let json = json.to_string();
+        on_blocking(move || providers.import(&agent, &json)).await
     }
 
     /// Per-session provider override (F11): writes the "provider" key into the
@@ -2560,15 +3795,37 @@ impl AcpPool {
         let agent = backend.agent_id().context("非 ACP 会话")?;
         match provider_id {
             Some(provider_id) => {
-                self.providers
-                    .store()
-                    .get(agent, &provider_id)
-                    .with_context(|| format!("Provider 不存在: {provider_id}"))?;
-                self.agents
-                    .set_acp_config_value(session_id, "provider", &provider_id)?;
+                // 同 save/delete 的 fresh-read 纪律：CLI 进程在本 GUI 启动后
+                // add 的 Provider，读启动内存会被误判「不存在」。
+                // The fresh read polls the cross-process section lock and
+                // reloads the store from disk — blocking worker, matching
+                // save/delete/switch.
+                let providers = self.providers.clone();
+                let agent_owned = agent.to_string();
+                let provider_owned = provider_id.clone();
+                on_blocking(move || {
+                    providers
+                        .store()
+                        .record_after_reload(&agent_owned, &provider_owned)
+                        .with_context(|| format!("Provider 不存在: {provider_owned}"))
+                })
+                .await?;
+                // Round-49 review: the session-index mutator polls the
+                // cross-process section lock and rewrites the whole
+                // session-agents.json — blocking worker, same as the fresh
+                // read above.
+                let agents = self.agents.clone();
+                let session_owned = session_id.to_string();
+                on_blocking(move || {
+                    agents.set_acp_config_value(&session_owned, "provider", &provider_id)
+                })
+                .await?;
             }
             None => {
-                self.agents.clear_acp_config_value(session_id, "provider")?;
+                let agents = self.agents.clone();
+                let session_owned = session_id.to_string();
+                on_blocking(move || agents.clear_acp_config_value(&session_owned, "provider"))
+                    .await?;
             }
         }
         self.restart_agent_sessions(backend).await;
@@ -2577,28 +3834,52 @@ impl AcpPool {
 
     /// 当前会话生效的 Provider key（会话 option > 全局 current_provider）。
     /// 仅用于 Codex 的 spawn env 注入。
-    fn session_provider_api_key(&self, session_id: &str) -> Result<Option<String>> {
+    ///
+    /// The decision reads poll the cross-process section lock (up to
+    /// SECTION_LOCK_TIMEOUT) and reload the store from disk, and the key
+    /// itself comes from the keychain — all blocking, so they run on a
+    /// blocking worker. The only caller is the async spawn path, whose
+    /// runtime workers also drive the ACP engine session pumps.
+    async fn session_provider_api_key(&self, session_id: &str) -> Result<Option<String>> {
         let backend = self.backend(session_id);
         let Some(agent) = backend.agent_id() else {
             return Ok(None);
         };
+        // In-memory read: the session's own provider option.
         let session_provider = self
             .agents
             .get(session_id)
             .acp_config_values
             .get("provider")
             .cloned();
-        let provider_id = match session_provider {
-            Some(provider_id) => Some(provider_id),
-            None => self.providers.store().current(agent),
-        };
-        let Some(provider_id) = provider_id else {
-            return Ok(None);
-        };
-        if self.providers.store().get(agent, &provider_id).is_none() {
-            return Ok(None);
-        }
-        self.providers.api_key(agent, &provider_id)
+        // codex 的 key 在 spawn 时注入：判定必须走 reload 后的 fresh
+        // read——CLI 进程在本 GUI 启动后 switch 过 current 时，读启动
+        // 内存会把旧 Provider 的 key 注进指向新 endpoint 的 config，
+        // 产生无因的 401。与 save/delete 的 fresh-read 纪律同一形状。
+        // 一次 state_after_reload 同时取回 current 与 providers 表：原
+        // 先的 current_after_reload + record_after_reload 是两段各自
+        // 加锁重读的临界区，这里的本地查找在同一份快照上完成判定。
+        let providers = self.providers.clone();
+        let agent = agent.to_string();
+        on_blocking(move || {
+            let state = providers.store().state_after_reload(&agent);
+            let provider_id = match session_provider {
+                Some(provider_id) => Some(provider_id),
+                None => state.current_provider_id.clone(),
+            };
+            let Some(provider_id) = provider_id else {
+                return Ok(None);
+            };
+            if !state
+                .providers
+                .iter()
+                .any(|candidate| candidate.id == provider_id)
+            {
+                return Ok(None);
+            }
+            providers.api_key(&agent, &provider_id)
+        })
+        .await
     }
 
     /// 卸载 ACP Agent CLI。有运行中会话时拒绝；`cleanup=true` 时额外删除该 Agent
@@ -2720,10 +4001,26 @@ impl AcpPool {
             tokio::task::spawn_blocking(move || remove_agent_paths(config_paths))
                 .await
                 .context("删除 Agent 配置任务异常退出")??;
-            for record in self.providers.store().state(agent_id).providers {
-                let _ = self.providers.delete(agent_id, &record.id);
-            }
-            let _ = self.providers.store().set_current(agent_id, None);
+            // 与上面同一 fresh-read 纪律：CLI 在本 GUI 启动后 add 的受管
+            // Provider 也要进清理集合，否则其凭据与受管配置在卸载后残留。
+            // The fresh read (section lock + disk reload) and every delete
+            // (keychain removal + vendor config rewrite) block — run the
+            // whole cleanup on a blocking worker, matching the uninstall
+            // lanes above.
+            let providers = self.providers.clone();
+            let cleanup_agent = agent_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                for record in providers
+                    .store()
+                    .state_after_reload(&cleanup_agent)
+                    .providers
+                {
+                    let _ = providers.delete(&cleanup_agent, &record.id);
+                }
+                let _ = providers.store().set_current(&cleanup_agent, None);
+            })
+            .await
+            .context("Provider 清理任务异常退出")?;
         }
         // 渠道翻转防护：卸载后仍探测到「已安装」说明存在另一渠道的安装（如
         // 脚本目录删除后探测回落到 npm/PATH 的另一份）。如实告知，避免
@@ -2982,14 +4279,20 @@ impl AcpPool {
                 .touch_activity(session_id)
                 .context("更新 ACP 会话最近活跃时间失败")
         })?;
+        // Register the exact turn before yielding or exposing the admitted
+        // request to Stop. `busy == true` therefore always has a turn id that
+        // the cancel fallback can bind to instead of guessing at fire time.
+        let turn_id = runtime
+            .bridge
+            .begin_turn(&content, &prepared.display_attachments);
+        // Start silence measurement when the prompt is sent. Agent activity and
+        // host delivery of card answers or cancellation can reset it afterward.
+        stall::mark_activity(&runtime.activity);
         drop(_admission);
         let pool = self.clone();
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            if runtime
-                .prompt(content, prepared.blocks, prepared.display_attachments)
-                .await
-            {
+            if runtime.prompt(turn_id, prepared.blocks).await {
                 pool.handle_outdated_codex_runtime(&session_id).await;
             }
         });
@@ -3042,7 +4345,38 @@ impl AcpPool {
         match self.sessions.lock().await.get(session_id).cloned() {
             Some(runtime) => {
                 if runtime.busy.load(Ordering::Acquire) {
+                    let turn_id = runtime.bridge.current_turn_id();
                     runtime.cancel();
+                    // Journal the cancel request before scheduling the settle
+                    // watchdog: the timeline journal then records that the
+                    // stop was requested even when the agent never answers and
+                    // the watchdog has to settle locally. This is a journal
+                    // record only — acp-state `lastStatus` is not patched and
+                    // the UI renders no cancelling state from it.
+                    runtime.bridge.emit_with_turn(
+                        turn_id.clone(),
+                        "cancel_requested",
+                        json!({ "status": "cancelling" }),
+                    );
+                    // Stop cannot wait forever for the agent. An upstream adapter
+                    // may never answer a dropped or absorbed prompt; field evidence
+                    // showed four clicks before its own cancel floor settled it.
+                    if let Some(turn_id) = turn_id {
+                        self.schedule_cancel_settle(
+                            session_id.to_string(),
+                            runtime.clone(),
+                            turn_id,
+                        );
+                    } else {
+                        // send_message registers the turn synchronously before
+                        // yielding, so this is an invariant violation. Never
+                        // guess later: doing so could close a different turn.
+                        diagnostics::write(
+                            &diagnostics::operation_id("cancel-settle"),
+                            "session:cancel_without_turn_id",
+                            format!("session_id={session_id}"),
+                        );
+                    }
                 } else {
                     // session 已恢复但当前进程没有活跃 prompt 时，session/cancel 无法
                     // 命中旧进程的 turn。直接收口持久化孤儿回合，让停止操作可恢复且幂等。
@@ -3060,6 +4394,84 @@ impl AcpPool {
         }
     }
 
+    /// Settle locally if the agent does not answer within the user-Stop grace period.
+    fn schedule_cancel_settle(
+        &self,
+        session_id: String,
+        runtime: Arc<AcpSession>,
+        turn_id: String,
+    ) {
+        // Deduplicate repeated Stop clicks per turn. If that turn ends and the
+        // next begins, it may install a fallback while the old task can only observe it.
+        if !runtime.cancel_settle_turns.lock().insert(turn_id.clone()) {
+            return;
+        }
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + stall::CANCEL_SETTLE_GRACE;
+            while Instant::now() < deadline {
+                if !runtime.busy.load(Ordering::Acquire)
+                    || runtime.bridge.current_turn_id().as_deref() != Some(turn_id.as_str())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let settled = {
+                // Keep the registry locked across the claim/timing/busy
+                // sequence. A restart or eviction cannot replace the runtime
+                // between the pointer check and the session-level timing close.
+                let registered = sessions.lock().await;
+                let matches = cancel_settle_matches(
+                    registered.get(&session_id),
+                    &runtime,
+                    runtime.bridge.current_turn_id().as_deref(),
+                    &turn_id,
+                );
+                matches
+                    && runtime.busy.load(Ordering::Acquire)
+                    && runtime.settle_turn_once(
+                        &turn_id,
+                        "Interrupted",
+                        None,
+                        Some("cancel_timeout"),
+                    )
+            };
+            if settled {
+                runtime
+                    .bridge
+                    .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
+                diagnostics::write(
+                    &diagnostics::operation_id("cancel-settle"),
+                    "session:cancel_timeout",
+                    format!(
+                        "session_id={session_id} grace_secs={}",
+                        stall::CANCEL_SETTLE_GRACE.as_secs()
+                    ),
+                );
+            }
+            runtime.cancel_settle_turns.lock().remove(&turn_id);
+        });
+    }
+
+    /// Drop a session's crash budget and any parked restart disclosure
+    /// together. Callers MUST hold the pool sessions lock: both maps are
+    /// keyed by session id, so taking them inside the same critical section
+    /// as the runtime removal is what orders them against a concurrent
+    /// `get_or_spawn` — that call performs every one of its own budget and
+    /// disclosure accesses while holding the lock, so a clear outside it
+    /// could interleave with a successor's spawn and erase freshly recorded
+    /// crash throttling or a parked replacement notice (a no-await span does
+    /// not: on the multi-thread runtime another worker can hold the lock and
+    /// run a full spawn while this task is descheduled between two
+    /// statements). `restart_agent_sessions`, `shutdown_all` and the
+    /// `get_or_spawn` arms hold the lock across their own map accesses for
+    /// the same reason.
+    fn clear_retirement_bookkeeping(&self, session_id: &str) {
+        self.runtime_crash_budgets.lock().remove(session_id);
+        self.runtime_restart_disclosures.lock().remove(session_id);
+    }
+
     pub async fn evict(&self, session_id: &str) {
         self.cancel_pending_permissions(session_id).await;
         self.cancel_pending_elicitations(session_id).await;
@@ -3072,7 +4484,23 @@ impl AcpPool {
         // probes) self-heal on the next list(); idle eviction goes through
         // `evict_if_idle`, never through this path, so its map entries stay.
         self.acp_metadata_backends.write().remove(session_id);
-        if let Some(runtime) = self.sessions.lock().await.remove(session_id) {
+        let taken = {
+            let mut sessions = self.sessions.lock().await;
+            let taken = sessions.remove(session_id);
+            // A deliberate eviction is not a crash: drop the session's crash
+            // budget together with the runtime so the next spawn starts
+            // clean. Cleared inside the take's critical section (see
+            // [`Self::clear_retirement_bookkeeping`]); the journal flush is
+            // under the same section so the card settlements cancelled above
+            // are durable before any concurrent `get_or_spawn` can seed a
+            // replacement's EventBridge sequence from this journal.
+            self.clear_retirement_bookkeeping(session_id);
+            if let Some(runtime) = &taken {
+                runtime.bridge.flush_journal();
+            }
+            taken
+        };
+        if let Some(runtime) = taken {
             runtime.shutdown().await;
         }
     }
@@ -3087,18 +4515,41 @@ impl AcpPool {
     /// 升级等其他路径仍走 `evict`，语义不变。
     async fn evict_if_idle(&self, session_id: &str) -> bool {
         let active_id = self.session_store.active_id();
-        let Some(runtime) = take_session_if_still_idle(&self.sessions, session_id, |runtime| {
-            should_reap_idle(
-                runtime.busy.load(Ordering::Acquire),
-                runtime.configuring.load(Ordering::Acquire),
-                active_id.as_deref() == Some(session_id),
-                runtime.idle_for(),
-            )
-        })
-        .await
+        // The take hands back the sessions lock still held: every keyed
+        // settle step below (budget/disclosure clear, card settlement,
+        // journal flush) must stay inside the take's critical section so a
+        // concurrent `get_or_spawn` can neither read the retired budget nor
+        // have a replacement's fresh state erased, and can only seed a
+        // replacement bridge after these settlements are durable.
+        let Some((runtime, sessions)) =
+            take_session_if_still_idle(&self.sessions, session_id, |runtime| {
+                should_reap_idle(
+                    runtime.busy.load(Ordering::Acquire),
+                    runtime.configuring.load(Ordering::Acquire),
+                    active_id.as_deref() == Some(session_id),
+                    runtime.idle_for(),
+                )
+            })
+            .await
         else {
             return false;
         };
+        // Idle reaping is deliberate retirement, not a crash: the budget must
+        // not survive the runtime it was tracked by.
+        self.clear_retirement_bookkeeping(session_id);
+        // A reap can still land on a runtime that died unexpectedly and was
+        // never accessed again (its crash would otherwise only feed the
+        // budget through the Dead arm). Re-parking the disclosure keeps the
+        // next spawn honest — the user's agent context was lost, so the
+        // rebuild surfaces the restarted notice. The budget itself stays
+        // cleared: the 30-minute idle gate means no tight respawn loop can
+        // route through this path, and the crash instant is unrecoverable
+        // here, so a slot recorded now would mis-anchor the 60 s window.
+        if runtime.lifecycle.take_uncounted_crash() {
+            self.runtime_restart_disclosures
+                .lock()
+                .insert(session_id.to_string(), RuntimeRestart::Crash);
+        }
         // Same F3 contract as `evict_if_idle_for_rebind`: the take already
         // removed the runtime from the map, so the pending-request cancels
         // must go through the reclaimed runtime's own bridge — a map lookup
@@ -3107,12 +4558,15 @@ impl AcpPool {
             .await;
         self.cancel_pending_elicitations_with_bridge(session_id, Some(&runtime.bridge))
             .await;
+        // Same flush-before-reseed invariant as `evict`.
+        runtime.bridge.flush_journal();
+        drop(sessions);
         runtime.shutdown().await;
         true
     }
 
     /// Rebind eviction (review #463 eviction-tail TOCTOU + round-8 M1/M2):
-    /// like [`evict_if_idle`](Self::evict_if_idle) the recheck and the removal
+    /// like `evict_if_idle` the recheck and the removal
     /// are atomic under the sessions lock, but with the rebind predicate — a
     /// turn that starts after the command layer's post-migration recheck is
     /// observed as busy/configuring and keeps its runtime instead of being
@@ -3140,17 +4594,36 @@ impl AcpPool {
             )
         })
         .await;
-        let RebindEvictTake::Reclaimed(runtime) = taken else {
+        let RebindEvictTake::Reclaimed(runtime, sessions) = taken else {
             // A session without a resident runtime (NoRuntime) has no pending
             // permission/elicitation to answer either, so only the Busy arm
-            // skips cleanup.
+            // skips cleanup. The lock-free `_with_bridge(_, None)` variants
+            // (review #463 round-15 SF-A): the map-lookup variants take an
+            // UNBOUNDED `sessions.lock()` — with a cold spawn holding that
+            // lock across its ready timeout, one NoRuntime candidate would
+            // stall the reclaim tail (and the process-wide rebind gate behind
+            // it) far past the documented ceiling; the session was absent at
+            // take time, so the lookup could only resolve None anyway.
             if matches!(taken, RebindEvictTake::NoRuntime) {
-                self.cancel_pending_permissions(session_id).await;
-                self.cancel_pending_elicitations(session_id).await;
+                self.cancel_runtime_pending_cards(session_id, None).await;
             }
+            // Deliberately no budget/disclosure clear on this arm, unlike
+            // the Reclaimed arm below: there is no runtime to retire, and a
+            // rebind does not repair a broken install, so an accumulated
+            // backoff staying armed is the honest state (and a parked
+            // disclosure still fires when the rebuild eventually succeeds).
+            // Clearing here would let a rebind be used to bypass the
+            // tight-loop throttle.
             return matches!(taken, RebindEvictTake::NoRuntime);
         };
         self.acp_metadata_backends.write().remove(session_id);
+        // Rebind eviction is deliberate retirement, not a crash. The clears,
+        // the card settlement and the journal flush stay inside the take's
+        // critical section (see [`Self::clear_retirement_bookkeeping`]) —
+        // a replacement seeded by a concurrent `get_or_spawn` must not have
+        // its fresh state erased, and must only seed after these settlements
+        // are durable.
+        self.clear_retirement_bookkeeping(session_id);
         // Cancel before shutdown, through the RECLAIMED runtime's own bridge
         // (review #463 F3): the take already removed the session from the map,
         // so the plain `cancel_pending_permissions` lookup would resolve
@@ -3163,6 +4636,9 @@ impl AcpPool {
             .await;
         self.cancel_pending_elicitations_with_bridge(session_id, Some(&runtime.bridge))
             .await;
+        // Same flush-before-reseed invariant as `evict`.
+        runtime.bridge.flush_journal();
+        drop(sessions);
         runtime.shutdown().await;
         true
     }
@@ -3185,9 +4661,52 @@ impl AcpPool {
         crate::core::reaper::start_idle_reaper(
             &mut slot,
             self.clone(),
-            |pool| async move { pool.reap_idle_sessions().await },
+            |pool| async move {
+                pool.sample_runtime_resources().await;
+                pool.reap_idle_sessions().await;
+            },
             "codex_acp",
         );
+    }
+
+    /// Samples the resident ACP process trees once per idle-inspection tick
+    /// and, when the aggregates changed enough, writes a single summary line
+    /// to the local diagnostics log (`resource:acp_sample` in
+    /// `~/.pinvou3/logs/codex-acp.log`). Observation only: nothing here feeds
+    /// admission, throttling, or reaping, and nothing is uploaded. Only the
+    /// directly spawned root PIDs are registered and only aggregate process
+    /// count / RSS are recorded — never command lines, environment variables,
+    /// working directories, or process names. Sampling runs on a blocking
+    /// thread; a failure skips this round only and retries next tick.
+    async fn sample_runtime_resources(&self) {
+        let roots = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .map(|runtime| RuntimeResourceRoot {
+                    pid: runtime.root_pid,
+                    role: runtime.resource_role,
+                })
+                .collect::<Vec<_>>()
+        };
+        if roots.is_empty() {
+            return;
+        }
+        let ledger = self.resource_ledger.clone();
+        let result =
+            tauri::async_runtime::spawn_blocking(move || ledger.lock().sample_and_record(&roots))
+                .await;
+        match result {
+            Ok(Some(summary)) => diagnostics::write(
+                &diagnostics::operation_id("resources"),
+                "resource:acp_sample",
+                summary,
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[codex_acp] ACP 资源采样失败（已降级，下轮重试）: {error}")
+            }
+        }
     }
 
     /// 单轮空闲回收。busy/configuring 会话（含 turn 等待权限/问询期间）与
@@ -3227,10 +4746,25 @@ impl AcpPool {
     pub async fn shutdown_all(&self) {
         let runtimes: Vec<Arc<AcpSession>> = {
             let mut sessions = self.sessions.lock().await;
+            // The drain empties the pool, so any crash budget or parked restart
+            // disclosure keyed by those sessions is stale. Clearing inside the
+            // drain's critical section (like `restart_agent_sessions`) denies
+            // a concurrent get_or_spawn the interleaving where it wins the
+            // lock after the drain, spawns a fresh generation, and has that
+            // generation's crash slot or parked disclosure erased by these
+            // clears. This matters because shutdown_all is also reached from
+            // prepare_app_restart — the settings restart command and the
+            // post-update relaunch — where that spawn is reachable.
+            self.runtime_crash_budgets.lock().clear();
+            self.runtime_restart_disclosures.lock().clear();
             sessions.drain().map(|(_, runtime)| runtime).collect()
         };
         for runtime in runtimes {
             runtime.shutdown().await;
+            // Flush any card settlements a racing retirement buffered on this
+            // bridge before the drain, so a later drop-flush cannot regress a
+            // replacement's journal sequence.
+            runtime.bridge.flush_journal();
         }
     }
 
@@ -3238,14 +4772,18 @@ impl AcpPool {
         if !self.is_acp(session_id) {
             bail!("当前会话不是 ACP 会话");
         }
+        // Resolve (and, when needed, reclaim/rebuild) the runtime BEFORE
+        // listing cards: the lists are filtered to the resident generation,
+        // and a poll that itself triggers a Dead/Missing reclaim must not
+        // attach the just-drained dead generation's cards to the
+        // replacement's info (mirrors `apply_config_change`'s list-after-
+        // resolve order). The listing helpers never spawn, so this stays a
+        // single get_or_spawn.
+        let runtime = self.get_or_spawn(session_id).await?;
         let pending_permissions = self.pending_permissions_for(session_id).await;
         let pending_elicitations = self.pending_elicitations_for(session_id).await;
         // provider is already filled from the session record by info(); nothing to add here.
-        Ok(self.get_or_spawn(session_id).await?.info(
-            &self.agents,
-            pending_permissions,
-            pending_elicitations,
-        ))
+        Ok(runtime.info(&self.agents, pending_permissions, pending_elicitations))
     }
 
     /// 一次性模型探针：切换/删除 Provider（或恢复官方）后，草稿态会话本不连接
@@ -3269,24 +4807,49 @@ impl AcpPool {
             PROBE_SEQ.fetch_add(1, Ordering::Relaxed),
         );
         // 临时工作区：spawn 时自动创建独立目录，不污染真实项目。
-        self.agents
-            .set_acp_workspace(&probe_id, backend, CodexWorkspaceKind::Temporary, None)?;
+        // Round-49 review: the index mutator polls the cross-process section
+        // lock and rewrites the whole session-agents.json, so it runs on a
+        // blocking worker like the fresh reads.
+        let agents = self.agents.clone();
+        let probe_owned = probe_id.clone();
+        on_blocking(move || {
+            agents.set_acp_workspace(
+                &probe_owned,
+                backend,
+                CodexWorkspaceKind::Temporary,
+                None,
+                Vec::new(),
+            )
+        })
+        .await?;
         let result = self.session_info(&probe_id).await;
         // 无论成败都必须收口，不得留下运行中的探针进程或 store 残留记录；
         // 清理失败只告警，主结果（上报或原始错误）优先透传。
         self.evict(&probe_id).await;
-        if let Err(error) = self.agents.remove(&probe_id) {
+        let agents = self.agents.clone();
+        let probe_owned = probe_id.clone();
+        if let Err(error) = on_blocking(move || agents.remove(&probe_owned)).await {
             eprintln!("[pinvou3-app] 清理模型探针会话记录失败（{probe_id}）: {error:#}");
         }
         let probe_dir = crate::platform::paths::sessions_root().join(&probe_id);
-        match std::fs::remove_dir_all(&probe_dir) {
-            Ok(()) => {}
-            // 探针未走到 spawn（如 CLI 未安装）时目录本就不存在。
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!(
+        let probe_dir_owned = probe_dir.clone();
+        // 与上面的 store 记录清理同样收口到 blocking worker：remove_dir_all
+        // 同步遍历整棵临时目录，不能占用驱动引擎会话泵的 runtime worker；
+        // 清理失败依旧只告警，主结果优先透传。
+        if let Err(error) = on_blocking(move || {
+            match std::fs::remove_dir_all(&probe_dir_owned) {
+                Ok(()) => Ok(()),
+                // 探针未走到 spawn（如 CLI 未安装）时目录本就不存在。
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await
+        {
+            eprintln!(
                 "[pinvou3-app] 清理模型探针临时目录失败（{}）: {error:#}",
                 probe_dir.display()
-            ),
+            );
         }
         result
     }
@@ -3342,28 +4905,58 @@ impl AcpPool {
         }
     }
 
+    /// Cards of the resident generation only. A dead generation's leftovers
+    /// are swept by the Dead arm's drain or a retirement, but between the
+    /// handlers' check-then-insert race and the next sweep a stale card can
+    /// sit in the map; listing it would make the UI prompt for a runtime that
+    /// no longer exists. With no runtime resident every card in the map is a
+    /// ghost, so the listing is empty. Does not spawn: pure listing lanes
+    /// must keep their no-spawn behavior.
     pub async fn pending_permissions_for(
         &self,
         session_id: &str,
     ) -> Vec<CodexAcpPendingPermission> {
+        let resident = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|session| session.lifecycle.generation());
+        let Some(generation) = resident else {
+            return Vec::new();
+        };
         self.pending_permissions
             .lock()
             .await
             .values()
-            .filter(|pending| pending.view.session_id == session_id)
+            .filter(|pending| {
+                pending.view.session_id == session_id && pending.generation == generation
+            })
             .map(|pending| pending.view.clone())
             .collect()
     }
 
+    /// Same resident-generation contract as [`Self::pending_permissions_for`].
     pub async fn pending_elicitations_for(
         &self,
         session_id: &str,
     ) -> Vec<CodexAcpPendingElicitation> {
+        let resident = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|session| session.lifecycle.generation());
+        let Some(generation) = resident else {
+            return Vec::new();
+        };
         self.pending_elicitations
             .lock()
             .await
             .values()
-            .filter(|pending| pending.view.session_id == session_id)
+            .filter(|pending| {
+                pending.view.session_id == session_id && pending.generation == generation
+            })
             .map(|pending| pending.view.clone())
             .collect()
     }
@@ -3375,18 +4968,12 @@ impl AcpPool {
         option_id: &str,
     ) -> Result<()> {
         let key = permission_key(session_id, tool_call_id);
-        let mut pending = self.pending_permissions.lock().await;
-        let request = pending
-            .remove(&key)
-            .context("权限请求已过期、已回复或不属于当前会话")?;
-        if !request
-            .option_ids
-            .iter()
-            .any(|candidate| candidate == option_id)
-        {
-            pending.insert(key, request);
-            bail!("权限选项不属于该请求");
-        }
+        // The helper returns an owned request, so the pending-map lock is
+        // necessarily released before this path can acquire `sessions`.
+        // Restart takes those locks in the opposite order while clearing old
+        // cards; keeping the map guard here would deadlock the whole pool.
+        let request =
+            take_pending_permission(self.pending_permissions.as_ref(), key, option_id).await?;
         let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
             SelectedPermissionOutcome::new(option_id.to_string()),
         ));
@@ -3426,12 +5013,7 @@ impl AcpPool {
             _ => bail!("不支持的输入请求操作: {action}"),
         };
         let key = elicitation_key(session_id, elicitation_id);
-        let request = self
-            .pending_elicitations
-            .lock()
-            .await
-            .remove(&key)
-            .context("输入请求已过期、已回复或不属于当前会话")?;
+        let request = take_pending_elicitation(self.pending_elicitations.as_ref(), &key).await?;
         request
             .response_tx
             .send(response)
@@ -3473,6 +5055,7 @@ impl AcpPool {
         let mut cancelled = Vec::new();
         for key in keys {
             if let Some(request) = pending.remove(&key) {
+                stall::mark_activity(&request.activity);
                 cancelled.push(request.view.tool_call_id.clone());
                 let _ = request.response_tx.send(RequestPermissionResponse::new(
                     RequestPermissionOutcome::Cancelled,
@@ -3518,6 +5101,7 @@ impl AcpPool {
         let mut cancelled = Vec::new();
         for key in keys {
             if let Some(request) = pending.remove(&key) {
+                stall::mark_activity(&request.activity);
                 cancelled.push(request.view.elicitation_id.clone());
                 let _ = request
                     .response_tx
@@ -3538,6 +5122,19 @@ impl AcpPool {
         }
     }
 
+    /// Settle both pending-card kinds for `session_id`, emitting the
+    /// cancellation events through `bridge` when one is available (an exit
+    /// path with the runtime still in scope). Callers without a bridge —
+    /// the rebind NoRuntime arm and the Missing arm of `get_or_spawn` —
+    /// pass `None`: the settlement is then only the cancelled response,
+    /// not a journal entry.
+    async fn cancel_runtime_pending_cards(&self, session_id: &str, bridge: Option<&EventBridge>) {
+        self.cancel_pending_permissions_with_bridge(session_id, bridge)
+            .await;
+        self.cancel_pending_elicitations_with_bridge(session_id, bridge)
+            .await;
+    }
+
     async fn get_or_spawn(&self, session_id: &str) -> Result<Arc<AcpSession>> {
         let operation_id = diagnostics::operation_id("session");
         diagnostics::write(
@@ -3545,20 +5142,117 @@ impl AcpPool {
             "session:resolve_start",
             format!("session_id={session_id}"),
         );
+        let mut restarted_after_stall = false;
+        let mut restarted_after_crash = false;
+        // Hold the pool-wide sessions lock until replacement insertion
+        // completes. A gap during shutdown would let concurrent callers spawn
+        // separate children, and the later insert would leak the earlier
+        // runtime. This deliberately blocks ACP entrypoints for every session
+        // during shutdown, the bounded 30-second initialize, and the currently
+        // unbounded session/load and config restoration.
         let mut sessions = self.sessions.lock().await;
-        if let Some(runtime) = sessions.get(session_id) {
-            diagnostics::write(
-                &operation_id,
-                "session:reused",
-                format!("session_id={session_id}"),
-            );
-            // 复用即活动：前端对可见会话的状态轮询会持续刷新空闲时钟，
-            // 这正好与「active 会话不回收」的保守语义一致。
-            runtime.note_activity();
-            return Ok(runtime.clone());
+        match resolve_runtime(&mut sessions, session_id, |runtime| {
+            runtime.lifecycle.is_running() && !runtime.restart_requested.load(Ordering::Acquire)
+        }) {
+            RuntimeLookup::Reusable(runtime) => {
+                if runtime_is_stable(&runtime.lifecycle) {
+                    self.runtime_crash_budgets.lock().remove(session_id);
+                }
+                diagnostics::write(
+                    &operation_id,
+                    "session:reused",
+                    format!(
+                        "session_id={session_id} generation={}",
+                        runtime.lifecycle.generation()
+                    ),
+                );
+                // Reuse counts as activity. UI polling for a visible session
+                // refreshes the idle clock, matching the conservative no-reap policy.
+                runtime.note_activity();
+                return Ok(runtime);
+            }
+            RuntimeLookup::Dead(runtime) => {
+                let was_running = runtime.lifecycle.is_running();
+                // Resolve cards from either the stalled or exited generation
+                // before the replacement watchdog observes shared pending maps,
+                // and before the transport goes away so Cancelled responses
+                // still reach a stalled-but-live agent.
+                self.cancel_runtime_pending_cards(session_id, Some(&runtime.bridge))
+                    .await;
+                if was_running {
+                    // Repeated stalls in one window request replacement. The
+                    // first stall stays conservative because long work can
+                    // look wedged; this branch is a deliberate retirement, so
+                    // it never feeds the crash budget and clears what the
+                    // session had accumulated. The clear sits after the
+                    // settlement await above: that is safe only because the
+                    // pool sessions lock is held across this whole arm, so
+                    // the lock — not statement order alone — orders the
+                    // clears after the take.
+                    self.runtime_crash_budgets.lock().remove(session_id);
+                    // The replacement may be published by a later call if the
+                    // budget throttles this one, so park the disclosure in the
+                    // pool instead of relying on the call-local flag.
+                    self.runtime_restart_disclosures
+                        .lock()
+                        .insert(session_id.to_string(), RuntimeRestart::Stall);
+                    runtime.shutdown().await;
+                    diagnostics::write(
+                        &operation_id,
+                        "session:restart_after_stall",
+                        format!(
+                            "session_id={session_id} generation={}",
+                            runtime.lifecycle.generation()
+                        ),
+                    );
+                    restarted_after_stall = true;
+                } else {
+                    if runtime.lifecycle.take_uncounted_crash() {
+                        self.runtime_crash_budgets
+                            .lock()
+                            .entry(session_id.to_string())
+                            .or_default()
+                            .record_crash_at(Instant::now());
+                    }
+                    // The child already exited; this only reaps it and
+                    // releases the per-generation connection task.
+                    runtime.shutdown().await;
+                    diagnostics::write(
+                        &operation_id,
+                        "session:dead_runtime_reclaimed",
+                        format!(
+                            "session_id={session_id} generation={}",
+                            runtime.lifecycle.generation()
+                        ),
+                    );
+                    restarted_after_crash = true;
+                    // Parked for the same reason as the stall branch above.
+                    self.runtime_restart_disclosures
+                        .lock()
+                        .insert(session_id.to_string(), RuntimeRestart::Crash);
+                }
+                // Card settlement and shutdown-side events must be durable
+                // before the replacement EventBridge seeds its sequence from
+                // the journal.
+                runtime.bridge.flush_journal();
+            }
+            RuntimeLookup::Missing => {
+                // No runtime exists for the session, so every pending card
+                // belongs to a generation that is gone — typically one that
+                // exited before publication and whose handler can still be
+                // polled after the exit-path sweep. Settle them so the
+                // replacement starts with clean shared maps; with no bridge
+                // the settlement is only the cancelled response, not a
+                // journal entry.
+                self.cancel_runtime_pending_cards(session_id, None).await;
+            }
         }
+
         // 与 spawn_session 一致走 self.backend()，让辅助索引缺失的会话在
         // acp_record 处得到明确报错，而不是误导性的「当前会话不是 ACP 会话」。
+        // Readiness is judged before the crash budget: a backend that is not
+        // installed must keep surfacing its actionable setup hint instead of
+        // a throttle message once its spawn attempts have exhausted the budget.
         let backend = self.backend(session_id);
         let readiness = match backend {
             AgentBackend::CodexAcp => self.ensure_codex_ready().await.map(|_| ()),
@@ -3586,14 +5280,60 @@ impl AcpPool {
             );
             return Err(error);
         }
+
+        let admission = self
+            .runtime_crash_budgets
+            .lock()
+            .get_mut(session_id)
+            .map(|budget| budget.admission_at(Instant::now()));
+        if let Some(SpawnAdmission::RetryAfter {
+            delay,
+            budget_exhausted,
+        }) = admission
+        {
+            let retry_ms = delay.as_millis().max(1);
+            let reason = if budget_exhausted {
+                "ACP 运行时在短时间窗口内多次退出，已暂停自动重建"
+            } else {
+                "ACP 运行时刚刚退出，正在退避"
+            };
+            let retry_hint = if retry_ms >= RETRY_HINT_SECONDS_MIN_MS {
+                format!("约 {} 秒", retry_ms.div_ceil(1_000))
+            } else {
+                format!("{retry_ms} 毫秒")
+            };
+            diagnostics::write(
+                &operation_id,
+                "session:spawn_throttled",
+                format!(
+                    "session_id={session_id} retry_after_ms={retry_ms} budget_exhausted={budget_exhausted}"
+                ),
+            );
+            bail!("{reason}；{retry_hint}后可重试");
+        }
         diagnostics::write(
             &operation_id,
             "session:spawn_start",
             format!("session_id={session_id}"),
         );
-        let runtime = match self.spawn_session(session_id, &operation_id).await {
+        let generation = self
+            .runtime_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let runtime = match self
+            .spawn_session(session_id, &operation_id, generation)
+            .await
+        {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
+                // A failed spawn costs a crash-budget slot too: an adapter that
+                // cannot start (broken install, bad env) must back off like one
+                // that exits immediately after starting.
+                self.runtime_crash_budgets
+                    .lock()
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .record_crash_at(Instant::now());
                 diagnostics::write(
                     &operation_id,
                     "session:spawn_failed",
@@ -3602,11 +5342,53 @@ impl AcpPool {
                 return Err(error);
             }
         };
+        if !runtime.lifecycle.is_running() {
+            if runtime.lifecycle.take_uncounted_crash() {
+                self.runtime_crash_budgets
+                    .lock()
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .record_crash_at(Instant::now());
+            }
+            // Same reclamation duties as the Dead arm: the generation died
+            // between initialize and publication, so cards it registered
+            // during session/load must not linger in the shared maps and its
+            // journal events must be durable before the next bridge seeds.
+            self.cancel_runtime_pending_cards(session_id, Some(&runtime.bridge))
+                .await;
+            runtime.bridge.flush_journal();
+            diagnostics::write(
+                &operation_id,
+                "session:exited_before_publish",
+                format!("session_id={session_id} generation={generation}"),
+            );
+            bail!("ACP 运行时初始化后立即退出，请重试");
+        }
         sessions.insert(session_id.to_string(), runtime.clone());
+        // Consume any disclosure parked by an earlier reclaim invocation:
+        // after a throttled crash replacement both call-local flags are
+        // false here, and the notice must still fire (round-3 review
+        // MAJOR-1). The only insert site into the pool map is the line
+        // above, so a parked disclosure can only be consumed here.
+        let pending_restart = self.runtime_restart_disclosures.lock().remove(session_id);
+        if restarted_after_stall || restarted_after_crash || pending_restart.is_some() {
+            // Promise retained history only after a real resume. Without
+            // `load_session`, or when loading fails, spawn creates a fresh session.
+            // A crash replacement discloses the same way as a stall
+            // replacement: the user's agent context was rebuilt either way.
+            let kind = if runtime.resumed_session {
+                "agent_session_restarted"
+            } else {
+                "agent_session_restarted_fresh"
+            };
+            runtime
+                .bridge
+                .emit("runtime_notice", json!({ "kind": kind }));
+        }
         diagnostics::write(
             &operation_id,
             "session:ready",
-            format!("session_id={session_id}"),
+            format!("session_id={session_id} generation={generation}"),
         );
         Ok(runtime)
     }
@@ -3615,6 +5397,7 @@ impl AcpPool {
         &self,
         pinvou_session_id: &str,
         operation_id: &str,
+        generation: u64,
     ) -> Result<AcpSession> {
         let backend = self.backend(pinvou_session_id);
         let (mut command, adapter, package_name, package_version) = match backend {
@@ -3622,8 +5405,14 @@ impl AcpPool {
                 let adapter = self.resolve_adapter().context("Codex ACP 尚未安装")?;
                 let mut command = self.adapter_command(&adapter)?;
                 self.configure_codex_path(&mut command)?;
-                self.configure_codex_provider_env(&mut command, pinvou_session_id)?;
-                (command, adapter, CODEX_ACP_PACKAGE, CODEX_ACP_VERSION)
+                self.configure_codex_provider_env(&mut command, pinvou_session_id)
+                    .await?;
+                (
+                    command,
+                    adapter,
+                    CODEX_ACP_PACKAGE,
+                    CODEX_ACP_ADAPTER_VERSION,
+                )
             }
             AgentBackend::ClaudeAcp => {
                 let adapter = self
@@ -3638,7 +5427,7 @@ impl AcpPool {
                     .context("未检测到 Kimi Code CLI；请先安装 Kimi，并确保 kimi 在 PATH 中")?;
                 let mut command = crate::platform::process::external_tokio_command(&executable);
                 command.arg("acp");
-                (command, executable, "kimi acp", "native")
+                (command, executable, KIMI_ACP_PACKAGE, "native")
             }
             AgentBackend::Deepseek => bail!("当前会话不是 ACP 会话"),
         };
@@ -3658,14 +5447,19 @@ impl AcpPool {
             .with_context(|| format!("启动 {} 失败", backend.display_name()))?;
         let stdin = child.stdin.take().context("ACP stdin 不可用")?;
         let stdout = child.stdout.take().context("ACP stdout 不可用")?;
+        let event_bridge = EventBridge::new(self.app.clone(), pinvou_session_id.to_string());
+        let lifecycle = Arc::new(RuntimeLifecycle::new(generation));
         let stderr_tail = Arc::new(parking_lot::Mutex::new(VecDeque::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
             let sid = pinvou_session_id.to_string();
             let operation_id = operation_id.to_string();
             let stderr_tail = stderr_tail.clone();
             let agent_id = backend.agent_id().unwrap_or("acp");
+            let notice_bridge = event_bridge.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
+                let mut last_notice: Option<Instant> = None;
+                let mut last_notice_line: Option<String> = None;
                 while let Ok(Some(line)) = lines.next_line().await {
                     {
                         let mut tail = stderr_tail.lock();
@@ -3679,11 +5473,36 @@ impl AcpPool {
                         "session:bridge_stderr",
                         format!("agent={agent_id} session_id={sid} stderr={line}"),
                     );
+                    // Adapters report actionable failures such as "cancel floor ...
+                    // wedged" only on stderr. Logging alone leaves the user guessing,
+                    // so `stall.rs` owns the tested phrase/throttle/deduplication gate.
+                    let now = Instant::now();
+                    let detail = line
+                        .chars()
+                        .take(stall::STDERR_NOTICE_MAX_CHARS)
+                        .collect::<String>();
+                    if stall::stderr_notice_due(
+                        now,
+                        last_notice,
+                        last_notice_line.as_deref(),
+                        &line,
+                        &detail,
+                    ) {
+                        last_notice = Some(now);
+                        last_notice_line = Some(detail.clone());
+                        notice_bridge.emit(
+                            "runtime_notice",
+                            json!({
+                                "kind": "agent_stderr",
+                                "agent": agent_id,
+                                "detail": detail,
+                            }),
+                        );
+                    }
                 }
             });
         }
 
-        let event_bridge = EventBridge::new(self.app.clone(), pinvou_session_id.to_string());
         let replay_suppressed = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3695,6 +5514,15 @@ impl AcpPool {
         let pending_for_elicitation = self.pending_elicitations.clone();
         let pinvou_id_for_permission = pinvou_session_id.to_string();
         let pinvou_id_for_elicitation = pinvou_session_id.to_string();
+        let generation_for_handlers = lifecycle.generation();
+        let lifecycle_for_permission = lifecycle.clone();
+        let lifecycle_for_elicitation = lifecycle.clone();
+        // The connection task is the one place that observes the transport
+        // ending. It stamps the lifecycle so the next `get_or_spawn` can tell
+        // an unexpected exit (crash-budget slot) from an expected shutdown.
+        let lifecycle_for_connection = lifecycle.clone();
+        let operation_id_for_connection = operation_id.to_string();
+        let pinvou_id_for_connection = pinvou_session_id.to_string();
 
         tokio::spawn(async move {
             let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
@@ -3713,6 +5541,15 @@ impl AcpPool {
                 )
                 .on_receive_request(
                     async move |request: RequestPermissionRequest, responder, _cx| {
+                        // A dead generation's handler can still be polled
+                        // after the exit-path cancel sweeps have run; deny
+                        // the frame instead of inserting a card no live
+                        // runtime will ever settle.
+                        if !lifecycle_for_permission.is_running() {
+                            return responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Cancelled,
+                            ));
+                        }
                         let tool_call_id = request.tool_call.tool_call_id.to_string();
                         let key = permission_key(&pinvou_id_for_permission, &tool_call_id);
                         let option_ids = request
@@ -3733,6 +5570,8 @@ impl AcpPool {
                             PendingPermission {
                                 view,
                                 option_ids,
+                                activity: bridge_for_permission.activity(),
+                                generation: generation_for_handlers,
                                 response_tx,
                             },
                         );
@@ -3743,16 +5582,28 @@ impl AcpPool {
                                 "request": request_value,
                             }),
                         );
+                        // A permission request is agent activity and resets the silence window.
+                        bridge_for_permission.note_agent_activity();
                         let response = response_rx.await.unwrap_or_else(|_| {
                             RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                         });
                         pending_for_permission.lock().await.remove(&key);
+                        // Exclude the entire human think-time interval from
+                        // the stall clock. Without this reset, answering an
+                        // old card can immediately cancel healthy follow-up
+                        // work using the time spent waiting for the user.
+                        bridge_for_permission.note_agent_activity();
                         responder.respond(response)
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
                     async move |request: CreateElicitationRequest, responder, _cx| {
+                        if !lifecycle_for_elicitation.is_running() {
+                            return responder.respond(CreateElicitationResponse::new(
+                                ElicitationAction::Cancel,
+                            ));
+                        }
                         let request_value =
                             serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
                         let elicitation_id = elicitation_id_for(&request_value);
@@ -3764,10 +5615,15 @@ impl AcpPool {
                             request: request_value.clone(),
                         };
                         let (response_tx, response_rx) = oneshot::channel();
-                        pending_for_elicitation
-                            .lock()
-                            .await
-                            .insert(key.clone(), PendingElicitation { view, response_tx });
+                        pending_for_elicitation.lock().await.insert(
+                            key.clone(),
+                            PendingElicitation {
+                                view,
+                                activity: bridge_for_elicitation.activity(),
+                                generation: generation_for_handlers,
+                                response_tx,
+                            },
+                        );
                         bridge_for_elicitation.emit(
                             "elicitation_requested",
                             json!({
@@ -3775,6 +5631,7 @@ impl AcpPool {
                                 "request": request_value,
                             }),
                         );
+                        bridge_for_elicitation.note_agent_activity();
                         let (response, cancelled_by_agent) = tokio::select! {
                             response = response_rx => (
                                 response.unwrap_or_else(|_| {
@@ -3788,6 +5645,7 @@ impl AcpPool {
                             ),
                         };
                         pending_for_elicitation.lock().await.remove(&key);
+                        bridge_for_elicitation.note_agent_activity();
                         if cancelled_by_agent {
                             bridge_for_elicitation.emit(
                                 "elicitation_resolved",
@@ -3819,11 +5677,32 @@ impl AcpPool {
                         let _ = tx.send(initialized.map(|response| (connection.clone(), response)));
                     }
                     if let Some(rx) = shutdown_rx.take() {
-                        let _ = rx.await;
+                        // `connect_with` runs until this closure returns; a
+                        // clean transport EOF (the child exited) does not end
+                        // it on its own and is not an error in this mode
+                        // (agent-client-protocol `connect_with` contract). Wait
+                        // for either our shutdown or the incoming close, so a
+                        // crashed child releases this task and the lifecycle
+                        // stamp below records the generation as dead instead
+                        // of leaving it "running" in the pool forever.
+                        tokio::select! {
+                            _ = rx => {}
+                            () = connection.incoming_closed() => {}
+                        }
                     }
                     Ok(())
                 })
                 .await;
+            let unexpected = lifecycle_for_connection.mark_connection_closed();
+            diagnostics::write(
+                &operation_id_for_connection,
+                "session:connection_closed",
+                format!(
+                    "session_id={pinvou_id_for_connection} generation={} unexpected={unexpected} result={}",
+                    lifecycle_for_connection.generation(),
+                    if result.is_ok() { "ok" } else { "error" }
+                ),
+            );
             if let Err(error) = result {
                 eprintln!("[pinvou3-app] ACP 协议连接结束: {error}");
             }
@@ -3871,9 +5750,17 @@ impl AcpPool {
         let desired_config_values = if saved.acp_session_id.is_some() {
             saved_config_values(&saved)
         } else {
-            self.config_defaults.get(backend)
+            // Round-40 review: fresh read. The CLI's `code` family rewrites
+            // the defaults store from a second process; a boot-era memory
+            // answer spawned new sessions with a stale default mode after
+            // exactly the second-writer write this store's section lock was
+            // built for. (`get_after_reload` needs no cross-process lock —
+            // the writers persist by atomic rename.)
+            self.config_defaults.get_after_reload(backend)
         };
-        let (acp_session_id, mut mode_state, mut config_options) =
+        // Record whether spawn resumed or created the session so restart recovery
+        // can report whether history survived. Missing or failed load creates fresh.
+        let (acp_session_id, mut mode_state, mut config_options, resumed_session) =
             if initialized.agent_capabilities.load_session {
                 if let Some(saved_id) = saved.acp_session_id.clone() {
                     replay_suppressed.store(true, Ordering::Release);
@@ -3887,20 +5774,27 @@ impl AcpPool {
                             saved_id,
                             response.modes,
                             response.config_options.unwrap_or_default(),
+                            true,
                         ),
                         Err(error) => {
                             eprintln!(
                                 "[pinvou3-app] {} ACP 恢复会话失败，改建新会话: {error}",
                                 backend.display_name()
                             );
-                            new_acp_session(&connection, &workspace, backend).await?
+                            let (id, modes, options) =
+                                new_acp_session(&connection, &workspace, backend).await?;
+                            (id, modes, options, false)
                         }
                     }
                 } else {
-                    new_acp_session(&connection, &workspace, backend).await?
+                    let (id, modes, options) =
+                        new_acp_session(&connection, &workspace, backend).await?;
+                    (id, modes, options, false)
                 }
             } else {
-                new_acp_session(&connection, &workspace, backend).await?
+                let (id, modes, options) =
+                    new_acp_session(&connection, &workspace, backend).await?;
+                (id, modes, options, false)
             };
         restore_config_values(
             &connection,
@@ -3915,12 +5809,31 @@ impl AcpPool {
         let models = codex_models(&config_options);
         let config_values = config_values_from_options(&config_options, &mode_state);
         let prompt_capabilities = initialized.agent_capabilities.prompt_capabilities.clone();
-        self.agents.set_acp_session(
-            pinvou_session_id,
-            acp_session_id.clone(),
-            current_model_id.clone(),
-            config_values,
-        )?;
+        // Round-49 review: the index mutator polls the cross-process section
+        // lock and rewrites the whole session-agents.json — blocking worker,
+        // matching the provider reads on this spawn path.
+        let agents = self.agents.clone();
+        let pinvou_session_owned = pinvou_session_id.to_string();
+        let acp_session_owned = acp_session_id.clone();
+        let current_model_owned = current_model_id.clone();
+        on_blocking(move || {
+            agents.set_acp_session(
+                &pinvou_session_owned,
+                acp_session_owned,
+                current_model_owned,
+                config_values,
+            )
+        })
+        .await?;
+        // Round-41 minor 2: `saved` was captured before the multi-second
+        // handshake — an align kernel committing mid-spawn would be silently
+        // reverted by the full rewrite below (the over-grant direction).
+        // Re-read the keychain immediately before persisting (round-48
+        // minor 2: this is the in-memory RwLock read, not the cross-process
+        // section lock — the persist below remains an unlocked writer per
+        // the events.rs six-writer disclosure); a missing record falls back
+        // to fresh-spawn defaults.
+        let fresh_keychain = self.agents.session_workspace_keychain(pinvou_session_id);
         persist_acp_state(
             pinvou_session_id,
             json!({
@@ -3942,6 +5855,28 @@ impl AcpPool {
                 "workspace": {
                     "kind": saved.workspace_kind,
                     "path": &workspace,
+                    // The durable roots snapshot (review #484 round-11 M8):
+                    // acp-state.json is the only per-session ACP artifact that
+                    // survives a session-agents.json loss, so the recovery
+                    // path below reads the keychain back from here instead of
+                    // hardcoding single-root semantics.
+                    //
+                    // Round-38 A1: the align-granted ancestor provenance rides
+                    // the SAME full rewrite (the in-scope index record `saved`
+                    // carries the field) — the convergence patch alone left a
+                    // respawn-sized hole: any restart rewrote the file without
+                    // the field, and a later index loss then revoked every
+                    // grant in exactly the recovery window. The plain
+                    // `set_session_workspace_roots` setter still resets
+                    // provenance (SF6) — only align grants it, so only align's
+                    // writers need to carry it (spawn here, convergence patch
+                    // in the store, and the rebind translate resets it too).
+                    // Round-41 minor 2: the fresh pre-persist re-read feeds
+                    // both fields (see the `fresh_keychain` binding above).
+                    "roots": fresh_keychain
+                        .clone()
+                        .0,
+                    "explicit_ancestor_roots": fresh_keychain.1,
                 },
                 "lastStatus": "ready",
             }),
@@ -3954,11 +5889,25 @@ impl AcpPool {
             }),
         );
 
+        let activity = event_bridge.activity();
+        let pending_permissions = self.pending_permissions.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
+        // Stable ownership anchor for the resource ledger: only this directly
+        // spawned PID is registered; the sampler never records process details.
+        let root_pid = child.id().context("ACP 子进程启动后未返回进程标识")?;
+        let resource_role = backend.agent_id().unwrap_or("acp");
         Ok(AcpSession {
             connection,
             kimi_session_id: (backend == AgentBackend::KimiAcp).then(|| acp_session_id.clone()),
             acp_session_id,
             bridge: event_bridge,
+            activity,
+            pending_permissions,
+            pending_elicitations,
+            stall_settles: parking_lot::Mutex::new(stall::StallSettleTracker::new()),
+            restart_requested: AtomicBool::new(false),
+            resumed_session,
+            cancel_settle_turns: parking_lot::Mutex::new(HashSet::new()),
             busy: AtomicBool::new(false),
             configuring: AtomicBool::new(false),
             prompt_pending: AtomicUsize::new(0),
@@ -3969,6 +5918,9 @@ impl AcpPool {
             prompt_capabilities,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             child: Mutex::new(child),
+            root_pid,
+            resource_role,
+            lifecycle,
             last_activity: parking_lot::Mutex::new(Instant::now()),
         })
     }
@@ -4020,7 +5972,7 @@ impl AcpPool {
 
     /// Codex 的 Provider key 注入：config.toml 只支持 env_key 引用，实际 key 在
     /// spawn 时注入子进程 env。进程 env 已设置时优先（用户显式配置），不覆盖。
-    fn configure_codex_provider_env(
+    async fn configure_codex_provider_env(
         &self,
         command: &mut Command,
         pinvou_session_id: &str,
@@ -4028,7 +5980,7 @@ impl AcpPool {
         if std::env::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty()) {
             return Ok(());
         }
-        let Some(key) = self.session_provider_api_key(pinvou_session_id)? else {
+        let Some(key) = self.session_provider_api_key(pinvou_session_id).await? else {
             return Ok(());
         };
         command.env("OPENAI_API_KEY", key);
@@ -4376,6 +6328,278 @@ mod tests {
     use super::*;
 
     #[test]
+    fn official_script_degrade_covers_reachable_unreachable_and_no_npm() {
+        // Script source reachable: run as-is, regardless of npm availability.
+        assert_eq!(
+            official_script_degrade(true, false),
+            Some("official_script")
+        );
+        assert_eq!(official_script_degrade(true, true), Some("official_script"));
+        // Unreachable but with an npm fallback: degrade to the npm install
+        // (built-in npmmirror mirror retry).
+        assert_eq!(official_script_degrade(false, true), Some("npm_upgrade"));
+        // Unreachable and no npm fallback: cannot degrade; the caller reports
+        // the original network error and the manual-install hint.
+        assert_eq!(official_script_degrade(false, false), None);
+    }
+
+    /// The npm fallback check is the conjunction "has package **and** has a
+    /// runnable executable": mistakenly changing it to a disjunction would let
+    /// machines without npm skip the "original network error + manual-install
+    /// hint" and go straight into the degraded path, failing mid-install.
+    #[test]
+    fn npm_fallback_requires_both_package_and_executable() {
+        assert!(npm_fallback_available(Some("@openai/codex"), true));
+        assert!(!npm_fallback_available(Some("@openai/codex"), false));
+        assert!(!npm_fallback_available(None, true));
+        assert!(!npm_fallback_available(None, false));
+    }
+
+    /// A card from an older generation must not hold the current
+    /// generation's stall watchdog open, even while it still sits in the
+    /// shared pending maps.
+    #[test]
+    fn pending_cards_await_decisions_only_for_their_own_generation() {
+        let session_id = "pinvou-session".to_string();
+        let card = |generation: u64| PendingPermission {
+            view: CodexAcpPendingPermission {
+                session_id: session_id.clone(),
+                tool_call_id: "tool-1".to_string(),
+                request: serde_json::Value::Null,
+            },
+            option_ids: Vec::new(),
+            activity: stall::new_activity_clock(),
+            generation,
+            response_tx: oneshot::channel().0,
+        };
+        let elicitation = |generation: u64| PendingElicitation {
+            view: CodexAcpPendingElicitation {
+                session_id: session_id.clone(),
+                elicitation_id: "elicit-1".to_string(),
+                request: serde_json::Value::Null,
+            },
+            activity: stall::new_activity_clock(),
+            generation,
+            response_tx: oneshot::channel().0,
+        };
+
+        let permissions = HashMap::from([("k".to_string(), card(7))]);
+        assert!(generation_awaits_user_decision(
+            7,
+            "pinvou-session",
+            &permissions,
+            &HashMap::new()
+        ));
+        assert!(!generation_awaits_user_decision(
+            8,
+            "pinvou-session",
+            &permissions,
+            &HashMap::new()
+        ));
+        assert!(!generation_awaits_user_decision(
+            7,
+            "other-session",
+            &permissions,
+            &HashMap::new()
+        ));
+
+        let elicitations = HashMap::from([("e".to_string(), elicitation(9))]);
+        assert!(generation_awaits_user_decision(
+            9,
+            "pinvou-session",
+            &HashMap::new(),
+            &elicitations
+        ));
+        assert!(!generation_awaits_user_decision(
+            10,
+            "pinvou-session",
+            &HashMap::new(),
+            &elicitations
+        ));
+    }
+
+    /// The isolation the lifecycle module doc claims lives in the spawn
+    /// wiring — one fresh [`RuntimeLifecycle`] per spawned generation — and
+    /// in the watchdog consulting only its own generation's cards. Neither
+    /// is constructible without a real child, so pin the source shape the
+    /// same way the rebind probes do.
+    #[test]
+    fn lifecycle_wiring_is_per_spawn_and_generation_scoped() {
+        let src = include_str!("mod.rs");
+        let src = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module marker must exist")];
+        let spawn = production_body(src, "async fn spawn_session");
+        assert!(
+            spawn.contains("RuntimeLifecycle::new("),
+            "every spawn must build a fresh lifecycle; a session-keyed \
+             shared lifecycle would let an old generation's exit mark or \
+             bill its replacement"
+        );
+        let watchdog = production_body(src, "async fn awaiting_user_decision");
+        assert!(
+            watchdog.contains("generation_awaits_user_decision")
+                && watchdog.contains("self.lifecycle.generation()"),
+            "the stall watchdog must consult only the runtime's own \
+             generation's cards"
+        );
+        let handlers = production_body(src, "async fn spawn_session");
+        assert!(
+            handlers.contains("if !lifecycle_for_permission.is_running()")
+                && spawn.contains("if !lifecycle_for_elicitation.is_running()"),
+            "the card handlers must deny frames from a dead generation \
+             instead of inserting cards no runtime will settle"
+        );
+        let missing = production_body(src, "async fn get_or_spawn");
+        assert!(
+            missing.contains("cancel_runtime_pending_cards(session_id, None)"),
+            "the Missing arm must settle leftover cards before spawning \
+             the replacement"
+        );
+        assert!(
+            missing.contains(
+                "restarted_after_stall || restarted_after_crash || pending_restart.is_some()"
+            ),
+            "the publish line must consume the parked restart disclosure; \
+             dropping the pending_restart term silently loses the throttled \
+             replacement's restart notice (round-3 MAJOR-1)"
+        );
+        let reuse_start = missing
+            .find("RuntimeLookup::Reusable(runtime) => {")
+            .expect("the Reusable arm must exist");
+        let dead_start = missing
+            .find("RuntimeLookup::Dead(runtime) => {")
+            .expect("the Dead arm must exist");
+        let reuse_arm = &missing[reuse_start..dead_start];
+        assert!(
+            reuse_arm.contains("runtime_is_stable(&runtime.lifecycle)")
+                && reuse_arm.contains("runtime_crash_budgets.lock().remove(session_id)"),
+            "a two-minute-stable reuse must clear the session's crash \
+             budget; without the clear, a runtime that only fails every few \
+             minutes stays throttled forever"
+        );
+        let restart = production_body(src, "async fn restart_agent_sessions");
+        assert!(
+            restart.contains("flush_journal()"),
+            "the restart teardown must flush before a replacement bridge \
+             seeds its sequence from the journal"
+        );
+        let shutdown = production_body(src, "pub async fn shutdown_all");
+        assert!(
+            shutdown.contains("runtime_crash_budgets.lock().clear()")
+                && shutdown.contains("runtime_restart_disclosures.lock().clear()"),
+            "shutdown_all must clear the retirement state of the pool it \
+             just drained"
+        );
+        for (lane, signature) in [
+            ("evict", "pub async fn evict("),
+            ("idle reap", "async fn evict_if_idle("),
+            ("rebind", "pub async fn evict_if_idle_for_rebind("),
+            ("shutdown_all", "pub async fn shutdown_all"),
+        ] {
+            assert!(
+                production_body(src, signature).contains("flush_journal()"),
+                "the {lane} retirement must flush settled journal events \
+                 before a replacement bridge seeds its sequence"
+            );
+        }
+        // The keyed retirement bookkeeping must be cleared inside the take's
+        // sessions critical section (the helper asserts the pairing; holding
+        // the take guard is what orders it against a concurrent
+        // `get_or_spawn`). shutdown_all clears the whole drained pool and is
+        // pinned above; restart_agent_sessions shares the helper with these.
+        for (lane, signature) in [
+            ("evict", "pub async fn evict("),
+            ("idle reap", "async fn evict_if_idle("),
+            ("rebind", "pub async fn evict_if_idle_for_rebind("),
+            ("account switch", "async fn restart_agent_sessions"),
+        ] {
+            assert!(
+                production_body(src, signature).contains("clear_retirement_bookkeeping("),
+                "the {lane} retirement must clear the crash budget and the \
+                 parked restart disclosure through the paired helper inside \
+                 its sessions critical section"
+            );
+        }
+        // The transport-completion dead stamp is the detection keystone of
+        // the whole reclaim: reverting to waiting on the shutdown channel
+        // alone leaves a crashed child `running` forever and every test in
+        // this module stays green.
+        assert!(
+            spawn.contains("connection.incoming_closed()")
+                && spawn.contains("mark_connection_closed()"),
+            "the connection task must select on transport completion and \
+             stamp the generation dead; without the stamp a crashed runtime \
+             is never reclaimed"
+        );
+        // The cancel_requested producer is the only new journal behavior of
+        // the envelope claim; dropping the emit or the turn tag currently
+        // has no behavioral consumer, so pin the wiring. (The signature is
+        // spelled out because `production_body` matches substrings —
+        // `pub async fn cancel` would find `cancel_agent_install` first.)
+        let cancel = production_body(src, "pub async fn cancel(&self, session_id: &str)");
+        assert!(
+            cancel.contains("emit_with_turn(") && cancel.contains("\"cancel_requested\""),
+            "a user cancel must journal the cancel_requested envelope \
+             through the captured busy turn"
+        );
+        // The idle reap can land on a runtime that died unexpectedly; the
+        // re-parked disclosure is what keeps the next spawn's restart notice
+        // honest for that generation.
+        let reap = production_body(src, "async fn evict_if_idle(");
+        assert!(
+            reap.contains("take_uncounted_crash()") && reap.contains("RuntimeRestart::Crash"),
+            "an idle reap of an unexpectedly dead runtime must re-park the \
+             crash disclosure so the next rebuild discloses the context loss"
+        );
+        // The listing lanes are the resident-generation contract of the
+        // ghost-card containment.
+        for (lane, signature) in [
+            ("permission", "pub async fn pending_permissions_for("),
+            ("elicitation", "pub async fn pending_elicitations_for("),
+        ] {
+            let listing = production_body(src, signature);
+            assert!(
+                listing.contains("let Some(generation) = resident else {")
+                    && listing.contains("pending.generation == generation"),
+                "the {lane} listing lane must filter cards to the resident \
+                 generation and return nothing without a resident runtime"
+            );
+        }
+    }
+
+    /// The move-aside check only recognizes "the script path is the resolved
+    /// result": resolutions such as the agent SDK bundled with the Claude
+    /// bridge, `PINVOU3_*_CLI_PATH` overrides, or PATH hits never land on the
+    /// script path, where moving aside would not make the npm upgrade more
+    /// effective and would permanently delete the user's script install after
+    /// the backup is cleaned up (regression guard: the move-aside must be
+    /// predicated on script shadowing). When no CLI can be resolved, the
+    /// move-aside semantics are kept — a leftover script is a bad file the
+    /// resolver does not recognize, and clearing it aside lets the
+    /// post-upgrade probe hit the new npm version.
+    #[test]
+    fn npm_move_aside_only_when_script_path_is_resolved() {
+        let script = PathBuf::from("/home/u/.local/bin/claude");
+        let script_paths = vec![script.clone()];
+        // Resolved result is the script path: move aside is needed (otherwise
+        // it shadows the npm version).
+        assert!(npm_move_aside_needed(Some(script.as_path()), &script_paths));
+        // Resolved result is elsewhere (bridge SDK / PATH / env override):
+        // never move aside.
+        let sdk = PathBuf::from(
+            "/app/resources/codex-bridge/node_modules/\
+             @anthropic-ai/claude-agent-sdk-darwin-arm64/claude",
+        );
+        assert!(!npm_move_aside_needed(Some(sdk.as_path()), &script_paths));
+        // No usable CLI can be resolved: keep the move-aside cleanup semantics.
+        assert!(npm_move_aside_needed(None, &script_paths));
+        // Script path table is empty (defensive): never move aside regardless
+        // of the resolved path.
+        assert!(!npm_move_aside_needed(Some(script.as_path()), &[]));
+    }
+
+    #[test]
     fn idle_reap_keeps_busy_configuring_and_active_sessions() {
         let idle = Duration::from_secs(IDLE_EVICT_AFTER_SECS);
         // 空闲且非 active → 回收。
@@ -4446,8 +6670,10 @@ mod tests {
         let guard = sessions.lock().await;
         let reaper_sessions = sessions.clone();
         let reaper = tokio::spawn(async move {
+            // 该用例只关心复核结果；take 交还的锁在任务内释放。
             take_session_if_still_idle(&reaper_sessions, "acp-session", FakeIdleEntry::still_idle)
                 .await
+                .map(|(entry, _sessions)| entry)
         });
         tokio::task::yield_now().await;
 
@@ -4473,9 +6699,13 @@ mod tests {
             FakeIdleEntry::idle_since(Duration::from_secs(IDLE_EVICT_AFTER_SECS)),
         )]));
 
-        let taken =
-            take_session_if_still_idle(&sessions, "acp-session", FakeIdleEntry::still_idle).await;
-        assert!(taken.is_some(), "保持空闲的会话必须照常回收");
+        let Some((_entry, guard)) =
+            take_session_if_still_idle(&sessions, "acp-session", FakeIdleEntry::still_idle).await
+        else {
+            panic!("保持空闲的会话必须照常回收");
+        };
+        // take 交还的锁在断言前释放：守卫若仍存活，当前线程运行时上取锁会死锁。
+        drop(guard);
         assert!(sessions.lock().await.is_empty());
         // 已被移除 / 从未存在的会话：取回 None，不二次回收。
         assert!(
@@ -4506,6 +6736,12 @@ mod tests {
             }
         }
 
+        fn busy() -> Self {
+            let entry = Self::idle();
+            entry.busy.store(true, Ordering::Release);
+            entry
+        }
+
         /// A session whose runtime was just resolved by `get_or_spawn` and
         /// whose sender is still preparing the prompt (round-8 M1).
         fn awaiting_admission() -> Self {
@@ -4524,6 +6760,16 @@ mod tests {
                 self.configuring.load(Ordering::Acquire),
                 self.prompt_pending.load(Ordering::Acquire) > 0,
                 self.last_activity.lock().elapsed(),
+            )
+        }
+
+        /// Same busy-flag probe as the fence closures in
+        /// AcpPool::is_turn_active / AcpPool::rebind_blocking_sessions.
+        fn blocking(&self) -> bool {
+            rebind_busy_flags(
+                self.busy.load(Ordering::Acquire),
+                self.configuring.load(Ordering::Acquire),
+                self.prompt_pending.load(Ordering::Acquire) > 0,
             )
         }
     }
@@ -4555,29 +6801,6 @@ mod tests {
             false,
             REBIND_EVICT_IDLE_EPSILON
         ));
-    }
-
-    #[test]
-    fn prompt_admission_guard_marks_and_releases() {
-        let pending = AtomicUsize::new(0);
-        {
-            let _guard = PromptAdmissionGuard::new(&pending);
-            assert!(
-                pending.load(Ordering::Acquire) > 0,
-                "the guarded window must be observable to rebind eviction"
-            );
-            assert!(!rebind_evictable(
-                false,
-                false,
-                pending.load(Ordering::Acquire) > 0,
-                Duration::from_secs(60)
-            ));
-        }
-        assert_eq!(
-            pending.load(Ordering::Acquire),
-            0,
-            "Drop must release the count on every path, so a failed send cannot wedge eviction"
-        );
     }
 
     #[test]
@@ -4643,6 +6866,91 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn rebind_take_gives_up_when_the_pool_lock_is_held() {
+        // review #463 round-10 T13 (restored by round-11 B2): `get_or_spawn`
+        // holds this lock across a whole cold spawn (including the ACP ready
+        // handshake), so the rebind take must refuse rather than stall the
+        // command — and the process-wide rebind gate it holds — for as long
+        // as an unrelated session takes to start. The paused clock makes the
+        // new bound deterministic: the 2 s timeout elapses without real
+        // waiting. Dropping the bound turns this into a hang, and treating
+        // the timeout as success fails the first assertion.
+        let sessions: Mutex<HashMap<String, FakeRebindEntry>> = Mutex::new(HashMap::from([(
+            "idle-session".to_string(),
+            FakeRebindEntry::idle(),
+        )]));
+
+        let held = sessions.lock().await;
+        let taken =
+            take_session_for_rebind(&sessions, "idle-session", FakeRebindEntry::evictable).await;
+        assert!(
+            matches!(taken, RebindEvictTake::Busy),
+            "an unreadable pool state must read as busy, never as a successful reclaim"
+        );
+        assert!(
+            held.contains_key("idle-session"),
+            "a refused take touches nothing"
+        );
+        drop(held);
+
+        // Once the spawn settles the same call reclaims the idle runtime,
+        // which is what makes the user's retry converge.
+        let taken =
+            take_session_for_rebind(&sessions, "idle-session", FakeRebindEntry::evictable).await;
+        assert!(matches!(taken, RebindEvictTake::Reclaimed(..)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebind_fence_refuses_when_the_pool_lock_is_held() {
+        // The fence half of the same bound (round-11 B2): a held sessions
+        // lock must read as `None` — the command layer rejects with
+        // REBIND_RUNTIME_STARTING instead of guessing busy ids.
+        let sessions: Mutex<HashMap<String, FakeRebindEntry>> = Mutex::new(HashMap::from([(
+            "idle-session".to_string(),
+            FakeRebindEntry::idle(),
+        )]));
+        let fence = |entry: &FakeRebindEntry| entry.blocking();
+        let held = sessions.lock().await;
+        let decided =
+            rebind_blocking_from_sessions(&sessions, &["idle-session".to_string()], &fence).await;
+        assert!(decided.is_none(), "a held lock must refuse, not guess");
+        drop(held);
+        let decided =
+            rebind_blocking_from_sessions(&sessions, &["idle-session".to_string()], &fence).await;
+        assert_eq!(decided, Some(vec![]), "idle sessions do not block");
+    }
+
+    #[tokio::test]
+    async fn rebind_fence_lists_only_blocking_sessions() {
+        let sessions: Mutex<HashMap<String, FakeRebindEntry>> = Mutex::new(HashMap::from([
+            ("busy-session".to_string(), FakeRebindEntry::busy()),
+            (
+                "pending-session".to_string(),
+                FakeRebindEntry::awaiting_admission(),
+            ),
+            ("idle-session".to_string(), FakeRebindEntry::idle()),
+        ]));
+        let decided = rebind_blocking_from_sessions(
+            &sessions,
+            &[
+                "busy-session".to_string(),
+                "pending-session".to_string(),
+                "idle-session".to_string(),
+                "absent-session".to_string(),
+            ],
+            FakeRebindEntry::blocking,
+        )
+        .await;
+        assert_eq!(
+            decided,
+            Some(vec![
+                "busy-session".to_string(),
+                "pending-session".to_string()
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn rebind_evict_takes_idle_and_skips_busy_and_absent() {
         // review #463 eviction-tail TOCTOU: an idle runtime is atomically
@@ -4660,10 +6968,10 @@ mod tests {
 
         let taken =
             take_session_for_rebind(&sessions, "idle-session", FakeRebindEntry::evictable).await;
-        assert!(
-            matches!(taken, RebindEvictTake::Reclaimed(_)),
-            "idle runtime must be atomically taken"
-        );
+        let RebindEvictTake::Reclaimed(_entry, guard) = taken else {
+            panic!("idle runtime must be atomically taken");
+        };
+        drop(guard);
         assert!(
             !sessions.lock().await.contains_key("idle-session"),
             "taken runtime is removed from the pool"
@@ -4701,8 +7009,16 @@ mod tests {
         let guard = sessions.lock().await;
         let rebind_sessions = sessions.clone();
         let eviction = tokio::spawn(async move {
-            take_session_for_rebind(&rebind_sessions, "acp-session", FakeRebindEntry::evictable)
-                .await
+            // 该用例只关心复核结果；take 交还的锁在任务内随临时值释放。
+            matches!(
+                take_session_for_rebind(
+                    &rebind_sessions,
+                    "acp-session",
+                    FakeRebindEntry::evictable
+                )
+                .await,
+                RebindEvictTake::Busy
+            )
         });
         tokio::task::yield_now().await;
 
@@ -4714,9 +7030,9 @@ mod tests {
             .store(true, Ordering::Release);
         drop(guard);
 
-        let taken = eviction.await.expect("eviction task joins");
+        let busy = eviction.await.expect("eviction task joins");
         assert!(
-            matches!(taken, RebindEvictTake::Busy),
+            busy,
             "a turn that starts before the eviction must survive it"
         );
         assert!(sessions.lock().await.contains_key("acp-session"));
@@ -4820,18 +7136,54 @@ mod tests {
         );
     }
 
+    /// Round-trip pin: the model string the session creator writes
+    /// (`acp_session_model_name`, also consumed by the CLI's `code sessions`
+    /// family) parses back to the same backend, so a `display_name()` or
+    /// helper rename can never silently fall back to Deepseek.
+    #[test]
+    fn acp_session_model_name_round_trips_through_acp_session_backend() {
+        // The exact spellings already persisted into existing sessions'
+        // metadata: a display_name() rebrand must ship a migration for these
+        // strings, not silently orphan them (the derived round-trip below
+        // alone stays green through any rename).
+        assert_eq!(
+            acp_session_model_name(AgentBackend::CodexAcp),
+            "Codex (ACP)"
+        );
+        assert_eq!(
+            acp_session_model_name(AgentBackend::ClaudeAcp),
+            "Claude Code (ACP)"
+        );
+        assert_eq!(acp_session_model_name(AgentBackend::KimiAcp), "Kimi (ACP)");
+        for backend in AgentBackend::ACP_BACKENDS {
+            assert_eq!(
+                acp_session_backend(AgentBackend::Deepseek, &acp_session_model_name(backend)),
+                Some(backend)
+            );
+        }
+    }
+
     #[test]
     fn acp_session_classification_survives_missing_auxiliary_index() {
         assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, CODEX_ACP_SESSION_MODEL),
+            acp_session_backend(
+                AgentBackend::Deepseek,
+                &acp_session_model_name(AgentBackend::CodexAcp)
+            ),
             Some(AgentBackend::CodexAcp)
         );
         assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, CLAUDE_ACP_SESSION_MODEL),
+            acp_session_backend(
+                AgentBackend::Deepseek,
+                &acp_session_model_name(AgentBackend::ClaudeAcp)
+            ),
             Some(AgentBackend::ClaudeAcp)
         );
         assert_eq!(
-            acp_session_backend(AgentBackend::Deepseek, KIMI_ACP_SESSION_MODEL),
+            acp_session_backend(
+                AgentBackend::Deepseek,
+                &acp_session_model_name(AgentBackend::KimiAcp)
+            ),
             Some(AgentBackend::KimiAcp)
         );
         assert_eq!(
@@ -4902,11 +7254,134 @@ mod tests {
             &temporary,
         )
         .unwrap();
+
         assert_eq!(
             temporary_recovered.workspace_kind,
             CodexWorkspaceKind::Temporary
         );
         assert_eq!(temporary_recovered.workspace_path, None);
+    }
+
+    #[test]
+    fn acp_recovery_reads_the_durable_roots_snapshot() {
+        // review #484 round-11 M8: acp-state.json is the durable per-session
+        // ACP keychain artifact — the recovery path must read
+        // workspace.roots back instead of hardcoding single-root semantics
+        // (a session-agents.json loss used to silently resume multi-root
+        // sessions single-root). Relative entries are dropped (intake
+        // requires absolute paths); a legacy file without the key stays
+        // empty, as the sibling test pins.
+        let temporary = std::env::temp_dir().join("pinvou-roots-recovery-workspace");
+        let project = std::env::temp_dir().join("pinvou-roots-recovery-project");
+        let extra = std::env::temp_dir().join("pinvou-roots-recovery-extra");
+        let state = json!({
+            "pinvouSessionId": "pinvou-session",
+            "adapter": {
+                "agentId": "kimi",
+                "package": KIMI_ACP_PACKAGE,
+            },
+            "session": {
+                "session_id": "acp-session",
+            },
+            "workspace": {
+                "kind": "project",
+                "path": &project,
+                "roots": [&project, &extra, "relative/path"],
+            },
+        });
+        let recovered = acp_recovery_record(
+            "pinvou-session",
+            AgentBackend::KimiAcp,
+            &state,
+            project.clone(),
+            &temporary,
+        )
+        .unwrap();
+        assert_eq!(recovered.workspace_kind, CodexWorkspaceKind::Project);
+        assert_eq!(recovered.workspace_path, Some(project.clone()));
+        // Verbatim durability: the snapshot round-trips the full set
+        // (primary included, spawn wrote it that way); the base normalizes
+        // cwd-first per turn. The relative entry is dropped.
+        assert_eq!(recovered.workspace_roots, vec![project, extra]);
+    }
+
+    #[test]
+    fn acp_spawn_and_recovery_roundtrip_align_granted_ancestors() {
+        // Round-38 A1: the spawn full-rewrite of acp-state.json carries
+        // explicit_ancestor_roots beside the roots (the convergence patch
+        // alone left a respawn-sized hole), and the recovery reader picks
+        // the field back up — the durable-provenance guarantee must survive
+        // BOTH writers plus the index loss. The writer half is pinned by
+        // production source (the spawn site must name the field); the reader
+        // half is pinned behaviorally here.
+        let temporary = std::env::temp_dir().join("pinvou-ancestors-recovery-workspace");
+        let project = std::env::temp_dir().join("pinvou-ancestors-recovery-project");
+        let granted = std::env::temp_dir().join("pinvou-ancestors-recovery-granted");
+        let state = json!({
+            "pinvouSessionId": "pinvou-session",
+            "adapter": {
+                "agentId": "kimi",
+                "package": KIMI_ACP_PACKAGE,
+            },
+            "session": {
+                "session_id": "acp-session",
+            },
+            "workspace": {
+                "kind": "project",
+                "path": &project,
+                "roots": [&project, &granted],
+                "explicit_ancestor_roots": [&granted],
+            },
+        });
+        let recovered = acp_recovery_record(
+            "pinvou-session",
+            AgentBackend::KimiAcp,
+            &state,
+            project.clone(),
+            &temporary,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.explicit_ancestor_roots,
+            vec![granted.clone()],
+            "the recovery must honor the align-granted ancestors from the durable copy"
+        );
+        // Bounded by the keychain: an ancestor outside the roots set (the
+        // stale-field resurrection shape the rebind translate now resets)
+        // is dropped at recovery.
+        let mut stale = state.clone();
+        stale["workspace"]["explicit_ancestor_roots"] =
+            json!([std::env::temp_dir().join("pinvou-ancestors-recovery-stale")]);
+        let recovered = acp_recovery_record(
+            "pinvou-session",
+            AgentBackend::KimiAcp,
+            &stale,
+            project.clone(),
+            &temporary,
+        )
+        .unwrap();
+        assert!(
+            recovered.explicit_ancestor_roots.is_empty(),
+            "an ancestor outside the durable keychain must not survive recovery"
+        );
+        // The spawn writer's production source must persist the field beside
+        // the roots (the exact miss of round-37's M6).
+        // Round-41 minor 2 reshaped the writer: the fields now come from
+        // the pre-persist fresh re-read (fresh_keychain) instead of the
+        // pre-handshake snapshot — the pin follows the new shape.
+        let production = include_str!("mod.rs");
+        let spawn = production
+            .find("\"roots\": fresh_keychain")
+            .expect("the spawn state writer must exist");
+        let window = &production[spawn..spawn + 1200];
+        assert!(
+            window.contains("\"explicit_ancestor_roots\": fresh_keychain"),
+            "the spawn full-rewrite must carry the align-granted ancestors beside the roots (from the fresh pre-persist read)"
+        );
+        assert!(
+            production.contains("session_workspace_keychain(pinvou_session_id);"),
+            "the fresh pre-persist keychain re-read must exist (mid-spawn align commits are not reverted)"
+        );
     }
 
     #[test]
@@ -4989,9 +7464,28 @@ mod tests {
         // 写入一个已绑定的原生代码会话（索引 + sidecar）。
         let writer = SessionAgentStore::for_test(path.clone());
         writer
-            .bind_code_native_session("code-1", CodexWorkspaceKind::Project, Some(root.clone()))
+            .bind_code_native_session(
+                "code-1",
+                CodexWorkspaceKind::Project,
+                Some(root.clone()),
+                Vec::new(),
+            )
             .unwrap();
-        // 模拟辅助索引丢失：空内存索引 + 磁盘 sidecar 仍在 → 真实恢复一次。
+        // code-1's durable record exists on disk (any live session has one in
+        // reality; the owner probe and the backfill gate only stat existence
+        // and never parse content, so a stub file stands in for "alive").
+        std::fs::write(root.join("sessions").join("code-1.json"), b"{}").unwrap();
+        // 模拟辅助索引丢失。Round-43 review：恢复臂现在在 section 锁下重读
+        // 磁盘索引，所以“索引丢失”的前提必须落在磁盘上（记录从索引文件中
+        // 移除、权威 sidecar 保留），而不仅是空内存表——否则重载后记录仍在，
+        // 恢复正确地早退。
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["sessions"]
+            .as_object_mut()
+            .expect("index sessions object")
+            .remove("code-1");
+        std::fs::write(&path, raw.to_string()).unwrap();
         let agents = SessionAgentStore::for_test(path.clone());
         let summary = restore_code_native_sessions_from_sidecars(&agents);
         assert_eq!(
@@ -4999,7 +7493,9 @@ mod tests {
             SidecarRecoverySummary {
                 restored: 1,
                 backfilled: 0,
-                cleaned: 0
+                cleaned: 0,
+                pruned_dead_entries: 0,
+                cleaned_ghost_sidecars: 0
             }
         );
         assert!(agents.is_code_session("code-1"));
@@ -5016,13 +7512,17 @@ mod tests {
             .join("code-1")
             .join("code-session.json");
         std::fs::remove_file(&sidecar_path).unwrap();
+        // Round-31 minor 5: seed the live owner the backfill's gate stats.
+        std::fs::write(root.join("sessions").join("code-1.json"), b"{}").unwrap();
         let summary = restore_code_native_sessions_from_sidecars(&agents);
         assert_eq!(
             summary,
             SidecarRecoverySummary {
                 restored: 0,
                 backfilled: 1,
-                cleaned: 0
+                cleaned: 0,
+                pruned_dead_entries: 0,
+                cleaned_ghost_sidecars: 0
             }
         );
         assert!(sidecar_path.is_file());
@@ -5033,6 +7533,7 @@ mod tests {
                 AgentBackend::CodexAcp,
                 CodexWorkspaceKind::Temporary,
                 None,
+                Vec::new(),
             )
             .unwrap();
         let leftover_dir = root.join("sessions").join("acp-1");
@@ -5043,6 +7544,8 @@ mod tests {
                 version: 1,
                 workspace_kind: CodexWorkspaceKind::Temporary,
                 workspace_path: None,
+                workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
                 bound_at: None,
             })
             .unwrap(),
@@ -5054,12 +7557,137 @@ mod tests {
             SidecarRecoverySummary {
                 restored: 0,
                 backfilled: 0,
-                cleaned: 1
+                cleaned: 1,
+                pruned_dead_entries: 0,
+                cleaned_ghost_sidecars: 0
             }
         );
         assert!(!leftover_dir.join("code-session.json").exists());
         assert_eq!(agents.get("acp-1").backend, AgentBackend::CodexAcp);
         // 残留已清理：再次启动扫描无任何动作。
+        let summary = restore_code_native_sessions_from_sidecars(&agents);
+        assert_eq!(summary, SidecarRecoverySummary::default());
+        // Dead index entry: the index holds the entry but the durable record
+        // (sessions/<id>.json) is gone — retention deletes records and dirs,
+        // never the index. Boot must drop the entry together with its
+        // sidecar dir instead of backfilling a sidecar that keeps the ghost
+        // alive. dead-2.json is deliberately not created: a missing owner
+        // record means "dead".
+        agents
+            .bind_code_native_session("dead-2", CodexWorkspaceKind::Temporary, None, Vec::new())
+            .unwrap();
+        let summary = restore_code_native_sessions_from_sidecars(&agents);
+        assert_eq!(
+            summary,
+            SidecarRecoverySummary {
+                restored: 0,
+                backfilled: 0,
+                cleaned: 0,
+                pruned_dead_entries: 1,
+                cleaned_ghost_sidecars: 0
+            }
+        );
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(index["sessions"].get("dead-2").is_none());
+        assert!(!root.join("sessions").join("dead-2").exists());
+        // Dead-entry pruning must not touch live entries: code-1 stays a
+        // code session, acp-1 stays ACP.
+        assert!(agents.is_code_session("code-1"));
+        assert_eq!(agents.get("acp-1").backend, AgentBackend::CodexAcp);
+        // Ghost sidecar: no index record and no durable record (deletion
+        // leftover). Restoring from it would only resurrect a ghost index
+        // entry — the dir must be disposed without creating any index
+        // record.
+        let ghost_dir = root.join("sessions").join("ghost-1");
+        std::fs::create_dir_all(&ghost_dir).unwrap();
+        std::fs::write(
+            ghost_dir.join("code-session.json"),
+            serde_json::to_vec(&store::CodeSessionSidecar {
+                version: 1,
+                workspace_kind: CodexWorkspaceKind::Temporary,
+                workspace_path: None,
+                workspace_roots: Vec::new(),
+                explicit_ancestor_roots: Vec::new(),
+                bound_at: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let summary = restore_code_native_sessions_from_sidecars(&agents);
+        assert_eq!(
+            summary,
+            SidecarRecoverySummary {
+                restored: 0,
+                backfilled: 0,
+                cleaned: 0,
+                pruned_dead_entries: 0,
+                cleaned_ghost_sidecars: 1
+            }
+        );
+        assert!(!ghost_dir.exists());
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(index["sessions"].get("ghost-1").is_none());
+        assert!(!agents.is_code_session("ghost-1"));
+        // Ghost convergence must not depend on a readable sidecar: a dead
+        // owner's dir with a corrupt code-session.json (crash of a
+        // pre-atomic-write build, disk damage) is disposed too, instead of
+        // logging a parse error on every boot forever.
+        let corrupt_dir = root.join("sessions").join("corrupt-1");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("code-session.json"), b"{not json").unwrap();
+        let summary = restore_code_native_sessions_from_sidecars(&agents);
+        assert_eq!(
+            summary,
+            SidecarRecoverySummary {
+                restored: 0,
+                backfilled: 0,
+                cleaned: 0,
+                pruned_dead_entries: 0,
+                cleaned_ghost_sidecars: 1
+            }
+        );
+        assert!(!corrupt_dir.exists());
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(index["sessions"].get("corrupt-1").is_none());
+        assert!(!agents.is_code_session("corrupt-1"));
+        // A live ACP session's normal dir shape: session data under
+        // sessions/<id>/ with NO code-session.json (ACP bindings never write
+        // one). The ACP-leftover branch must stay silent for it — no cleaned
+        // count, no log — and the dir must survive. Before the count was
+        // gated on an actual removal, this shape fired a false "removed
+        // leftover sidecar" report on every boot for every ACP session.
+        agents
+            .set_acp_workspace(
+                "acp-live",
+                AgentBackend::CodexAcp,
+                CodexWorkspaceKind::Temporary,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        let acp_live_dir = root.join("sessions").join("acp-live");
+        std::fs::create_dir_all(&acp_live_dir).unwrap();
+        std::fs::write(acp_live_dir.join("events.jsonl"), b"{}").unwrap();
+        let summary = restore_code_native_sessions_from_sidecars(&agents);
+        assert_eq!(summary, SidecarRecoverySummary::default());
+        assert!(acp_live_dir.is_dir());
+        assert!(acp_live_dir.join("events.jsonl").is_file());
+        // A dead owner's bare dir (no sidecar — crash between durable-record
+        // deletion and dir removal): the ghost branch removes nothing, so it
+        // must count and log nothing; otherwise the report would repeat on
+        // every boot forever. The dir holding other content survives
+        // untouched.
+        let bare_dead_dir = root.join("sessions").join("bare-dead");
+        std::fs::create_dir_all(&bare_dead_dir).unwrap();
+        std::fs::write(bare_dead_dir.join("events.jsonl"), b"{}").unwrap();
+        let summary = restore_code_native_sessions_from_sidecars(&agents);
+        assert_eq!(summary, SidecarRecoverySummary::default());
+        assert!(bare_dead_dir.is_dir());
+        assert!(bare_dead_dir.join("events.jsonl").is_file());
+        // Ghosts fully converged: a second boot scan is a no-op.
         let summary = restore_code_native_sessions_from_sidecars(&agents);
         assert_eq!(summary, SidecarRecoverySummary::default());
         std::fs::remove_dir_all(&root).unwrap();
@@ -5099,5 +7727,275 @@ mod tests {
         assert!(!stale_official_target(&root.join("absent"), None));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Production-wiring probe (review #463 round-14 R2): every behavioral
+    /// test injects a hand-copied closure (FakeRebindEntry mirrors the reads
+    /// by hand), so dropping `prompt_pending` from the PRODUCTION closures —
+    /// the exact round-13 change — leaves every test green. AcpSession holds
+    /// a live connection and child process and cannot be unit-constructed,
+    /// so pin the reads in the production bodies — the layer the
+    /// pure-predicate pins cannot cover.
+    fn production_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).expect("production fn must exist");
+        let rest = &src[start + signature.len()..];
+        // End at the next fn ITEM, not the next `pub ` token (review #463
+        // round-17 SF-3): a `pub(crate)`/`pub(super)` item would otherwise
+        // extend the span past the function under test, silently diluting
+        // (and eventually neutralizing) the contains-assertions.
+        let end = [
+            "\n    pub ",
+            "\n    pub(crate) ",
+            "\n    pub(super) ",
+            "\n    ///",
+        ]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .map_or(src.len(), |offset| start + signature.len() + offset);
+        &src[start..end]
+    }
+
+    #[test]
+    fn rebind_acp_production_closures_read_prompt_pending() {
+        let src = include_str!("mod.rs");
+        // Round-26 MAJOR-3: cut at the test module exactly like projects.rs's
+        // `production_source` (round-18) — an unanchored find over the WHOLE
+        // file lands on this probe's own string argument once the production
+        // function is deleted or renamed, and the span then contains the
+        // probe's own assertion text, which can never fail.
+        let src = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module marker must exist")];
+        let fence = production_body(src, "pub async fn rebind_blocking_sessions");
+        assert!(
+            fence.contains("prompt_pending"),
+            "the fence must count a resolved-but-unadmitted prompt as busy",
+        );
+        let take = production_body(src, "pub async fn evict_if_idle_for_rebind");
+        assert!(
+            take.contains("prompt_pending"),
+            "the eviction recheck must count a resolved-but-unadmitted prompt",
+        );
+        assert!(
+            take.contains("idle_for()"),
+            "the eviction recheck must include the recent-activity window",
+        );
+    }
+
+    /// Declared adapter versions must match their bundled pins.
+    ///
+    /// `CLAUDE_ACP_VERSION` is written to session `acp-state.json` as
+    /// `adapter.version`; if it lags the bridge pin, persisted diagnostics lie.
+    #[test]
+    fn forkguard_declared_adapter_versions_match_the_bridge_pin() {
+        let manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/codex-bridge-runtime/package.json"
+        ))
+        .expect("read the bridge runtime manifest");
+        let manifest =
+            serde_json::from_str::<Value>(&manifest).expect("parse the bridge runtime manifest");
+        let dependencies = &manifest["dependencies"];
+        let codex_pinned = dependencies[CODEX_ACP_PACKAGE]
+            .as_str()
+            .expect("codex-acp pin");
+        let claude_pinned = dependencies[CLAUDE_ACP_PACKAGE]
+            .as_str()
+            .expect("claude-agent-acp pin");
+        assert_eq!(
+            codex_pinned, CODEX_ACP_ADAPTER_VERSION,
+            "CODEX_ACP_ADAPTER_VERSION must match the bundled codex-acp pin"
+        );
+        assert_eq!(
+            claude_pinned, CLAUDE_ACP_VERSION,
+            "CLAUDE_ACP_VERSION must match the bundled claude-agent-acp pin"
+        );
+
+        let prepare = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/prepare-codex-bridge-runtime.sh"
+        ))
+        .expect("read the bridge runtime script");
+        assert!(
+            prepare.contains(&format!(
+                "CODEX_ACP_VERSION=\"{CODEX_ACP_ADAPTER_VERSION}\""
+            )),
+            "prepare-codex-bridge-runtime.sh must pin the same Codex adapter version"
+        );
+        assert!(
+            prepare.contains(&format!("CLAUDE_ACP_VERSION=\"{CLAUDE_ACP_VERSION}\"")),
+            "prepare-codex-bridge-runtime.sh must pin the same adapter version"
+        );
+
+        let lock = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/codex-bridge-runtime/package-lock.json"
+        ))
+        .expect("read the bridge runtime lockfile");
+        let lock = serde_json::from_str::<Value>(&lock).expect("parse the bridge lockfile");
+        let claude_sdk_pinned =
+            lock["packages"]["node_modules/@anthropic-ai/claude-agent-sdk"]["version"]
+                .as_str()
+                .expect("claude-agent-sdk lock pin");
+        assert!(
+            prepare.contains(&format!("CLAUDE_SDK_VERSION=\"{claude_sdk_pinned}\"")),
+            "prepare-codex-bridge-runtime.sh must match the locked Claude SDK version"
+        );
+        // A hand-stale lock must not pass while the manifest pins a newer
+        // adapter: the installed `node_modules` entry is what actually runs.
+        let codex_locked =
+            lock["packages"]["node_modules/@agentclientprotocol/codex-acp"]["version"]
+                .as_str()
+                .expect("codex-acp lock pin");
+        assert_eq!(
+            codex_locked, CODEX_ACP_ADAPTER_VERSION,
+            "the lockfile must pin the declared codex-acp version"
+        );
+        let claude_locked = lock["packages"]["node_modules/@agentclientprotocol/claude-agent-acp"]
+            ["version"]
+            .as_str()
+            .expect("claude-agent-acp lock pin");
+        assert_eq!(
+            claude_locked, CLAUDE_ACP_VERSION,
+            "the lockfile must pin the declared claude-agent-acp version"
+        );
+    }
+
+    #[tokio::test]
+    async fn forkguard_permission_take_releases_lock_and_resets_activity() {
+        let pending = Mutex::new(HashMap::new());
+        let activity = stall::new_activity_clock();
+        *activity.lock() = Instant::now() - stall::STALL_CANCEL_AFTER;
+        let key = permission_key("session-1", "tool-1");
+        let (response_tx, _response_rx) = oneshot::channel();
+        pending.lock().await.insert(
+            key.clone(),
+            PendingPermission {
+                view: CodexAcpPendingPermission {
+                    session_id: "session-1".to_string(),
+                    tool_call_id: "tool-1".to_string(),
+                    request: Value::Null,
+                },
+                option_ids: vec!["allow".to_string()],
+                activity: activity.clone(),
+                generation: 1,
+                response_tx,
+            },
+        );
+
+        assert!(
+            take_pending_permission(&pending, key.clone(), "deny")
+                .await
+                .is_err(),
+            "an unknown option must be rejected"
+        );
+        assert!(
+            pending.lock().await.contains_key(&key),
+            "a rejected option must leave the request pending"
+        );
+
+        let request = take_pending_permission(&pending, key, "allow")
+            .await
+            .expect("the declared option should remove the request");
+        assert!(
+            pending.try_lock().is_ok(),
+            "the helper must return without retaining the pending-map lock"
+        );
+        assert!(
+            stall::quiet_for(&activity) < stall::STALL_NOTICE_AFTER,
+            "removing a user decision must reset the stall clock immediately"
+        );
+        drop(request);
+    }
+
+    /// A late closer must not close another turn.
+    ///
+    /// After watchdog or Stop settlement releases `busy`, the user may start a
+    /// new turn before the abandoned prompt fails. An unconditional timing close
+    /// would then pop the new session-level entry, disable active-turn guards,
+    /// and attach the old terminal status to the new turn.
+    #[test]
+    fn forkguard_late_close_does_not_finish_the_next_timing_turn() {
+        crate::platform::test_support::with_temp_home("acp-late-close-test", || {
+            let session_id = "acp-late-close-test";
+            let busy = AtomicBool::new(true);
+            crate::features::assistant::timing::start_turn(session_id);
+            assert!(!finalize_claimed_turn(&busy, false, || {
+                crate::features::assistant::timing::finish_turn(
+                    session_id,
+                    "Failed",
+                    Some("ACP Agent: x"),
+                );
+            }));
+            assert!(
+                busy.load(Ordering::Acquire),
+                "a loser of the old turn claim must not release the new turn's busy flag"
+            );
+            assert!(
+                crate::features::assistant::timing::has_queued_active_turn(session_id),
+                "a loser of the turn claim must not close timing"
+            );
+            assert!(finalize_claimed_turn(&busy, true, || {
+                assert!(
+                    busy.load(Ordering::Acquire),
+                    "settlement order must be claim -> timing -> busy"
+                );
+                crate::features::assistant::timing::finish_turn(
+                    session_id,
+                    "Failed",
+                    Some("ACP Agent: x"),
+                );
+            }));
+            assert!(!busy.load(Ordering::Acquire));
+            assert!(
+                !crate::features::assistant::timing::has_queued_active_turn(session_id),
+                "the claimant owns settlement"
+            );
+            crate::features::assistant::timing::clear_session(session_id);
+        });
+    }
+
+    #[test]
+    fn forkguard_cancel_settle_is_bound_to_runtime_and_turn() {
+        let runtime_a = Arc::new(());
+        let runtime_b = Arc::new(());
+        assert!(cancel_settle_matches(
+            Some(&runtime_a),
+            &runtime_a,
+            Some("turn-a"),
+            "turn-a",
+        ));
+        assert!(!cancel_settle_matches(
+            Some(&runtime_a),
+            &runtime_a,
+            Some("turn-b"),
+            "turn-a",
+        ));
+        assert!(!cancel_settle_matches(
+            Some(&runtime_b),
+            &runtime_a,
+            Some("turn-a"),
+            "turn-a",
+        ));
+        assert!(!cancel_settle_matches::<()>(
+            None,
+            &runtime_a,
+            Some("turn-a"),
+            "turn-a",
+        ));
+    }
+
+    #[test]
+    fn forkguard_stall_ladder_stops_after_turn_ownership_changes() {
+        assert!(stall_guard_owns_turn(Some("turn-a"), "turn-a"));
+        assert!(
+            !stall_guard_owns_turn(None, "turn-a"),
+            "a turn settled by the Stop fallback no longer owns the ladder"
+        );
+        assert!(
+            !stall_guard_owns_turn(Some("turn-b"), "turn-a"),
+            "an abandoned prompt future must not act on the next turn"
+        );
     }
 }

@@ -10,6 +10,7 @@ import {
 import { createPetActivationState, loadActivePet } from './pet-active.js';
 import { isImeComposing } from '../../shared/ime-guard.mjs';
 import { useAutoResizeTextarea } from '../../hooks/useAutoResizeTextarea.js';
+import { useFollowMainWindowLanguage } from '../../hooks/useFollowMainWindowLanguage.js';
 import { loadImage } from './load-image.js';
 import {
   buildAnimationSequence,
@@ -31,7 +32,6 @@ import {
   petEdgeAlignment,
   petElementHorizontalBounds,
   petMonitorAtPosition,
-  petScreenAnchorFromRect,
   petVerticalAlignmentAtDragEdge,
   petClientOriginVerticalBounds,
   petConnectedClientOriginVerticalBounds,
@@ -40,7 +40,6 @@ import {
   rebasePetDragForAlignment,
   rebasePetDragForVerticalAlignment,
   releasePetDrag,
-  scaleFromResizeDrag,
   setPetWindowPosition,
   stepPetDrag,
 } from './pet-interaction.js';
@@ -73,7 +72,7 @@ import {
   resolvePet,
 } from './pet-registry.js';
 import { useReducedMotion } from '../../hooks/useReducedMotion.js';
-import { dict, ensureLanguage, initialSystemLanguage, TAG_TO_LANG } from '../../shared/i18n.js';
+import { dict, zhDict } from '../../shared/i18n.js';
 import './pet.css';
 
 const TICK_MS = 600;
@@ -159,7 +158,6 @@ const PetActivityBody = memo(function PetActivityBody({ text, expanded = false }
 });
 
 export default function PetWindow({
-  allowResize = true,
   configuredScale = null,
   configuredVerticalAlignment = 'bottom',
 }) {
@@ -167,8 +165,9 @@ export default function PetWindow({
     ? Math.min(MAX_SCALE, Math.max(DEFAULT_SCALE, configuredScale))
     : DEFAULT_SCALE;
   const stateRef = useRef(createPetState());
-  const [language, setLanguage] = useState(initialSystemLanguage);
-  const t = dict[language] || dict.zh;
+  const language = useFollowMainWindowLanguage({ enabled: isTauriAvailable() });
+  // 兜底 zh 是活腿:入口引导失败降级装载 zh 后 zhDict() 非空(与主窗同口径)。
+  const t = dict[language] || zhDict();
   const petCopy = t.uiPet;
   // pet.html 的 <title>/<html lang> 是静态中文,按当前语言同步一次。
   useEffect(() => {
@@ -293,29 +292,6 @@ export default function PetWindow({
   const activePetName = activePet
     ? (t.uiPetSettings.pets[activePet.id]?.name || activePet.name)
     : '';
-
-  useEffect(() => {
-    if (!isTauriAvailable()) return;
-    let disposed = false;
-    let unlisten = null;
-    invokeTauri('get_settings').then((settings) => {
-      const lang = TAG_TO_LANG[settings?.language] || initialSystemLanguage();
-      // en/ja 惰性词典:本窗口入口首帧只引导系统语言,落盘语言可能未装载
-      if (!disposed) ensureLanguage(lang).then((ok) => { if (ok) setLanguage(lang); }).catch(() => {});
-    }).catch(() => {});
-    tauriEvents.listen('ui:language_changed', (event) => {
-      const next = event.payload?.language;
-      // 主窗切换前已 ensure;本窗仍需各自装载(窗口间不共享 dict 装载状态)
-      if (!disposed) ensureLanguage(next).then((ok) => { if (ok) setLanguage(next); }).catch(() => {});
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    }).catch(() => {});
-    return () => {
-      disposed = true;
-      if (unlisten) unlisten();
-    };
-  }, []);
 
   const refresh = () => {
     const now = Date.now();
@@ -565,9 +541,10 @@ export default function PetWindow({
 
   useEffect(() => {
     if (!isTauriAvailable()) return;
-    // pet-main.jsx 恒定传入 configuredScale(固定 0.5),窗口总是以启动缩放
-    // 初始化原生侧;get_pet_scale 读取分支不可达,已删(Rust 命令保留,由
-    // 协议测试钉住)。
+    // pet-main.jsx always passes configuredScale (a fixed 0.5), so the window is
+    // always initialized at its startup scale; the value is never read back from
+    // the native side (the get_pet_scale command was removed along with the read
+    // branch).
     const scaleRequest = invokeTauri('set_pet_scale', {
       scale: startupScale,
       activityVisible: activityVisibleRef.current,
@@ -1054,126 +1031,6 @@ export default function PetWindow({
     if (drag) Object.assign(drag, releasePetDrag(drag));
   };
 
-  const resizeRef = useRef(null);
-  const flushResizeScale = async (drag) => {
-    if (drag.sending) return;
-    const core = isTauriAvailable() ? tauriCommands : null;
-    if (!core) return;
-    drag.sending = true;
-    while (drag.pendingScale != null) {
-      const pending = drag.pendingScale;
-      const next = pending.scale;
-      drag.pendingScale = null;
-      try {
-        const hasCharacterAnchor = Number.isFinite(drag.anchorX)
-          && Number.isFinite(drag.anchorY);
-        const actual = await core.invoke('set_pet_scale', {
-          scale: next,
-          anchor: hasCharacterAnchor ? 'character_top_left' : 'top_left',
-          alignment: drag.alignment,
-          verticalAlignment: edgeVAlignRef.current,
-          anchorX: hasCharacterAnchor ? drag.anchorX : null,
-          anchorY: hasCharacterAnchor ? drag.anchorY : null,
-          activityVisible: activityVisibleRef.current,
-          activityHeight: activityHeightRef.current,
-          persist: pending.persist,
-        });
-        if (drag.pendingScale == null && resizeRef.current === drag && actual > 0) {
-          scaleRef.current = actual;
-          setScale(actual);
-        }
-      } catch {
-        drag.pendingScale = null;
-        break;
-      }
-    }
-    drag.sending = false;
-    if (drag.ended && resizeRef.current === drag) resizeRef.current = null;
-  };
-
-  const queueResizeScale = (drag, next, persist) => {
-    drag.pendingScale = { scale: next, persist };
-    void flushResizeScale(drag);
-  };
-
-  const applyResizePointer = (drag, persist) => {
-    if (!drag.ready) return;
-    const next = scaleFromResizeDrag(
-      drag.startScale,
-      drag.latestX - drag.startX,
-      drag.latestY - drag.startY,
-    );
-    if (next !== drag.currentScale) {
-      drag.currentScale = next;
-      scaleRef.current = next;
-      setScale(next);
-      queueResizeScale(drag, next, false);
-    }
-    if (persist) queueResizeScale(drag, drag.currentScale, true);
-  };
-
-  const onResizePointerDown = (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.button !== 0) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const drag = {
-      pointerId: event.pointerId,
-      startX: event.screenX,
-      startY: event.screenY,
-      latestX: event.screenX,
-      latestY: event.screenY,
-      startScale: scaleRef.current,
-      currentScale: scaleRef.current,
-      alignment: edgeAlignRef.current,
-      anchorX: null,
-      anchorY: null,
-      ready: false,
-      pendingScale: null,
-      sending: false,
-      ended: false,
-    };
-    resizeRef.current = drag;
-
-    const rect = characterSlotRef.current?.getBoundingClientRect();
-    Promise.resolve()
-      .then(() => getCurrentTauriWindow().innerPosition())
-      .then((position) => petScreenAnchorFromRect({
-        position,
-        rect,
-        scaleFactor: window.devicePixelRatio || 1,
-      }))
-      .catch(() => null)
-      .then((anchor) => {
-        if (resizeRef.current !== drag) return;
-        drag.anchorX = anchor?.x ?? null;
-        drag.anchorY = anchor?.y ?? null;
-        drag.ready = true;
-        applyResizePointer(drag, drag.ended);
-      });
-  };
-
-  const onResizePointerMove = (event) => {
-    const drag = resizeRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    event.stopPropagation();
-    drag.latestX = event.screenX;
-    drag.latestY = event.screenY;
-    applyResizePointer(drag, false);
-  };
-
-  const onResizePointerUp = (event) => {
-    const drag = resizeRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    event.stopPropagation();
-    drag.latestX = event.screenX;
-    drag.latestY = event.screenY;
-    drag.ended = true;
-    applyResizePointer(drag, true);
-  };
-
   // 根节点只负责压掉 WebView 默认右键菜单（卡片/透明区不该冒出"检查/刷新"）；
   // 公仔菜单只在人物本体上触发，透明边距和活动卡不再误开。
   const suppressContextMenu = (event) => {
@@ -1521,27 +1378,6 @@ export default function PetWindow({
             <span className="pet-activation-fallback-title">{petCopy.loadFailed}</span>
             <span className="pet-activation-fallback-action">{petCopy.retry}</span>
           </button>
-        )}
-        {allowResize && (
-          <div
-            className="pet-resize-grip"
-            aria-hidden="true"
-            title={petCopy.resizeTitle}
-            onPointerDown={onResizePointerDown}
-            onPointerMove={onResizePointerMove}
-            onPointerUp={onResizePointerUp}
-            onPointerCancel={onResizePointerUp}
-          >
-            {/* pointer-only drag handle with no keyboard interaction path: hidden from assistive tech as a whole, so no role="separator". */}
-            <svg
-              className="pet-resize-grip-icon"
-              viewBox="0 0 16 16"
-              aria-hidden="true"
-              focusable="false"
-            >
-              <path d="M2 14H14V2" />
-            </svg>
-          </div>
         )}
       </div>
       {ctxMenu && (

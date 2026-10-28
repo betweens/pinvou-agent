@@ -59,7 +59,12 @@ pub(crate) fn strip_all_git_env(command: &mut Command) {
 /// Once `GIT_CONFIG_COUNT` is removed, the `GIT_CONFIG_KEY_n`/
 /// `GIT_CONFIG_VALUE_n` numbered pairs become ineffective, so the numbered
 /// keys need no enumeration.
-const GIT_OVERRIDE_KEYS: [&str; 20] = [
+///
+/// `pub` so the same-repo `pinvou-cli` workspace lanes can import it through
+/// the `features::codex_acp` facade re-export instead of mirroring the list
+/// (a CLI-side mirror had already drifted by three keys); the GUI's own
+/// callers keep using it through the crate-private strip_git_override_env.
+pub const GIT_OVERRIDE_KEYS: [&str; 25] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -72,6 +77,25 @@ const GIT_OVERRIDE_KEYS: [&str; 20] = [
     "GIT_NAMESPACE",
     "GIT_CEILING_DIRECTORIES",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    // GIT_TEMPLATE_DIR would seed a fresh `git init` of the shadow repo with
+    // hook-carrying templates (pre-auto-gc runs under `gc --auto`).
+    "GIT_TEMPLATE_DIR",
+    // The pathspec-magic trio, stripped together for one reason: the secret
+    // purge's pathspecs are `:(icase)*.pem`-shaped, so anything that changes
+    // how default magic is interpreted can silently turn the purge into a
+    // no-op. GIT_LITERAL_PATHSPECS=1 disables magic outright (the `:(icase)`
+    // prefix is then matched as literal text); GIT_NOGLOB_PATHSPECS=1 makes
+    // the default no-glob, so `*.pem` matches only a file literally named
+    // `*.pem`. GIT_ICASE_PATHSPECS only broadens matching — the safe
+    // direction — but goes with its siblings so the purge's matching rules
+    // come from the command line rather than from whatever the host exported.
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    // GIT_EXTERNAL_DIFF replaces the diff driver with an arbitrary command.
+    // `--no-ext-diff` closes it at the one diff call site, but the isolation
+    // primitive must not depend on every future call site remembering a flag.
+    "GIT_EXTERNAL_DIFF",
     "GIT_CONFIG",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
@@ -86,7 +110,12 @@ const GIT_OVERRIDE_KEYS: [&str; 20] = [
     "GIT_CONFIG_VALUE_0",
 ];
 
-const GIT_IDENTITY_KEYS: [&str; 6] = [
+/// Published through the `features::codex_acp` facade for the same-repo
+/// `pinvou-cli`'s commit lane: the CLI must strip the exact identity list the
+/// GUI's commit lane strips, or an ambient `GIT_AUTHOR_*` could outrank the
+/// `-c user.name=` the CLI passes (same drift-prevention as
+/// `GIT_OVERRIDE_KEYS` above); behavior is unchanged.
+pub const GIT_IDENTITY_KEYS: [&str; 6] = [
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_AUTHOR_DATE",
@@ -117,7 +146,27 @@ fn external_command_for(executable: &Path, windows: bool) -> Command {
 
 /// 构造隐藏窗口的外部 CLI 命令。Windows npm 生成的 `.cmd` / `.bat` shim
 /// 必须经 `cmd /D /S /C`，否则探测、登录或启动 Agent 时会被当成原生可执行文件。
-pub(crate) fn external_command(executable: &Path) -> Command {
+/// Shared with the pinvou-cli kill tree (`support.rs` Windows arm) through
+/// the targeted `platform::external_command` re-export — the `process`
+/// module itself stays crate-private. The point of sharing is *resolution
+/// parity*, not hardening: `external_application_path` only normalizes
+/// `\\?\`/UNC spellings and returns a bare name like `taskkill` verbatim,
+/// so a bare-name caller resolves exactly as it does for the GUI's own
+/// `kill_pid_tree` (app dir → CWD → System32 → PATH). A caller that needs a
+/// planted-`taskkill.exe`-in-CWD defense must resolve
+/// `%SystemRoot%\System32\taskkill.exe` itself — this helper deliberately
+/// does not invent a stricter PATH policy the GUI does not have.
+///
+/// The Windows `.cmd`/`.bat` branch keeps the manual `cmd /D /S /C` wrap
+/// (unlike the CLI's own `build_command`, which delegates to std's hardened
+/// batch quoting): these shims NEED the cmd interpretation to run at all
+/// — an npm `.cmd` spawned directly is treated as a non-executable image —
+/// and every current caller passes a fixed, first-party-resolved path with
+/// no attacker-shaped argument material, so the BatBadBut argument-quoting
+/// class the CLI pin guards against has no vector here. If a caller ever
+/// forwards external arguments through this helper, route that caller
+/// through `build_command`'s std delegation instead of extending the wrap.
+pub fn external_command(executable: &Path) -> Command {
     external_command_for(executable, crate::platform::capabilities::is_windows())
 }
 
@@ -628,6 +677,15 @@ mod tests {
             "GIT_CONFIG_NOSYSTEM",
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS",
+            // Named explicitly so removing one goes red here. The sibling
+            // test iterates GIT_OVERRIDE_KEYS itself and is therefore
+            // tautological; only the array length would otherwise object, and
+            // it objects to every edit equally.
+            "GIT_TEMPLATE_DIR",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_EXTERNAL_DIFF",
         ] {
             assert!(
                 GIT_OVERRIDE_KEYS.contains(&key),

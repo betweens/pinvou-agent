@@ -12,7 +12,6 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -96,15 +95,10 @@ fn bundled_engine_dir() -> Option<PathBuf> {
     BUNDLED_ENGINE_DIR.get().cloned()
 }
 
-fn bundled_engine_intact(path: &Path) -> bool {
-    let bundled_dir = bundled_engine_dir();
-    super::platform::bundled_engine_intact(path, bundled_dir.as_deref())
-}
-
 pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
+    let mut probe = crate::platform::process::HiddenCommand::new("ffmpeg");
+    probe.arg("-version");
+    crate::platform::process::output_with_timeout(probe, std::time::Duration::from_secs(10))
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -166,14 +160,18 @@ fn compose_status(engine: bool, ffmpeg: bool, model: bool, installable: bool) ->
     }
 }
 
-pub async fn download_current_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    download_asr_model(app, current_model_spec()).await
+/// Per-spec download cap carried in `DownloadRequest.max_bytes`: the expected
+/// model size with a 16 MiB floor, doubled, so the band scales with the spec
+/// instead of a flat cap silently over- or under-fitting a future model bump.
+/// Shared verbatim with pinvou-cli through
+/// [`crate::features::voice::contract`], whose `asr-install` size gate must
+/// scale with the spec identically.
+pub fn asr_download_max_bytes(expected_size: u64) -> u64 {
+    expected_size.max(16 * 1024 * 1024) * 2
 }
 
-pub async fn download_asr_model(
-    app: &tauri::AppHandle,
-    spec: AsrModelSpec,
-) -> Result<PathBuf, String> {
+pub async fn download_current_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let spec = current_model_spec();
     std::fs::create_dir_all(asr_dir()).map_err(|e| format!("创建 ASR 目录失败: {e}"))?;
     let dest = model_download_path();
     debug_assert_eq!(
@@ -219,7 +217,7 @@ pub async fn download_asr_model(
         // 进度按它算 100%)。max_bytes 只做离谱大文件挡板,刻意与 total 分开——此前
         // 复用单字段会让进度停在约 50%(2*expected_size 当 total)。
         let total_hint = spec.expected_size;
-        let max_bytes = spec.expected_size.max(16 * 1024 * 1024) * 2;
+        let max_bytes = asr_download_max_bytes(spec.expected_size);
         // `verify` 事件恢复到重构前时点:下载成功后、sha256 校验开始前 emit(helper 在
         // sync_all 后、sha256_file 前调用此闭包)。frontend 据此从下载进度(0–95%)
         // 切到「校验中」(96%),不再出现 96%→0% 倒退。
@@ -364,14 +362,23 @@ pub fn transcribe(wav: &Path) -> Result<String, String> {
     }
 
     // 浏览器录音多为 48k/立体声，sense-voice 只吃 16k mono，先转码。
+    // Corrupted input can hang the demuxer: bound the transcode with a 60s
+    // timeout + kill-tree (the same fallback the files/ converters such as
+    // pdftotext get); on failure, fall back to the original wav.
     let norm = std::env::temp_dir().join(format!("pinvou3-asr-{}.wav", std::process::id()));
     let input = if ffmpeg_available() {
-        let ff = Command::new("ffmpeg")
-            .args(["-y", "-i"])
-            .arg(wav)
-            .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
-            .arg(&norm)
-            .output();
+        let ff = crate::platform::process::output_with_timeout_and_kill_tree(
+            {
+                let mut command = crate::platform::process::HiddenCommand::new("ffmpeg");
+                command
+                    .args(["-y", "-i"])
+                    .arg(wav)
+                    .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
+                    .arg(&norm);
+                command
+            },
+            std::time::Duration::from_secs(60),
+        );
         match ff {
             Ok(o)
                 if o.status.success() && norm.metadata().map(|m| m.len() > 44).unwrap_or(false) =>
@@ -390,16 +397,23 @@ pub fn transcribe(wav: &Path) -> Result<String, String> {
     // 钉死 CWD 到可写的 asr_dir,让这个副产物落在那里、不污染源码树。
     let work_dir = asr_dir();
     let _ = std::fs::create_dir_all(&work_dir);
-    if !bundled_engine_intact(&engine) {
-        return Err("本地语音识别引擎完整性校验失败，已拒绝执行；请重新安装 pinvou3。".to_string());
-    }
-    let out = Command::new(&engine)
-        .current_dir(&work_dir)
-        .arg("-m")
-        .arg(&model)
-        .arg(&input)
-        .args(["-t", "4", "-l", "auto", "-itn"])
-        .output();
+    // Transcription is a long-running task (long recordings can take
+    // minutes), so allow a generous 300s: the timeout kill-tree keeps a
+    // wedged engine from blocking the calling thread forever, rather than
+    // cutting a legitimate transcription short.
+    let out = crate::platform::process::output_with_timeout_and_kill_tree(
+        {
+            let mut command = crate::platform::process::HiddenCommand::new(&engine);
+            command
+                .current_dir(&work_dir)
+                .arg("-m")
+                .arg(&model)
+                .arg(&input)
+                .args(["-t", "4", "-l", "auto", "-itn"]);
+            command
+        },
+        std::time::Duration::from_secs(300),
+    );
     let _ = std::fs::remove_file(&norm);
     let out = out.map_err(|e| format!("启动语音识别引擎失败: {e}"))?;
     if !out.status.success() {

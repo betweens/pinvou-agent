@@ -6,17 +6,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use parking_lot::{Mutex, RwLock};
-use sha2::{Digest, Sha256};
 
 use crate::client::normalize_endpoint;
 use crate::model::*;
 use crate::parser::parse_document;
 use crate::store::{DeviceMutationError, DocumentIndexUpdate, RestoreDocumentOutcome, Store};
 use crate::tls::TlsIdentity;
-use crate::{Embedder, MAX_UPLOAD_BYTES, MAX_VECTOR_DIMENSIONS, chunk_text};
+use crate::{
+    Embedder, MAX_UPLOAD_BYTES, MAX_VECTOR_DIMENSIONS, chunk_text, random_secret, sha256_hex,
+};
 
 pub const MODEL_NAME: &str = "bge-m3";
 
@@ -91,6 +90,21 @@ enum RateDecision {
     Allowed,
     SourceLimited,
     GlobalLimited,
+}
+
+// 桩构建的统一下载拒绝文案：begin_model_download（宿主服务端闸）与
+// download_model（公开 API 直连的防御纵深闸）共用同一语义与文案。能力位
+// 作参数（与桌面端 local_embed_download_refusal 同形），宿主即可在两个
+// 方向上执行闸语义，而不是只靠 loongarch64 目标的编译期检查。
+// 文案遵循 CONTRIBUTING 的诊断语言约定（英文），并刻意区别于 embedding
+// 桩常量（409 下载拒绝 ≠ 503 装载不可用，is_local_embed_unavailable 只
+// 认后者）。
+fn local_embed_download_refusal(supported: bool) -> Option<String> {
+    (!supported).then(|| {
+        "local embedding model download is unavailable on this platform (no embedding \
+         runtime artifacts for this architecture)"
+            .to_string()
+    })
 }
 
 fn check_attempt_rate(
@@ -278,22 +292,21 @@ impl KnowledgeService {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: 2,
             tls_ca: self.tls.ca_encoded.clone(),
-            initialized: self.initialized(),
+            // initialized/model 是 2026-10 前客户端的 serde 必需字段,必须继续
+            // 下发真实值(见 model.rs 的兼容说明与 wire_compat_tests)。
+            initialized: self
+                .store
+                .list_devices()
+                .map(|devices| {
+                    devices
+                        .iter()
+                        .any(|device| device.scope.is_owner() && !device.revoked)
+                })
+                .unwrap_or(false),
             ready: self.ready(),
             model_present: self.model_directory_complete(),
             model: MODEL_NAME.to_string(),
         })
-    }
-
-    pub fn initialized(&self) -> bool {
-        self.store
-            .list_devices()
-            .map(|devices| {
-                devices
-                    .iter()
-                    .any(|device| device.scope.is_owner() && !device.revoked)
-            })
-            .unwrap_or(false)
     }
 
     pub fn ready(&self) -> bool {
@@ -322,6 +335,13 @@ impl KnowledgeService {
     }
 
     pub fn begin_model_download(&self) -> Result<(), String> {
+        // 服务端孪生门（桌面端 = kb_model_download 的 local_embed_download_refusal）：
+        // 桩构建里下载下来的模型永远无法加载，任何下载触发（含宿主服务的
+        // 远端下载入口）都必须在触碰下载管线之前被拒绝。
+        if let Some(error) = local_embed_download_refusal(crate::embedding::local_embed_available())
+        {
+            return Err(error);
+        }
         self.model_downloading
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
@@ -334,6 +354,7 @@ impl KnowledgeService {
         self.model_downloading.store(false, Ordering::Release);
     }
 
+    #[cfg(test)]
     pub fn ensure_host_owner(&self, device_name: &str, token: &str) -> Result<DeviceGrant, String> {
         let device_name = normalized_required_name(device_name)?;
         if token.len() < 32 || token.chars().any(char::is_control) {
@@ -453,6 +474,7 @@ impl KnowledgeService {
             .ok_or_else(|| "恢复本机所有者失败".to_string())
     }
 
+    #[cfg(test)]
     pub fn set_owner_device(&self, device_id: &str, owner: bool) -> Result<DeviceGrant, String> {
         Self::set_owner_device_in_store(&self.store, device_id, owner)
     }
@@ -705,6 +727,7 @@ impl KnowledgeService {
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub fn list_devices(&self) -> Result<Vec<DeviceGrant>, String> {
         self.store.list_devices().map_err(|error| error.to_string())
     }
@@ -768,21 +791,6 @@ impl KnowledgeService {
             .map_err(|error| error.to_string())
     }
 
-    pub fn update_collection(
-        &self,
-        id: i64,
-        request: CreateCollectionRequest,
-    ) -> Result<Collection, String> {
-        let name = normalized_name(&request.name, "知识集")?;
-        self.store
-            .update_collection(id, &name, request.description.as_deref())
-            .map_err(|_| "知识集不存在或已删除".to_string())?;
-        self.store
-            .collection(id, false)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "知识集不存在或已删除".to_string())
-    }
-
     pub fn trash_collection(&self, id: i64) -> Result<(), String> {
         self.store
             .trash_collection(id)
@@ -804,16 +812,6 @@ impl KnowledgeService {
             .map_err(|_| "回收站中未找到该知识集".to_string())?;
         self.remove_managed_sources(paths);
         Ok(())
-    }
-
-    pub fn documents(
-        &self,
-        collection_id: i64,
-        include_deleted: bool,
-    ) -> Result<Vec<Document>, String> {
-        self.store
-            .list_documents(collection_id, include_deleted)
-            .map_err(|error| error.to_string())
     }
 
     pub fn documents_page(
@@ -852,7 +850,7 @@ impl KnowledgeService {
             ));
         }
         let filename = safe_filename(filename)?;
-        let sha256 = hash_bytes(&bytes);
+        let sha256 = sha256_hex(&bytes);
         let relative = PathBuf::from(random_secret(18)).join(&filename);
         let absolute = self.documents_dir.join(&relative);
         write_atomic(&absolute, &bytes)?;
@@ -884,15 +882,14 @@ impl KnowledgeService {
         // A successful upload means the managed source is durable. Index in the
         // background so a slow parser/model cannot make the client time out and
         // retry an upload that the server already committed. With lazy model load
-        // the upload is a first-use trigger: ensure the model, then index (failure
-        // leaves the document pending, same as the old not-ready path).
+        // the upload is a first-use trigger: ensure the model, then index; a
+        // failed ensure marks the row failed (the boot backlog requeues failed
+        // rows) instead of leaving it pending forever with no visible reason.
         {
             let background = Arc::clone(self);
             let document_id = document.id;
             tokio::spawn(async move {
-                if background.ensure_model_loaded().await.is_ok() {
-                    let _ = background.index_document(document_id).await;
-                }
+                background.index_after_model_load(document_id).await;
             });
         }
         self.store
@@ -960,7 +957,7 @@ impl KnowledgeService {
                 ext: ext.as_deref(),
                 storage_path: &relative.to_string_lossy(),
                 size: bytes.len() as i64,
-                sha256: &hash_bytes(&bytes),
+                sha256: &sha256_hex(&bytes),
                 chunks: &prepared.0,
                 vectors: &prepared.1,
             },
@@ -991,6 +988,23 @@ impl KnowledgeService {
                 let message = format!("索引任务异常结束：{error}");
                 let _ = self.store.mark_document_failed(document_id, &message);
                 Err(message)
+            }
+        }
+    }
+
+    /// Background tail of `upload_document`: ensure the model, then index.
+    /// A failed ensure must write the failure back to the row — on stub
+    /// builds (`local_embed_available() == false`) it is deterministic and
+    /// permanent, and an eternal `pending` row gives the owner no visible
+    /// reason. `failed` rows stay retryable: the boot backlog requeue
+    /// selects `status IN ('pending','failed')`.
+    async fn index_after_model_load(self: &Arc<Self>, document_id: i64) {
+        match self.ensure_model_loaded().await {
+            Ok(()) => {
+                let _ = self.index_document(document_id).await;
+            }
+            Err(error) => {
+                let _ = self.store.mark_document_failed(document_id, &error);
             }
         }
     }
@@ -1165,9 +1179,6 @@ impl KnowledgeService {
             return Ok(hits);
         }
         let query = request.query.trim();
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
         let embedder = self
             .embedder
             .read()
@@ -1246,6 +1257,17 @@ impl KnowledgeService {
     }
 
     pub fn load_model(&self) -> Result<(), String> {
+        // 桩构建里模型永远无法装载：在触碰跨进程安装锁与磁盘恢复之前就
+        // 返回桩常量。否则安装锁竞争（如桌面端同时操作共享模型目录）等
+        // 前置错误会替代能力缺失文案返回，HTTP 层键于桩常量的 503 映射
+        // （map_document_write_error）就会把同一能力缺失读成 400。
+        #[cfg(not(all(
+            feature = "local-embed",
+            not(all(target_os = "linux", target_arch = "loongarch64"))
+        )))]
+        if !crate::embedding::local_embed_available() {
+            return Err(crate::embedding::local_embed_unavailable_error().to_string());
+        }
         let _install_lock = crate::try_lock_knowledge_model_install(&self.model_dir)?;
         if let Some(warning) = crate::model_download::recover_model_directory(&self.model_dir)? {
             eprintln!("[knowledge] {warning}");
@@ -1337,8 +1359,15 @@ impl KnowledgeService {
     }
 
     pub async fn download_model(self: &Arc<Self>) -> Result<(), String> {
+        // 防御纵深：公开 API 的直连调用者不经过 begin_model_download 的闸。
+        // 桩构建里同样必须在安装锁/磁盘 I/O 之前拒绝，否则会白下 568 MB 后
+        // 才在 Embedder::from_dir 处失败。
+        if let Some(error) = local_embed_download_refusal(crate::embedding::local_embed_available())
+        {
+            return Err(error);
+        }
         self.download_model_with(
-            crate::model_download::knowledge_model_hf_base_url,
+            crate::model_download::knowledge_model_hf_base_url_candidates,
             || async { self.load_model_unlocked() },
         )
         .await?;
@@ -1349,11 +1378,11 @@ impl KnowledgeService {
 
     async fn download_model_with<F, L, Fut>(
         self: &Arc<Self>,
-        resolve_hf_base_url: F,
+        resolve_hf_base_urls: F,
         mut load_complete: L,
     ) -> Result<(), String>
     where
-        F: FnOnce() -> String + Send,
+        F: FnOnce() -> Vec<String> + Send,
         L: FnMut() -> Fut + Send,
         Fut: Future<Output = Result<(), String>> + Send,
     {
@@ -1377,10 +1406,10 @@ impl KnowledgeService {
         std::fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
         let candidate = parent.join(format!(".{MODEL_NAME}.candidate-{}", random_secret(8)));
         let result = async {
-            let hf_base_url = resolve_hf_base_url();
+            let hf_base_urls = resolve_hf_base_urls();
             crate::model_download::download_knowledge_model_candidate(
                 &candidate,
-                &hf_base_url,
+                &hf_base_urls,
                 |_| {},
                 || false,
             )
@@ -1406,24 +1435,8 @@ impl KnowledgeService {
     }
 }
 
-fn random_secret(bytes: usize) -> String {
-    URL_SAFE_NO_PAD.encode(random_bytes(bytes))
-}
-
-fn random_bytes(bytes: usize) -> Vec<u8> {
-    use rand::Rng;
-    let mut value = vec![0u8; bytes];
-    rand::rng().fill_bytes(&mut value);
-    value
-}
-
 fn hash_secret(value: &str) -> String {
-    hash_bytes(value.as_bytes())
-}
-
-fn hash_bytes(value: &[u8]) -> String {
-    let digest = Sha256::digest(value);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::sha256_hex(value.as_bytes())
 }
 
 fn normalized_name(value: &str, fallback: &str) -> Result<String, String> {
@@ -1448,17 +1461,16 @@ fn is_private_share_endpoint(endpoint: &str) -> bool {
         return false;
     };
     match url.host() {
+        // Share endpoints reject loopback (loopback-rejecting semantics);
+        // the rest of the private-network classification is shared with the
+        // join-source check.
         Some(url::Host::Ipv4(address)) => {
-            let value = u32::from(address);
-            let tailnet = value >= u32::from_be_bytes([100, 64, 0, 0])
-                && value <= u32::from_be_bytes([100, 127, 255, 255]);
-            (address.is_private() || address.is_link_local() || tailnet) && !address.is_loopback()
+            crate::net_policy::is_private_network_ip(IpAddr::V4(address), false)
         }
         Some(url::Host::Ipv6(address)) => {
-            let first = address.segments()[0];
-            !address.is_loopback() && ((first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
+            crate::net_policy::is_private_network_ip(IpAddr::V6(address), false)
         }
-        Some(url::Host::Domain(host)) => [".local", ".lan", ".internal", ".home.arpa", ".ts.net"]
+        Some(url::Host::Domain(host)) => crate::net_policy::PRIVATE_HOST_SUFFIXES
             .iter()
             .any(|suffix| host.trim_end_matches('.').ends_with(suffix)),
         None => false,
@@ -1592,6 +1604,24 @@ mod tests {
         ] {
             assert!(!is_private_share_endpoint(endpoint), "{endpoint}");
         }
+        // IPv4-mapped addresses classify by their mapped v4 private-network
+        // form (same semantics as the join source).
+        assert!(is_private_share_endpoint(
+            "https://[::ffff:192.168.1.10]:3210"
+        ));
+        assert!(!is_private_share_endpoint("https://[::ffff:8.8.8.8]:3210"));
+        // Mapped boundary classes: link-local and tailnet literals stay
+        // private; a mapped loopback must keep the share gate's reject (only
+        // the join gate accepts loopback sources).
+        assert!(is_private_share_endpoint(
+            "https://[::ffff:169.254.1.5]:3210"
+        ));
+        assert!(is_private_share_endpoint(
+            "https://[::ffff:100.64.0.1]:3210"
+        ));
+        assert!(!is_private_share_endpoint(
+            "https://[::ffff:127.0.0.1]:3210"
+        ));
     }
 
     #[test]
@@ -1619,7 +1649,130 @@ mod tests {
         assert!(cached.is_err(), "negative cache still reports the failure");
     }
 
+    #[test]
+    fn local_embed_refusal_tracks_the_capability_bit() {
+        // Same shape as the desktop twin's
+        // download_is_refused_when_local_embed_is_unsupported: the gate
+        // decision is a pure function of the compile-time capability bit, so
+        // the host executes both directions; the full-funnel stub refusals
+        // stay type-checked for the loongarch64 target by the cfg test below
+        // (service.rs is server-gated, so no host feature set compiles it
+        // with the stub).
+        assert!(local_embed_download_refusal(true).is_none());
+        let refusal = local_embed_download_refusal(false)
+            .expect("an unsupported capability must refuse downloads");
+        assert!(
+            refusal.contains("unavailable on this platform"),
+            "{refusal}"
+        );
+    }
+
     #[tokio::test]
+    async fn upload_marks_the_document_failed_when_the_model_cannot_load() {
+        // upload's background ensure/index tail must write the failure back
+        // to the row: on stub builds every document would otherwise sit in
+        // `pending` forever with no owner-visible reason. A garbage model
+        // directory makes the load fail deterministically at ONNX parsing
+        // (offline), so the host executes the Err arm; `failed` rows stay
+        // retryable via the boot backlog (see pending_document_ids).
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("models").join(MODEL_NAME);
+        let service = KnowledgeService::boot(root.path().join("data"), Some(model_dir.clone()))
+            .unwrap()
+            .service;
+        std::fs::create_dir_all(&model_dir).unwrap();
+        for (name, contents) in [
+            ("model.onnx", b"not-a-real-onnx".as_slice()),
+            ("tokenizer.json", b"{}".as_slice()),
+            ("config.json", b"{}".as_slice()),
+            ("special_tokens_map.json", b"{}".as_slice()),
+            ("tokenizer_config.json", b"{}".as_slice()),
+        ] {
+            std::fs::write(model_dir.join(name), contents).unwrap();
+        }
+        let collection = service
+            .create_collection(CreateCollectionRequest {
+                name: "kb".to_string(),
+                description: None,
+            })
+            .unwrap();
+        let document = service
+            .upload_document(collection.id, "note.md", b"hello".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(document.status, "pending");
+        service.index_after_model_load(document.id).await;
+        let stored = service
+            .store
+            .document(document.id, false)
+            .unwrap()
+            .expect("uploaded document must remain readable");
+        assert_eq!(stored.document.status, "failed");
+        assert!(
+            stored
+                .document
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty()),
+            "a failed row must carry the reason"
+        );
+    }
+
+    #[test]
+    #[cfg(not(all(
+        feature = "local-embed",
+        not(all(target_os = "linux", target_arch = "loongarch64"))
+    )))]
+    fn model_download_refuses_on_stub_embedder_without_starting_the_pipeline() {
+        // 服务端下载门（与桌面端 local_embed_download_refusal 同语义）：桩
+        // 构建里下载注定无法加载,必须在触碰 DOWNLOADING 状态之前拒绝,否则
+        // 状态视图会显示一个永远卡住的「下载中」。
+        assert!(!crate::embedding::local_embed_available());
+        let root = tempfile::tempdir().unwrap();
+        let service = KnowledgeService::boot(root.path().to_path_buf(), None)
+            .unwrap()
+            .service;
+        let error = service
+            .begin_model_download()
+            .expect_err("stub builds must refuse model downloads");
+        assert!(error.contains("unavailable on this platform"), "{error}");
+        // 下载闸文案是有意的独立文案（说明"下载不可为"）。503 映射键于
+        // embedding 桩常量——那个常量由装载路径返回（from_dir 或上方
+        // load_model 的早退）；下载端点自行映射 409，两者不需要同源。
+        // 钉住这个「不同源」：文案漂移成桩常量会把 409 拒绝误入 503 语义。
+        assert!(
+            !crate::embedding::is_local_embed_unavailable(&error),
+            "{error}"
+        );
+        assert!(!service.model_downloading(), "no download may be in flight");
+        // 公开 download_model 的直连调用者不经过上面的闸（防御纵深）：同样
+        // 必须在任何安装锁/磁盘 I/O 之前拒绝，而不是白下 568 MB 后才失败。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let direct = rt
+            .block_on(async { service.download_model().await })
+            .expect_err("stub builds must refuse direct download_model calls");
+        assert!(direct.contains("unavailable on this platform"), "{direct}");
+        // 装载路径同样在任何锁/磁盘 I/O 之前拒绝,且返回与 503 映射同源的
+        // 桩常量(is_local_embed_unavailable):replace/search 据此映射 503。
+        let load_error = service.load_model().unwrap_err();
+        assert!(
+            crate::embedding::is_local_embed_unavailable(&load_error),
+            "{load_error}"
+        );
+    }
+
+    #[tokio::test]
+    // 真实实现方向专属：场景依赖真装载路径（跨进程锁 BUSY → 垃圾 ONNX
+    // 解析失败）。桩构建里 load_model 在锁之前就返回桩常量，这个场景不
+    // 存在（首用失败的负缓存契约由
+    // boot_does_not_load_model_and_first_use_reports_failure 覆盖）。
+    #[cfg(all(
+        feature = "local-embed",
+        not(all(target_os = "linux", target_arch = "loongarch64"))
+    ))]
     async fn model_load_failure_uses_negative_cache_then_retries_after_window() {
         // 负缓存+重试契约:失败后的窗口内,并发/后续调用复用缓存错误,不重读
         // 568MB;窗口过期后真正重跑装载。用跨进程安装锁制造可区分的失败:
@@ -1838,7 +1991,13 @@ mod tests {
         assert!(duplicate.already_exists);
         assert_eq!(duplicate.id, first.id);
         assert_eq!(duplicate.name, "first.md");
-        assert_eq!(service.documents(collection.id, false).unwrap().len(), 1);
+        assert_eq!(
+            service
+                .documents_page(collection.id, false, None, 0)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             std::fs::read_dir(&service.documents_dir).unwrap().count(),
             1
@@ -1905,9 +2064,18 @@ mod tests {
 
         let error = service.restore_document(original.id).unwrap_err();
         assert!(error.contains("相同内容"));
-        assert_eq!(service.documents(collection.id, false).unwrap().len(), 1);
         assert_eq!(
-            service.documents(collection.id, false).unwrap()[0].id,
+            service
+                .documents_page(collection.id, false, None, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .documents_page(collection.id, false, None, 0)
+                .unwrap()[0]
+                .id,
             replacement.id
         );
     }
@@ -2174,7 +2342,7 @@ mod tests {
             .download_model_with(
                 move || {
                     observed.store(true, Ordering::Release);
-                    String::new()
+                    Vec::new()
                 },
                 move || {
                     let loaded_observed = Arc::clone(&loaded_observed);
@@ -2226,7 +2394,7 @@ mod tests {
             .download_model_with(
                 move || {
                     observed.store(true, Ordering::Release);
-                    String::new()
+                    Vec::new()
                 },
                 || async { Err("invalid model".to_string()) },
             )
@@ -2234,13 +2402,7 @@ mod tests {
             .unwrap_err();
 
         assert!(resolved.load(Ordering::Acquire));
-        assert_eq!(
-            error,
-            format!(
-                "{} 不能为空",
-                crate::model_download::KNOWLEDGE_MODEL_HF_BASE_URL_ENV
-            )
-        );
+        assert_eq!(error, "mirror base URL list is empty");
         assert!(std::fs::read_dir(model_parent).unwrap().all(|entry| {
             !entry
                 .unwrap()

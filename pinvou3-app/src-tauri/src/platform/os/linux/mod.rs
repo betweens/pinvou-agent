@@ -1,6 +1,9 @@
+mod linux_clipboard;
 mod linux_path;
 mod linux_permission;
 mod linux_system;
+
+pub use linux_clipboard::read_clipboard_image;
 
 pub(crate) use super::locale::current_system_locale;
 
@@ -25,4 +28,5 @@ pub use linux_system::{
     pdf_tool_path, presentation_pdf_missing_message, process_alive, reveal_target,
     show_archive_dependency_check, show_ocr_dependency_check, show_pandoc_dependency_check,
     show_pdf_dependency_check, startup_platform_env, system_default_open_supported,
+    try_make_private_dir,
 };

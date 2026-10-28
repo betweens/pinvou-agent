@@ -6,8 +6,21 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use wait_timeout::ChildExt;
 
-/// codex-acp 1.1.5 官方依赖的最低 Codex CLI 版本。
-/// 所有运行时来源都必须满足，显式覆盖路径也不能绕过兼容性门禁。
+/// Compatibility floor retained from the legacy codex-acp bridge.
+///
+/// Every runtime source, including an explicit override, must satisfy this
+/// gate. The gate itself is an unbounded >= 0.144.6 floor: the bundled
+/// codex-acp 2.2.2 package declares `@openai/codex ^0.160.1`, so installs in
+/// 0.144.6-0.160.0 (including the 0.146.0 documentation example) sit below
+/// the bridge's declared range. The floor is runtime-validated, not just
+/// retained: driving codex-acp 2.2.2 against codex-cli 0.144.6 completes
+/// initialize (ACP protocolVersion 1), session/new (thread created through
+/// the 0.144.6 app-server, model/command lists intact), and a full
+/// session/prompt round-trip; the same probe on a declared-range 0.160.1
+/// behaves identically except that auth failures surface as a structured
+/// JSON-RPC error instead of an in-stream agent_message_chunk. Raising the
+/// floor still requires a separate compatibility change with its own
+/// migration path for existing installations.
 pub const MIN_CODEX_VERSION: &str = "0.144.6";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

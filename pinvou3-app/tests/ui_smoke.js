@@ -10,6 +10,8 @@
  *   ⑤ session 内未发送的 composer 草稿在跳转其他页面后仍能恢复。
  * 依赖:puppeteer-core(自动从 node_modules / ~/.npm/_npx 发现)+ 系统 chromium(或 env CHROME 指定)。
  * 用法:node pinvou3-app/tests/ui_smoke.js   (全 PASS → exit 0,任一 FAIL → exit 1,缺依赖 → exit 2)
+ * 缺依赖分支必须在 exit 2 之前打印一行以 SKIP: 开头的说明(必须在行首);
+ * scripts/run-user-journey-tests.sh 只在退出码 2 且有该行时才算 skip,否则算失败。
  */
 const fs = require('fs'), path = require('path'), os = require('os');
 const { startUiTestServer } = require('./ui_test_server');
@@ -111,13 +113,18 @@ function injectSource() {
       window.__TAURI_INVOKES__.push({cmd:cmd,args:args||{}});
       switch(cmd){
         case 'get_settings': return Promise.resolve({theme:'liquid-light',language:'zh-Hans'});
-        case 'get_platform_capabilities': return Promise.resolve({codexAcpSupported:true,browserNativeDisplay:true,localModelSetup:true,dependencyInstall:true});
+        // localEmbedSupported must be explicit: the desktop bridge defaults
+        // the capability to false (fail-closed) until the snapshot lands, so
+        // a missing key silently gates the knowledge download/repair UI.
+        case 'get_platform_capabilities': return Promise.resolve({codexAcpSupported:true,browserNativeDisplay:true,localModelSetup:true,localEmbedSupported:true,dependencyInstall:true});
         case 'get_effective_model_config': return Promise.resolve({model:'qwen36_35b_256k',base_url:'http://127.0.0.1:8000/v1',api_key_set:false});
         case 'list_sessions': return Promise.resolve(SESSIONS);
         case 'list_codex_acp_sessions': return Promise.resolve(CODEX_SESSIONS);
         case 'get_acp_agent_status': return Promise.resolve({agent_id:args.agentId||'codex',installed:true,node_supported:true,authenticated:true});
         case 'get_codex_acp_session_info': return Promise.resolve({session_id:args.sessionId,models:[],current_model_id:'',modes:null,config_options:[]});
-        case 'get_codex_acp_timeline': return Promise.resolve([
+        case 'get_codex_acp_timeline':
+          if(window.__ACP_TIMELINE_DEFER__) return new Promise(resolve=>{window.__ACP_TIMELINE_RESOLVE__=resolve;});
+          return Promise.resolve([
           {version:1,sessionId:'codex-1',turnId:'copy-turn',seq:1,timestamp:'2026-08-04T01:00:00Z',event:{type:'user_message',data:{content:[{type:'text',text:'Test copy layout'}]}}},
           {version:1,sessionId:'codex-1',turnId:'copy-turn',seq:2,timestamp:'2026-08-04T01:00:01Z',event:{type:'turn_started',data:{status:'running'}}},
           {version:1,sessionId:'codex-1',turnId:'copy-turn',seq:3,timestamp:'2026-08-04T01:00:02Z',event:{type:'agent_message_chunk',data:{update:{content:{type:'text',text:'Codex copy layout'}}}}},
@@ -271,13 +278,6 @@ function injectSource() {
         case 'artifact_info': return Promise.resolve({exists:true,kind:'md',size:2048,modified:1});
         case 'read_artifact_text': return Promise.resolve('# 会议纪要');
         case 'render_artifact_visual': return Promise.resolve({mode:'unsupported'});
-        case 'detect_local_vllm_setup': {
-          const engineState = window.__VLLM_STATE__ || 'stopped';
-          return Promise.resolve(window.__VLLM_ELIGIBLE__ && engineState !== 'starting'
-            ? {eligible:true,may_offer_setup:true,has_packages:true,vllm_online:false,engine_state:engineState,already_bootstrapped:false}
-            : {eligible:false,may_offer_setup:!!window.__VLLM_ELIGIBLE__,has_packages:engineState==='starting',vllm_online:false,engine_state:engineState,already_bootstrapped:false});
-        }
-        case 'bootstrap_local_vllm': return new Promise(function(){}); // 永不 resolve,停在 bootstrapping 态供测步骤指示
         default: return Promise.resolve(null);
       }
     }
@@ -349,6 +349,26 @@ async function expand(page) {
       && visualShell.overflow === 'hidden'
       && visualShell.backgroundColor !== 'rgba(0, 0, 0, 0)',
     JSON.stringify(visualShell),
+  );
+
+  const searchOverlayFirstOpen = await page.evaluate(async () => {
+    const trigger = [...document.querySelectorAll('[aria-label], [title]')]
+      .find(element => `${element.getAttribute('aria-label') || ''}${element.getAttribute('title') || ''}`.includes('搜索对话'));
+    trigger?.click();
+    const opened = await window.__uiWait__(() => !!document.querySelector('[role="dialog"][aria-modal="true"]'));
+    const dialog = document.querySelector('[role="dialog"][aria-modal="true"]');
+    const fixedBackdrop = dialog?.parentElement
+      ? getComputedStyle(dialog.parentElement).position === 'fixed'
+      : false;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    const closed = await window.__uiWait__(() => !document.querySelector('[role="dialog"][aria-modal="true"]'));
+    return { triggerFound: !!trigger, opened, fixedBackdrop, closed };
+  });
+  rec(
+    'search overlay lazy chunk opens on first use and closes with Escape',
+    searchOverlayFirstOpen.triggerFound && searchOverlayFirstOpen.opened
+      && searchOverlayFirstOpen.fixedBackdrop && searchOverlayFirstOpen.closed,
+    JSON.stringify(searchOverlayFirstOpen),
   );
 
   const artifactPresentation = await page.evaluate(async () => {
@@ -431,7 +451,12 @@ async function expand(page) {
     const nativeShowsBeforeInitialStatus = window.__TAURI_INVOKES__
       .filter(call => call.cmd === 'browser_show_native_surface').length;
     defaultBrowserOption?.click();
-    await wait(120);
+    // The browser view mounts from a lazy chunk, so its first (delayed)
+    // browser_status lands only after the chunk loads. Wait for the queued
+    // resolver instead of sleeping a fixed 120ms: releasing the latch before
+    // the view's request is queued would leave the one-shot resolver a no-op
+    // and the initial status pending forever (no native surface show).
+    await window.__uiWait__(() => window.__BROWSER_STATUS_RESOLVERS__.length > 0, 10000);
     const initialStatusGated = window.__TAURI_INVOKES__
       .filter(call => call.cmd === 'browser_show_native_surface').length === nativeShowsBeforeInitialStatus;
     window.__RESOLVE_BROWSER_STATUS__?.();
@@ -686,7 +711,17 @@ async function expand(page) {
       cancelable: true,
       dataTransfer: dragData,
     }));
-    await new Promise(resolve => setTimeout(resolve, 80));
+    // Wait for a DEFINITE overlay state before reading the flag. While inactive
+    // the overlay still renders (invisible, aria-hidden) — a fixed timeout here
+    // raced the dragenter commit on slow runners and read the inactive-present
+    // form as "not withheld" (deflake). The withheld form is the overlay being
+    // removed from the DOM entirely (active committed, publication not yet
+    // acked); the published form is aria-hidden=false after the ack resolves
+    // below — a publication without an ack still fails the flag read.
+    await window.__uiWait__(() => {
+      const overlay = document.querySelector('[data-testid="attachment-drop-overlay"]');
+      return !overlay || overlay.getAttribute('aria-hidden') === 'false';
+    });
     const attachmentDropWithheldUntilHideAck = !document.querySelector('[data-testid="attachment-drop-overlay"]');
     const attachmentDropHidePending = typeof window.__RESOLVE_BROWSER_HIDE__ === 'function';
     window.__RESOLVE_BROWSER_HIDE__?.();
@@ -1480,6 +1515,48 @@ async function expand(page) {
       && !codexCompletedOverflow.detailsAfter,
     JSON.stringify(codexCompletedOverflow));
 
+  // Refetch an authoritative snapshot after a gap while another live event
+  // arrives. Snapshot duplicates win; missing history and the live tail survive.
+  await page.evaluate(async () => {
+    window.__ACP_TIMELINE_DEFER__ = true;
+    const payload = {version:1,sessionId:'codex-1',turnId:'recovery-turn',seq:18,
+      timestamp:'2026-08-04T01:02:01Z',event:{type:'agent_message_chunk',data:{content:{type:'text',text:'live-stale-marker'}}}};
+    for (const handler of (window.__TAURI_EVENT_HANDLERS__['acp:event'] || [])) await handler({ payload });
+  });
+  await page.waitForFunction(() => typeof window.__ACP_TIMELINE_RESOLVE__ === 'function', { timeout: 10000 });
+  await page.evaluate(async () => {
+    const envelope = (seq, type, data) => ({version:1,sessionId:'codex-1',turnId:'recovery-turn',seq,
+      timestamp:'2026-08-04T01:02:02Z',event:{type,data}});
+    const payload = envelope(19, 'agent_message_chunk', {content:{type:'text',text:'live-tail-marker'}});
+    for (const handler of (window.__TAURI_EVENT_HANDLERS__['acp:event'] || [])) await handler({ payload });
+    const resolve = window.__ACP_TIMELINE_RESOLVE__;
+    window.__ACP_TIMELINE_DEFER__ = false;
+    window.__ACP_TIMELINE_RESOLVE__ = null;
+    resolve([
+      envelope(17, 'user_message', {content:[{type:'text',text:'snapshot-gap-question'}]}),
+      envelope(18, 'agent_message_chunk', {content:{type:'text',text:'snapshot-authority-marker'}}),
+    ]);
+  });
+  await page.waitForFunction(() => {
+    const text = document.querySelector('[data-conversation-turn="recovery-turn"]')?.textContent || '';
+    return text.includes('snapshot-authority-marker') && text.includes('live-tail-marker') && !text.includes('live-stale-marker');
+  }, { timeout: 10000 });
+  const recoveredSnapshot = await page.evaluate(async () => {
+    const payload = {version:1,sessionId:'codex-1',turnId:'recovery-turn',seq:20,
+      timestamp:'2026-08-04T01:02:03Z',event:{type:'turn_completed',data:{status:'Completed',error:null}}};
+    for (const handler of (window.__TAURI_EVENT_HANDLERS__['acp:event'] || [])) await handler({ payload });
+    await new Promise(resolve => { requestAnimationFrame(() => requestAnimationFrame(resolve)); });
+    const text = document.querySelector('[data-conversation-turn="recovery-turn"]')?.textContent || '';
+    return { snapshotWins: text.includes('snapshot-authority-marker') && !text.includes('live-stale-marker'),
+      gapHealed: text.includes('snapshot-gap-question'), tailCount: text.split('live-tail-marker').length - 1,
+      oldHistory: Boolean(document.querySelector('[data-conversation-turn="copy-turn"]')),
+      toolsRetained: document.querySelector('[data-conversation-turn="overflow-turn"] [data-testid="conversation-tool-group-summary"]')?.textContent.trim() === '执行步骤 · 1 项' };
+  });
+  rec('ACP snapshot gap recovery preserves authoritative duplicates, old history and in-flight live tail',
+    recoveredSnapshot.snapshotWins && recoveredSnapshot.gapHealed && recoveredSnapshot.tailCount === 1
+      && recoveredSnapshot.oldHistory && recoveredSnapshot.toolsRetained,
+    JSON.stringify(recoveredSnapshot));
+
   await clickText(page, '查看全部'); await sleep(400);
   const managedActiveState = await page.evaluate(() => {
     const label = [...document.querySelectorAll('span')]
@@ -1500,7 +1577,12 @@ async function expand(page) {
       .find(node => (node.textContent || '').trim() === 'Codex回归会话' && node.getBoundingClientRect().left > 300);
     label && label.closest('div[class*="cursor-pointer"]')?.click();
   });
-  await clickText(page, '收纳'); await sleep(700);
+  await clickText(page, '收纳');
+  // The archive toast is a lazy chunk (Suspense fallback=null until it
+  // arrives), so poll for the toast text instead of a fixed sleep — the same
+  // contract the ⑤b archive flow below pins.
+  await page.evaluate(() => window.__uiWait__(() =>
+    document.body.innerText.includes('已收纳到【对话管理-已收纳】')));
   const codexBatchArchive = await page.evaluate(() => ({
     invoked: window.__TAURI_INVOKES__.some(call => call.cmd === 'set_session_archived' && call.args.id === 'codex-1' && call.args.archived === true),
     archived: document.body.innerText.includes('已收纳到【对话管理-已收纳】'),
@@ -2427,6 +2509,39 @@ async function expand(page) {
     }
   });
 
+  // A background preview may be throttled, but the first published snapshot
+  // after activating it must already contain the latest rendered content.
+  const backgroundPreviewActivation = await page.evaluate(async () => {
+    const bridge = window.TauriBridge;
+    const emit = (name, payload) => {
+      for (const handler of window.__TAURI_EVENT_HANDLERS__[name] || []) {
+        handler({ payload: { session_id: 's1', ...payload } });
+      }
+    };
+    await bridge.sessions.switchToSession('s-browser-b');
+    emit('chat:turn_started', { status: 'Running' });
+    emit('chat:delta', { text: 'background-switch-marker' });
+    emit('chat:delta', { text: ' **latest**' });
+    const observed = [];
+    const unsubscribe = bridge.state.subscribe('chat', () => {
+      const snapshot = bridge.state.getMany(['chat', 'sessions']);
+      if (snapshot.activeSessionId !== 's1') return;
+      const item = snapshot.chatItems.find(candidate => String(candidate.text || '').includes('background-switch-marker'));
+      if (item) observed.push({ text: item.text, html: item.html });
+    });
+    try { await bridge.sessions.switchToSession('s1'); }
+    finally { unsubscribe(); }
+    emit('chat:done', { status: 'Completed' });
+    return { first: observed[0], notifications: observed.length };
+  });
+  await page.evaluate(() => window.__uiWait__(() => document.body.innerText.includes('background-switch-marker'), 2000));
+  const backgroundPreviewVisible = await page.evaluate(() => document.body.innerText.includes('background-switch-marker'));
+  rec('background activation publishes the latest preview before the first subscriber snapshot',
+    backgroundPreviewVisible &&
+      backgroundPreviewActivation.first?.text === 'background-switch-marker **latest**' &&
+      backgroundPreviewActivation.first?.html?.includes('<strong>latest</strong>'),
+    JSON.stringify({ ...backgroundPreviewActivation, visible: backgroundPreviewVisible }));
+
   // ⑤b 收纳成功 toast 的「前往查看」必须直达对话管理页并展开「已收纳」面板，且按钮不折行。
   await expand(page); await sleep(200);
   const archiveMenuOpened = await page.evaluate(() => {
@@ -2444,11 +2559,17 @@ async function expand(page) {
     }));
     return true;
   });
-  await sleep(250);
+  await page.evaluate(() => window.__uiWait__(() =>
+    [...document.querySelectorAll('span,div,button,a')]
+      .some(node => (node.textContent || '').trim() === '收纳')));
   await clickText(page, '收纳');
-  await sleep(250);
+  await page.evaluate(() => window.__uiWait__(() =>
+    [...document.querySelectorAll('span,div,button,a')]
+      .some(node => (node.textContent || '').trim() === '确认收纳')));
   await clickText(page, '确认收纳');
-  await sleep(450);
+  await page.evaluate(() => window.__uiWait__(() =>
+    [...document.querySelectorAll('button')]
+      .some(node => (node.textContent || '').trim() === '前往查看')));
   const archiveToastBefore = await page.evaluate(() => {
     const button = [...document.querySelectorAll('button')].find(node => (node.textContent || '').trim() === '前往查看');
     const rect = button && button.getBoundingClientRect();
@@ -2459,7 +2580,9 @@ async function expand(page) {
     };
   });
   await clickText(page, '前往查看');
-  await sleep(600);
+  await page.evaluate(() => window.__uiWait__(() =>
+    document.querySelector('[data-testid="app-root"]')?.dataset.currentView === 'search'
+      && document.body.innerText.includes('第三季度财报分析')));
   const archiveToastGoto = await page.evaluate(() => ({
     currentView: document.querySelector('[data-testid="app-root"]')?.getAttribute('data-current-view'),
     archivedTabVisible: document.body.innerText.includes('已收纳'),
@@ -2470,63 +2593,6 @@ async function expand(page) {
     archiveMenuOpened && archiveToastBefore.opened && archiveToastBefore.noWrap && archiveToastBefore.text &&
     archiveToastGoto.currentView === 'search' && archiveToastGoto.archivedTabVisible && archiveToastGoto.archivedVisible && archiveToastGoto.noSettingsError,
     JSON.stringify({ archiveMenuOpened, archiveToastBefore, archiveToastGoto }));
-
-  // ⑥ 开机加载中不弹框；确认 stopped 后才渲染启用引导。
-  await page.evaluate(() => { window.__VLLM_ELIGIBLE__ = true; window.__VLLM_STATE__ = 'starting'; });
-  await page.evaluate(() => window.TauriBridge.vllm.detectLocalVllmSetup());
-  await sleep(300);
-  const startingSetup = await page.evaluate(() => document.body.innerText.includes('启用本地大模型'));
-  rec('⑥ 本地大模型引擎 starting 时不弹启用框', !startingSetup, JSON.stringify({ popup: startingSetup }));
-
-  // 将时钟推进到 12 分钟截止之后，等待内部自动轮询一次；卡死的 starting 必须恢复重试入口。
-  await page.evaluate(() => {
-    window.__VLLM_REAL_DATE_NOW__ = Date.now;
-    const base = Date.now();
-    Date.now = () => base + 13 * 60 * 1000;
-  });
-  await sleep(3300);
-  const timedOutSetup = await page.evaluate(() => {
-    const setup = window.TauriBridge.state.getMany(['chat', 'vllm']).vllmSetup || {};
-    return {
-      popup: document.body.innerText.includes('启用本地大模型'),
-      state: setup.engine_state,
-      timedOut: setup.detection_timed_out,
-    };
-  });
-  rec('⑦ 本地大模型引擎 starting 超时后恢复重试入口', timedOutSetup.popup && timedOutSetup.state === 'failed' && timedOutSetup.timedOut === true, JSON.stringify(timedOutSetup));
-
-  await page.evaluate(() => {
-    Date.now = window.__VLLM_REAL_DATE_NOW__;
-    window.__VLLM_STATE__ = 'stopped';
-  });
-  await page.evaluate(() => { window.__VLLM_ELIGIBLE__ = true; });
-  await page.evaluate(() => window.TauriBridge.vllm.detectLocalVllmSetup());
-  await sleep(500);
-  const setup = await page.evaluate(() => {
-    const btns = [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim());
-    return { title: document.body.innerText.includes('启用本地大模型'), enable: btns.includes('启用'), skip: btns.includes('暂不'), never: btns.includes('不再提醒') };
-  });
-  rec('⑧ 本地大模型引导框 eligible 渲染(标题+启用/暂不/不再提醒)', setup.title && setup.enable && setup.skip && setup.never, JSON.stringify(setup));
-
-  // ⑨ 点「不再提醒」→ 二次确认子态(警示文案 + 确认不启用/再想想);点「再想想」回到初始态
-  await clickText(page, '不再提醒');
-  await sleep(300);
-  const decline = await page.evaluate(() => {
-    const btns = [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim());
-    return { warn: document.body.innerText.includes('不再自动弹出'), confirm: btns.includes('确认不启用'), reconsider: btns.includes('再想想') };
-  });
-  await clickText(page, '再想想');
-  await sleep(200);
-  rec('⑨ 不再提醒→二次确认渲染(警示+确认/再想想)', decline.warn && decline.confirm && decline.reconsider, JSON.stringify(decline));
-
-  // ⑩ 点「启用」→ 立即进入等待系统授权；mock bootstrap 永不 resolve 停在进行中。
-  await clickText(page, '启用');
-  await sleep(700);
-  const prog = await page.evaluate(() => {
-    const txt = document.body.innerText;
-    return { auth: txt.includes('等待系统授权'), wait: txt.includes('等待模型加载就绪'), elapsed: txt.includes('已等待') };
-  });
-  rec('⑩ 点启用后等待系统授权+计时渲染', prog.auth && prog.wait && prog.elapsed, JSON.stringify(prog));
 
   // ⑩c Keyboard operability of the sidebar resize handle (WAI-ARIA Window
   // Splitter): focusable, arrow-key stepping, Home/End land on the clamped
@@ -2604,6 +2670,150 @@ async function expand(page) {
       && ariaAtMax === 480
       && settledWidth === 480,
     JSON.stringify({ handleState, initialWidth, afterGrow, afterShrink, atMin, clampedBelow, atMax, clampedAbove, persistedAtMax, ariaAtMax, settledWidth }));
+
+  // ⑩d Pointer operability of the same handle. ⑩c only drives KeyboardEvent
+  // dispatch, which works even when the handle is a 6×0 sliver: Tailwind
+  // preflight pins <hr> to height:0 and absolute top-0/bottom-0 cannot stretch
+  // a non-auto height — exactly how pointer resize shipped broken. Assert the
+  // strip is really hit-testable, then drag with trusted CDP mouse input.
+  // Earlier steps leave view/modal state behind (search view, guidance
+  // dialogs); pointer gestures unlike dispatched KeyboardEvents actually
+  // hit-test, so normalize to the plain draft view first. The structural nav
+  // selector beats exact-text matching: it cannot be shadowed by a future
+  // same-text node elsewhere in the DOM. Assert the view actually flipped so
+  // the precondition is self-verifying instead of resting on fixed sleeps.
+  await page.keyboard.press('Escape');
+  await sleep(150);
+  await page.keyboard.press('Escape');
+  await sleep(150);
+  await page.click('[data-testid="sidebar-primary-nav"] > div:first-child');
+  const onDraftView = await page.evaluate(() => window.__uiWait__(
+    () => document.querySelector('[data-testid="app-root"]')?.getAttribute('data-current-view') === 'chat',
+    3000,
+  ));
+  await sleep(400);
+  const handleGeometry = await page.evaluate(() => {
+    const handle = document.querySelector('[data-testid="sidebar-resize-handle"]');
+    if (!handle) return null;
+    const rect = handle.getBoundingClientRect();
+    const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    const top = document.elementFromPoint(center.x, center.y);
+    const sidebarRect = document.querySelector('[data-testid="app-sidebar"]').getBoundingClientRect();
+    return {
+      height: Math.round(rect.height),
+      // Zero-area elements never win hit-testing: with the height bug the top
+      // element at the strip's center is the sidebar list, not the handle.
+      hit: top === handle,
+      // The strip must ride the sidebar's right edge: a mis-anchored or
+      // partially stretched handle would be hit-testable yet undraggable
+      // where it matters. subpixel rounding tolerated within 1px.
+      edgeAligned: Math.abs(rect.right - sidebarRect.right) <= 1,
+      coverClass: top && top !== handle && typeof top.className === 'string' ? top.className.slice(0, 60) : null,
+    };
+  });
+  const handleCenter = () => page.evaluate(() => {
+    const handle = document.querySelector('[data-testid="sidebar-resize-handle"]');
+    if (!handle) throw new Error('sidebar-resize-handle not found');
+    const rect = handle.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  });
+  // Re-read the center before every gesture: the strip rides the sidebar edge,
+  // so coordinates captured before a resize are stale by the next drag.
+  const dragHandleBy = async (dx) => {
+    const center = await handleCenter();
+    await page.mouse.move(center.x, center.y);
+    await page.mouse.down();
+    for (let step = 1; step <= 12; step++) {
+      await page.mouse.move(center.x + (dx / 12) * step, center.y);
+      await sleep(20);
+    }
+    await page.mouse.up();
+    await sleep(120);
+  };
+  await dragHandleBy(-100);
+  const pointerDragWidth = await sidebarWidthOf();
+  const pointerDragPersisted = await page.evaluate(() => window.localStorage.getItem('pinvou_sidebar_width'));
+  // Pin the round-2 focus regression: the canceled compatibility mousedown
+  // must leave focus wherever it was — never on the strip (a focused strip
+  // hijacks later arrow keys into keyboardSidebarResize).
+  const focusAfterDrag = await page.evaluate(() => ({
+    isHandle: document.activeElement === document.querySelector('[data-testid="sidebar-resize-handle"]'),
+    active: document.activeElement && (document.activeElement.tagName + (document.activeElement.getAttribute('data-testid') ? '#' + document.activeElement.getAttribute('data-testid') : '')),
+  }));
+  // Pin the primary-button guard: a middle-press drag must not start a resize
+  // (the window listeners never attach, so the width cannot move).
+  {
+    const center = await handleCenter();
+    await page.mouse.move(center.x, center.y);
+    await page.mouse.down({ button: 'middle' });
+    for (let step = 1; step <= 12; step++) {
+      await page.mouse.move(center.x - (200 / 12) * step, center.y);
+      await sleep(20);
+    }
+    await page.mouse.up({ button: 'middle' });
+    await sleep(120);
+  }
+  const middlePressWidth = await sidebarWidthOf();
+  await dragHandleBy(-2000);
+  const pointerClampWidth = await sidebarWidthOf();
+  const pointerClampPersisted = await page.evaluate(() => window.localStorage.getItem('pinvou_sidebar_width'));
+  // Double-click reset through the real input pipeline: press(1)/release(1)
+  // then press(2)/release(2) is the CDP shape of a genuine double-click.
+  // Whether that synthesizes a trusted native dblclick is transport- and
+  // build-dependent, not a version cliff — observed firing on one reviewer's
+  // Chrome 154 and not firing on local Chrome 153 nor on Chrome for Testing
+  // 155 in CI — so a dispatched-event fallback keeps the onDoubleClick wiring
+  // covered on every runner. Either path exercises the same
+  // resetSidebarWidth handler; the check guards that wiring, not the
+  // pointerdown preventDefault (the spec forbids the cancel from suppressing
+  // click/dblclick, and that held in every probe above).
+  let dblclickResetWidth = await (async () => {
+    const center = await handleCenter();
+    await page.mouse.click(center.x, center.y);
+    await page.mouse.click(center.x, center.y, { clickCount: 2 });
+    // Wait for the width to actually reach the reset target rather than for
+    // "stability": right after the React commit and before the transition's
+    // first frame, consecutive samples both read the old width and would
+    // falsely count as settled.
+    await page.evaluate(() => window.__uiWait__(
+      () => Math.round(document.querySelector('[data-testid="app-sidebar"]').getBoundingClientRect().width) === 280,
+      1200,
+    ));
+    return sidebarWidthOf();
+  })();
+  // True only when the native input path both dispatched a dblclick AND the
+  // app handled it — i.e. "native double click worked end to end".
+  const dblclickViaNative = dblclickResetWidth === 280;
+  if (!dblclickViaNative) {
+    await page.evaluate(() => {
+      const handle = document.querySelector('[data-testid="sidebar-resize-handle"]');
+      if (!handle) throw new Error('sidebar-resize-handle not found');
+      handle.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    });
+    await page.evaluate(() => window.__uiWait__(
+      () => Math.round(document.querySelector('[data-testid="app-sidebar"]').getBoundingClientRect().width) === 280,
+      1500,
+    ));
+    dblclickResetWidth = await sidebarWidthOf();
+  }
+  const dblclickResetPersisted = await page.evaluate(() => window.localStorage.getItem('pinvou_sidebar_width'));
+  rec('⑩d sidebar splitter pointer drag (hit-test + drag + clamp + dblclick reset + persistence)',
+    !!handleGeometry
+      // >100 rather than >0: a degenerate partial-height strip (e.g. 2px) is
+      // technically hit-testable at its center yet still broken as a grip.
+      && handleGeometry.height > 100
+      && handleGeometry.hit
+      && handleGeometry.edgeAligned
+      && onDraftView
+      && pointerDragWidth === 480 - 100
+      && pointerDragPersisted === '380'
+      && !focusAfterDrag.isHandle
+      && middlePressWidth === 480 - 100
+      && pointerClampWidth === 220
+      && pointerClampPersisted === '220'
+      && dblclickResetWidth === 280
+      && dblclickResetPersisted === '280',
+    JSON.stringify({ handleGeometry, onDraftView, pointerDragWidth, pointerDragPersisted, focusAfterDrag, middlePressWidth, pointerClampWidth, pointerClampPersisted, dblclickViaNative, dblclickResetWidth, dblclickResetPersisted }));
 
   if (errs.length) console.log('⚠️ PAGEERRORS:', errs.slice(0, 3).join(' | '));
   await browser.close();

@@ -1,3 +1,4 @@
+// architecture-guard: allow-target-cfg -- the 0600 permission pins assert POSIX mode bits (PermissionsExt), which only exist on unix; the tests are cfg(unix)-gated and no platform behavior leaks into shared code.
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -35,6 +36,19 @@ const TIMELINE_APPEND_BUFFER_BYTES: usize = 64 * 1024;
 /// journals larger than it skip everything before the window
 /// (see `load_timeline_last_seq`).
 const TIMELINE_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The journal's crash-recovery anchors flush synchronously: resume and
+/// orphan-turn recovery read them after a crash, so they must never depend
+/// on buffered chunk bytes. `cancel_requested` flushes too: it exists to
+/// record that the user asked to stop a turn the agent may never answer,
+/// which is exactly the window an app crash would otherwise erase it from.
+/// Everything else rides the TIMELINE_APPEND_BUFFER_BYTES window.
+fn flushes_timeline_synchronously(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "turn_started" | "turn_completed" | "cancel_requested"
+    )
+}
 
 /// Codex ACP 页面唯一消费的事件合同。
 ///
@@ -174,6 +188,12 @@ fn project_acp_event_data_for_web(event_type: &str, value: Value) -> Value {
         "turn_started" | "turn_completed" => {
             project_allowed_fields(value, &["status", "error", "message", "recoveryReason"])
         }
+        // Turn-watchdog and adapter runtime notices expose host-owned protocol
+        // fields only. `detail` contains raw adapter stderr, including absolute
+        // paths in field evidence and potentially gateway bodies or credentials.
+        // Keep it local for the desktop card and `codex-acp.log`; Relay must not
+        // forward untrusted text.
+        "runtime_notice" => project_allowed_fields(value, &["kind"]),
         // runtime_ready is a signal; the Web client fetches the authoritative
         // session info separately and does not need adapter capabilities here.
         "runtime_ready" => Value::Object(serde_json::Map::new()),
@@ -375,6 +395,11 @@ fn absolute_host_path_fragment_start(message: &str) -> Option<usize> {
                 bytes[index - 1],
                 b'\''
                     | b'"'
+                    // Round-37 (folded separate ticket): backtick-quoted
+                    // paths are agent markdown's routine formatting for
+                    // file paths — without this boundary the fragment
+                    // passed `sanitize_web_string` unredacted.
+                    | b'`'
                     | b'('
                     | b'['
                     | b'{'
@@ -686,6 +711,11 @@ pub struct EventBridge {
     web_delivery: OrderedWebDelivery,
     tools: Arc<Mutex<HashMap<String, ToolCall>>>,
     timeline_writer: Arc<Mutex<TimelineWriter>>,
+    /// Turn activity clock (see [`super::stall`]). Inbound notifications and
+    /// permission/elicitation requests advance it. Host-side answers and
+    /// cancellation also advance it through their pending request handles; a
+    /// prompt response exits the stall loop without advancing this clock.
+    activity: super::stall::ActivityClock,
 }
 
 #[derive(Clone)]
@@ -754,11 +784,51 @@ impl EventBridge {
             web_delivery: OrderedWebDelivery::new(last_seq),
             tools: Arc::new(Mutex::new(HashMap::new())),
             timeline_writer,
+            activity: super::stall::new_activity_clock(),
         }
     }
 
     pub fn pinvou_session_id(&self) -> &str {
         &self.pinvou_session_id
+    }
+
+    /// Session activity handle sharing the same clock as [`super::stall::ActivityClock`].
+    pub fn activity(&self) -> super::stall::ActivityClock {
+        self.activity.clone()
+    }
+
+    /// Current turn ID, claimed by the closer through [`EventBridge::finish_turn_once`].
+    pub fn current_turn_id(&self) -> Option<String> {
+        self.current_turn.read().clone()
+    }
+
+    /// Record inbound Agent activity (notifications or permission/elicitation requests).
+    pub fn note_agent_activity(&self) {
+        super::stall::mark_activity(&self.activity);
+    }
+
+    /// Idempotent settlement: emit `turn_completed` only while this bridge owns the turn.
+    ///
+    /// Prompt response and watchdog settlement are independent paths. The late
+    /// path must yield or the same turn would get two terminal events.
+    pub fn finish_turn_once(
+        &self,
+        turn_id: &str,
+        status: &str,
+        error: Option<&str>,
+        recovery_reason: Option<&str>,
+    ) -> bool {
+        if !super::stall::claim_current_turn(&self.current_turn, turn_id) {
+            return false;
+        }
+        let mut data = json!({ "status": status, "error": error });
+        if let Some(reason) = recovery_reason {
+            if let Value::Object(map) = &mut data {
+                map.insert("recoveryReason".to_string(), json!(reason));
+            }
+        }
+        self.emit_with_turn(Some(turn_id.to_string()), "turn_completed", data);
+        true
     }
 
     pub fn begin_turn(&self, content: &str, attachments: &[CodexDisplayAttachment]) -> String {
@@ -781,26 +851,16 @@ impl EventBridge {
         turn_id
     }
 
-    pub fn finish_turn(&self, turn_id: &str, status: &str, error: Option<&str>) {
-        self.emit_with_turn(
-            Some(turn_id.to_string()),
-            "turn_completed",
-            json!({ "status": status, "error": error }),
-        );
-        let mut current = self.current_turn.write();
-        if current.as_deref() == Some(turn_id) {
-            *current = None;
-        }
-    }
-
-    /// 把 timeline 中只开始、未结束的旧回合收口为已中断。
+    /// Settle timeline turns that started but never finished as interrupted.
     ///
-    /// ACP prompt future 和当前 turn 只存在于宿主进程内；应用被直接关闭后，Agent
-    /// 会话虽然可以恢复，但旧 prompt 已无法重新挂接。继续把这种回合展示为 running
-    /// 会让前端永久停在“处理中”，而恢复后的 session/cancel 也没有旧 turn 可取消。
+    /// ACP prompt futures and the current turn exist only in the host process.
+    /// After the application is terminated, the Agent session can resume but
+    /// the old prompt cannot be reattached. Leaving that turn running would
+    /// keep the UI busy forever, while the resumed session has no old turn for
+    /// `session/cancel` to address.
     ///
-    /// 本方法只处理当前 timeline 已存在的孤儿回合。正常的同进程活跃回合仍由
-    /// `prompt()` 返回后调用 `finish_turn()` 收口。
+    /// This handles only orphaned turns already present in the timeline. A live
+    /// same-process turn is settled by `prompt()` through `finish_turn_once()`.
     pub fn interrupt_orphaned_turns(&self, reason: &str) -> usize {
         // Orphan detection must pair turn_started/turn_completed events that
         // can live arbitrarily far apart, so this scan is inherently over the
@@ -834,6 +894,8 @@ impl EventBridge {
     }
 
     pub fn handle(&self, notification: SessionNotification) {
+        // Every inbound session update proves the agent is alive for the silence watchdog.
+        self.note_agent_activity();
         let meta = serde_json::to_value(notification.meta).unwrap_or(Value::Null);
         match notification.update {
             SessionUpdate::UserMessageChunk(chunk) => {
@@ -927,7 +989,7 @@ impl EventBridge {
         self.emit_with_turn(self.current_turn.read().clone(), event_type, data)
     }
 
-    fn emit_with_turn(
+    pub(super) fn emit_with_turn(
         &self,
         turn_id: Option<String>,
         event_type: &str,
@@ -955,11 +1017,7 @@ impl EventBridge {
                     data,
                 },
             };
-            // Turn boundaries are the journal's crash-recovery anchors: they
-            // flush synchronously so resume and orphan-turn recovery never
-            // depend on buffered chunk bytes.
-            // Everything else rides the TIMELINE_APPEND_BUFFER_BYTES window.
-            let flush_timeline = matches!(event_type, "turn_started" | "turn_completed");
+            let flush_timeline = flushes_timeline_synchronously(event_type);
             if let Err(error) = self.append_timeline(&envelope, flush_timeline) {
                 eprintln!(
                     "[pinvou3-app] append Codex ACP timeline failed for {}: {error:#}",
@@ -1024,9 +1082,16 @@ impl EventBridge {
     /// emit path (`AcpPool::timeline` / `AcpPool::web_timeline_page`) never
     /// observe a pre-buffer view of an active turn. Turn boundaries already
     /// flush synchronously; this only drains the buffered chunk window.
-    /// Failures are swallowed: the reader falls back to whatever is durable.
+    /// Retirement paths additionally lean on this flush for their
+    /// flush-before-reseed invariant, so a failure is logged (never fatal —
+    /// the reader falls back to whatever is durable) rather than swallowed
+    /// silently.
     pub fn flush_journal(&self) {
-        let _ = self.timeline_writer.lock().flush();
+        if let Err(error) = self.timeline_writer.lock().flush() {
+            // Log hygiene (CodeQL cleartext-logging convention): the IO error
+            // never carries session ids or paths.
+            eprintln!("[codex-acp] timeline journal flush failed: {error}");
+        }
     }
 }
 
@@ -1061,7 +1126,7 @@ fn timeline_path(session_id: &str) -> Result<PathBuf> {
     session_file_path(session_id, TIMELINE_FILE)
 }
 
-fn state_path(session_id: &str) -> Result<PathBuf> {
+pub(crate) fn state_path(session_id: &str) -> Result<PathBuf> {
     session_file_path(session_id, STATE_FILE)
 }
 
@@ -1088,14 +1153,92 @@ pub fn persist_acp_state(session_id: &str, mut state: Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::platform::filesystem::atomic_write(&path, &serde_json::to_vec_pretty(&state)?)?;
+    crate::platform::filesystem::atomic_write_private(&path, &serde_json::to_vec_pretty(&state)?)?;
     Ok(())
 }
 
-pub fn patch_acp_state(session_id: &str, patch: Value) -> Result<()> {
+/// Round-20 SF1: an unparseable acp-state.json used to be silently reset to
+/// `{}` and the align convergence then reported `state_committed = true` — a
+/// plain-success toast while the durable artifact just lost its
+/// adapter/session/workspace sections. The reset still happens (the file is
+/// corrupt; recovering a writable state is right), but it is logged and
+/// surfaced to the align lane as a convergence failure (`sidecar_stale`),
+/// never as clean success.
+/// Concurrency residual (round-20 SF2, on record; class count corrected
+/// round-38, sixth site named round-51): the acp-state.json
+/// read-modify-write window is unlocked across six write call sites in
+/// five logical classes (events lastStatus, operation_gate, the align
+/// convergence patch, the spawn full rewrite, and the rebind translate
+/// pass — whose detached-sweep retranslate tail shares the align writer,
+/// giving the sixth site). A
+/// milliseconds-wide interleave can drop one patch (e.g. the event lane's
+/// stale read landing after align's narrower workspace patch resurrects the
+/// wider pre-align root set — the over-grant direction, the exact scenario
+/// `sidecar_stale` exists to surface). The file self-heals at the next
+/// spawn (a full rewrite) and every writer persists atomically, so the
+/// residual is documented rather than fenced: a per-session write lock
+/// would serialize the event lane against align for a window the next
+/// spawn collapses anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpStatePatchOutcome {
+    /// The existing state parsed and the patch applied onto it.
+    Clean,
+    /// The existing state was unparseable and got reset before the patch —
+    /// the callers that treat the file as load-bearing (align) must report
+    /// a convergence failure.
+    ResetCorrupt,
+}
+
+/// The acp-state.json durable keychain roots (round-29 M1): the ACP lane's
+/// stale-delivery artifact — the align retry path compares this against the
+/// target shape exactly like the native lane compares its sidecar.
+/// `None` = no state file / unreadable / no workspace.roots array.
+pub fn acp_state_workspace_roots(session_id: &str) -> Option<Vec<PathBuf>> {
+    let path = state_path(session_id).ok()?;
+    let raw = fs::read(&path).ok()?;
+    let state: Value = serde_json::from_slice(&raw).ok()?;
+    let roots = state.get("workspace")?.get("roots")?.as_array()?;
+    Some(
+        roots
+            .iter()
+            .filter_map(|root| root.as_str())
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+    )
+}
+
+pub fn patch_acp_state_with_outcome(
+    session_id: &str,
+    patch: Value,
+) -> Result<AcpStatePatchOutcome> {
     let path = state_path(session_id)?;
+    let mut outcome = AcpStatePatchOutcome::Clean;
     let mut state = if path.exists() {
-        serde_json::from_slice::<Value>(&fs::read(&path)?).unwrap_or_else(|_| json!({}))
+        // Round-26 minor 7: a session deleted between the exists() probe and
+        // this read is a benign race (the sibling translate lane treats the
+        // same NotFound this way) — report clean WITHOUT persisting, not an
+        // Err that would surface as a spurious sidecar_stale, and not a
+        // fresh write that would resurrect the artifact of a deleted session.
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AcpStatePatchOutcome::Clean);
+            }
+            Err(error) => return Err(anyhow::Error::new(error).context("read acp-state for patch")),
+        };
+        match serde_json::from_slice::<Value>(&raw) {
+            Ok(state) => state,
+            Err(error) => {
+                // Log hygiene (CodeQL cleartext-logging convention): the
+                // parse error never carries session ids or paths.
+                eprintln!(
+                    "[codex-acp] acp-state.json unparseable; resetting before patch: {error}"
+                );
+                outcome = AcpStatePatchOutcome::ResetCorrupt;
+                json!({})
+            }
+        }
     } else {
         json!({})
     };
@@ -1107,7 +1250,120 @@ pub fn patch_acp_state(session_id: &str, patch: Value) -> Result<()> {
             state_object.insert(key.clone(), value.clone());
         }
     }
-    persist_acp_state(session_id, state)
+    persist_acp_state(session_id, state)?;
+    Ok(outcome)
+}
+
+pub fn patch_acp_state(session_id: &str, patch: Value) -> Result<()> {
+    patch_acp_state_with_outcome(session_id, patch).map(|_| ())
+}
+
+/// Rebind support (review #463 round-14 B2): translate the persisted
+/// `workspace.path` of a session's acp-state.json through the caller's
+/// mapping. `acp-state.json` is a persisted workspace-path lane of its own:
+/// the boot recovery (`load_acp_recovery_record`) reads this field FIRST and
+/// only falls back to `codex-workspace-baseline.json` when it is absent or
+/// empty — so an untranslated state file preempts even a successfully
+/// recaptured baseline and, if the agent index is later lost or corrupted,
+/// re-inserts the record at the vanished root (the resurrection class the
+/// other lanes close). Same load→patch→persist shape as
+/// `SessionStore::rebase_workspace_artifact_paths`: a missing state file, a
+/// missing/empty field, an unmapped path and an already-converged value all
+/// persist nothing and report `false`; the path math (from→to) lives with
+/// the caller, single-sourced with the other lanes.
+pub fn translate_acp_state_workspace(
+    session_id: &str,
+    translate: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Result<bool> {
+    let path = state_path(session_id)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        // Round-20 minor 11: a session deleted between the exists() probe
+        // and this read is a benign race, not a failed session.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("read acp-state for workspace rebind"));
+        }
+    };
+    let mut state: Value = serde_json::from_slice(&raw)
+        .with_context(|| "parse acp-state for workspace rebind".to_string())?;
+    // Round-21 #14: BOTH durable workspace fields translate. The old shape
+    // rewrote only `workspace.path`, leaving `workspace.roots` on its stale
+    // `/from` spellings in the one artifact the design declares the sole
+    // durable ACP survivor — after an index loss the boot recovery
+    // re-inserted the pre-rebind root set, compose soft-kept the
+    // now-unresolvable spellings and delivered them as additional roots
+    // outside `to`, and the next spawn re-persisted them verbatim
+    // (over-grant, self-perpetuating). The roots array now rides the same
+    // mapping, mirroring the align convergence.
+    //
+    // Wrong-shape guard (round-22 minor 5, scope note round-24 minor 7): a
+    // missing or non-object workspace carries nothing translatable and is
+    // converged (Ok(false)) — the previous index-through-Null arms behaved
+    // identically; an object workspace never panics through IndexMut.
+    let mut changed = false;
+    {
+        let Some(workspace) = state.get_mut("workspace").and_then(|w| w.as_object_mut()) else {
+            return Ok(false);
+        };
+        if let Some(current) = workspace
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            if let Some(next) = translate(&current) {
+                if next != current {
+                    workspace.insert(
+                        "path".to_string(),
+                        json!(next.to_string_lossy().to_string()),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if let Some(roots) = workspace.get_mut("roots").and_then(Value::as_array_mut) {
+            for root in roots.iter_mut() {
+                let Some(current) = root
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                else {
+                    continue;
+                };
+                let Some(next) = translate(&current) else {
+                    continue;
+                };
+                if next != current {
+                    *root = json!(next.to_string_lossy().to_string());
+                    changed = true;
+                }
+            }
+        }
+        // Round-38 minor 3: the rebind reset the index provenance (SF6 — a
+        // replacement keychain carries no grants), so the durable copy must
+        // reset it too: an ancestor outside the rebind prefix otherwise
+        // SURVIVES the translate in the stale field, and an index-loss
+        // recovery would resurrect a grant the rebind just revoked (the
+        // over-grant direction; bounded today by the recovery containment
+        // filter, closed outright here).
+        if workspace
+            .get("explicit_ancestor_roots")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            workspace.insert("explicit_ancestor_roots".to_string(), json!([]));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    persist_acp_state(session_id, state)?;
+    Ok(true)
 }
 
 /// Cached append handle for one session's ACP timeline journal.
@@ -1632,7 +1888,10 @@ mod tests {
                     "arguments": [
                         { "text": "cat /home/alice/private/config.toml" },
                         { "message": "read file:///Users/alice/private/key.txt" },
-                        { "text": "tail ~/.pinvou3/sessions/private.jsonl" }
+                        { "text": "tail ~/.pinvou3/sessions/private.jsonl" },
+                        // Round-37 folded ticket: backtick-quoted paths are
+                        // agent markdown's routine file-path formatting.
+                        { "text": "Edited `/Users/alice/secret-project/src/main.rs`" }
                     ],
                     "C:\\Users\\alice\\private\\as-a-key": "must-not-cross-web",
                     "relativeHint": "docs/guide.md",
@@ -1645,6 +1904,11 @@ mod tests {
         });
 
         let projected = serde_json::to_value(project_acp_event_for_web(&event)).unwrap();
+        let flat = serde_json::to_string(&projected).unwrap();
+        assert!(
+            !flat.contains("/Users/alice/secret-project"),
+            "a backtick-quoted host path must be redacted: {flat}"
+        );
         let update = &projected["event"]["data"]["update"];
         assert_eq!(
             update["rawInput"]["command"],
@@ -1879,6 +2143,33 @@ mod tests {
         );
     }
 
+    /// `runtime_notice` projects host-owned protocol fields to Web/Relay only.
+    /// `detail` is raw adapter stderr and remains local by this module's boundary.
+    #[test]
+    fn forkguard_runtime_notice_web_projection_keeps_only_host_fields() {
+        let mut notice = event(3, Some("turn-1"), "runtime_notice");
+        notice.event.data = json!({
+            "kind": "agent_stderr",
+            "agent": "claude",
+            "quietSeconds": 200,
+            "detail": "File C:\\Users\\example-user\\Temp\\x.ps1: cancel floor elapsed without the SDK yielding",
+        });
+        let projected = project_acp_event_for_web(&notice).event.data;
+        assert_eq!(projected["kind"], json!("agent_stderr"));
+        assert!(
+            projected.get("quietSeconds").is_none(),
+            "unused runtime fields must not cross the Relay: {projected}"
+        );
+        assert!(
+            projected.get("detail").is_none(),
+            "raw adapter stderr must not cross Relay: {projected}"
+        );
+        assert!(
+            projected.get("agent").is_none(),
+            "Web derives the title from the active agent and needs no agent payload field"
+        );
+    }
+
     #[test]
     fn web_timeline_reader_resumes_from_a_byte_cursor() {
         let events: Vec<_> = (1..=5).map(|seq| message_event(seq, "chunk")).collect();
@@ -2046,15 +2337,21 @@ mod tests {
             event(3, Some("turn-completed"), "turn_completed"),
             event(4, None, "cancel_requested"),
             event(5, Some("turn-orphan-2"), "turn_started"),
+            // The live stop path tags the envelope with the busy turn: that
+            // shape must neither close the turn nor open a second one.
+            event(6, Some("turn-orphan-2"), "cancel_requested"),
+            // A cancel for a turn that never started must not fabricate an
+            // orphaned turn either.
+            event(7, Some("turn-ghost"), "cancel_requested"),
         ];
         assert_eq!(
             orphaned_turn_ids(&events),
             vec!["turn-orphan-1", "turn-orphan-2"],
-            "global cancel events must not accidentally close a persisted turn"
+            "cancel events must neither close a persisted turn nor open a new one"
         );
 
-        events.push(event(6, Some("turn-orphan-1"), "turn_completed"));
-        events.push(event(7, Some("turn-orphan-2"), "turn_completed"));
+        events.push(event(8, Some("turn-orphan-1"), "turn_completed"));
+        events.push(event(9, Some("turn-orphan-2"), "turn_completed"));
         assert!(
             orphaned_turn_ids(&events).is_empty(),
             "re-running recovery after terminal events must be a no-op"
@@ -2257,6 +2554,31 @@ mod tests {
     }
 
     #[test]
+    fn timeline_flush_set_is_exactly_the_crash_anchors() {
+        // The emit path consults this predicate to decide the synchronous
+        // flush, so membership drift here silently moves an event into (or
+        // out of) the crash-durable window.
+        for event_type in ["turn_started", "turn_completed", "cancel_requested"] {
+            assert!(
+                flushes_timeline_synchronously(event_type),
+                "{event_type} must flush the journal synchronously"
+            );
+        }
+        for event_type in [
+            "agent_message_chunk",
+            "permission_requested",
+            "permission_resolved",
+            "elicitation_resolved",
+            "runtime_notice",
+        ] {
+            assert!(
+                !flushes_timeline_synchronously(event_type),
+                "{event_type} must ride the buffered append window"
+            );
+        }
+    }
+
+    #[test]
     fn timeline_writer_reanchors_when_the_journal_is_removed_externally() {
         let _root = TempSessionsRoot::new("reanchor");
         let mut writer = TimelineWriter::new("acp-writer-sandbox");
@@ -2291,5 +2613,93 @@ mod tests {
             .map(|line| serde_json::from_str::<AcpEventEnvelope>(line).unwrap().seq)
             .collect();
         assert_eq!(seqs, vec![3, 4]);
+    }
+
+    /// Review #463 round-14 B2: acp-state.json is a persisted workspace lane
+    /// of its own — the boot recovery reads workspace.path BEFORE the
+    /// baseline, so the rebind's metadata pass translates it. Only the
+    /// caller-mapped path moves; unrelated fields, unrelated sessions and an
+    /// already-converged value persist nothing.
+    #[test]
+    fn translate_acp_state_workspace_rewrites_only_mapped_paths() {
+        let _root = TempSessionsRoot::new("acp-state-rebind");
+        let session_id = "acp-state-rebind-session";
+        let unique = format!("pinvou3-acp-state-{}", std::process::id());
+        let from = std::env::temp_dir().join(format!("{unique}-from"));
+        let to = std::env::temp_dir().join(format!("{unique}-to"));
+        let unmapped = std::env::temp_dir().join(format!("{unique}-elsewhere"));
+        persist_acp_state(
+            session_id,
+            json!({
+                "workspace": {
+                    "path": from.to_string_lossy(),
+                    // Round-21 #14: the roots array must ride the same
+                    // translation — mapped entries rewrite, unmapped entries
+                    // stay verbatim, non-string entries pass through.
+                    "roots": [
+                        from.to_string_lossy().to_string(),
+                        unmapped.to_string_lossy().to_string(),
+                        1
+                    ]
+                },
+                "other": "untouched"
+            }),
+        )
+        .expect("persist initial state");
+
+        let translate = |path: &Path| -> Option<PathBuf> { (path == from).then(|| to.clone()) };
+        assert!(
+            translate_acp_state_workspace(session_id, &translate).expect("translate"),
+            "a mapped path or root reports the translation"
+        );
+        let state: Value = serde_json::from_slice(
+            &fs::read(state_path(session_id).expect("state path")).expect("read state"),
+        )
+        .expect("parse state");
+        assert_eq!(
+            state["workspace"]["path"],
+            json!(to.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            state["workspace"]["roots"],
+            json!([
+                to.to_string_lossy().to_string(),
+                unmapped.to_string_lossy().to_string(),
+                1
+            ]),
+            "mapped roots translate, unmapped and non-string roots stay verbatim"
+        );
+        assert_eq!(state["other"], json!("untouched"));
+        // Already converged: persists nothing, reports false.
+        assert!(
+            !translate_acp_state_workspace(session_id, &translate).expect("idempotent"),
+            "an already-converged value persists nothing"
+        );
+        // No state file at all: false, no error, no file fabricated.
+        assert!(
+            !translate_acp_state_workspace("acp-state-rebind-absent", &translate)
+                .expect("absent state file"),
+        );
+        assert!(
+            !state_path("acp-state-rebind-absent")
+                .expect("state path")
+                .exists()
+        );
+    }
+
+    /// Round-32 minor 7: acp-state.json (the durable ACP keychain copy)
+    /// persists 0600 like its two sibling artifacts. cfg(unix)-gated: the
+    /// PermissionsExt import is unix-only at COMPILE time (the round-32
+    /// follow-up caught a runtime-gated spelling failing the Windows test
+    /// build); the file-header guard exception covers exactly this test.
+    #[cfg(unix)]
+    #[test]
+    fn acp_state_persists_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let _root = TempSessionsRoot::new("acp-state-private");
+        persist_acp_state("s-private", serde_json::json!({ "workspace": {} })).expect("persist");
+        let path = state_path("s-private").expect("state path");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "acp-state.json is keychain-bearing");
     }
 }

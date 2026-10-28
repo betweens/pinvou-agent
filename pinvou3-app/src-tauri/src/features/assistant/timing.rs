@@ -17,17 +17,39 @@ use std::sync::{Mutex, OnceLock};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-#[cfg(any(feature = "benchmark-hooks", test))]
-use sha2::{Digest, Sha256};
 
 static TURN_SEQ: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_TURNS: OnceLock<Mutex<HashMap<String, VecDeque<ActiveTurnTiming>>>> = OnceLock::new();
 #[cfg(any(feature = "benchmark-hooks", test))]
 static EVAL_OBSERVATION_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
+/// Fixed-schema, content-free breakdown of one Engine acquisition.
+///
+/// These numbers are stored in the existing local timing sidecar so cold and
+/// warm startup can be compared without sending diagnostics elsewhere. Keep
+/// this schema numeric and bounded: session content, paths, model names and
+/// raw errors must never be added here.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EngineAcquireTiming {
+    pub kind: &'static str,
+    pub total_ms: u64,
+    pub runtime_lock_ms: u64,
+    pub prepare_model_ms: u64,
+    pub reclaim_ms: u64,
+    pub finalize_bridge_ms: u64,
+    pub tool_setup_ms: u64,
+    pub materialize_skills_ms: u64,
+    pub spawn_engine_ms: u64,
+    pub load_session_ms: u64,
+    pub sync_session_ms: u64,
+}
+
 #[derive(Debug)]
 struct ActiveTurnTiming {
     turn_id: String,
+    engine_acquire: Option<EngineAcquireTiming>,
+    engine_ready_timestamp: Option<i64>,
+    first_output_timestamp: Option<i64>,
     #[cfg(any(feature = "benchmark-hooks", test))]
     recorded_first_events: HashSet<&'static str>,
     #[cfg(any(feature = "benchmark-hooks", test))]
@@ -40,6 +62,9 @@ impl ActiveTurnTiming {
     fn new(turn_id: String) -> Self {
         Self {
             turn_id,
+            engine_acquire: None,
+            engine_ready_timestamp: None,
+            first_output_timestamp: None,
             #[cfg(any(feature = "benchmark-hooks", test))]
             recorded_first_events: HashSet::new(),
             #[cfg(any(feature = "benchmark-hooks", test))]
@@ -277,12 +302,10 @@ pub struct ToolCatalogSummary {
 #[cfg(any(feature = "benchmark-hooks", test))]
 impl ToolCatalogSummary {
     pub fn from_serialized_catalog(catalog_count: usize, catalog_json: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(catalog_json);
         Self {
             catalog_count: catalog_count as u64,
             catalog_bytes: catalog_json.len() as u64,
-            catalog_sha256: crate::platform::encoding::hex_lower(&hasher.finalize()),
+            catalog_sha256: crate::platform::hashing::sha256_hex(catalog_json),
         }
     }
 }
@@ -343,6 +366,13 @@ fn finish_turn_internal(
         "status": status,
         "error": error,
     });
+    if let Some(engine_acquire) = active_turn.engine_acquire {
+        entry["engine_startup"] = json!({
+            "engine_ready_timestamp": active_turn.engine_ready_timestamp,
+            "first_output_timestamp": active_turn.first_output_timestamp,
+            "engine_acquire": engine_acquire,
+        });
+    }
     if let Some(u) = usage {
         entry["usage"] = json!({
             "input_tokens": u.input_tokens,
@@ -393,11 +423,37 @@ fn record_first_event(session_id: &str, event: &'static str, tool_name: Option<&
     );
 }
 
+/// Record Engine readiness once for the currently admitted turn. Calls made
+/// outside a turn (for example an eval prepare step) intentionally stay out of
+/// the interactive startup sample.
+pub fn record_engine_ready(session_id: &str, timing: EngineAcquireTiming) {
+    if let Ok(mut map) = active_turns().lock()
+        && let Some(active) = map.get_mut(session_id).and_then(VecDeque::back_mut)
+        && active.engine_acquire.is_none()
+    {
+        active.engine_acquire = Some(timing);
+        active.engine_ready_timestamp = Some(now_ms());
+    }
+}
+
 #[cfg(any(feature = "benchmark-hooks", test))]
 pub fn record_engine_turn_started(session_id: &str) {
     record_first_event(session_id, "engine_turn_started", None);
 }
 
+/// Capture the first user-visible text delta for startup diagnostics. Empty
+/// deltas are intentionally excluded from this production metric.
+pub fn record_first_output(session_id: &str) {
+    if let Ok(mut map) = active_turns().lock()
+        && let Some(active) = map.get_mut(session_id).and_then(VecDeque::back_mut)
+        && active.first_output_timestamp.is_none()
+    {
+        active.first_output_timestamp = Some(now_ms());
+    }
+}
+
+/// Preserve the benchmark milestone's historical "first MessageDelta event"
+/// semantics, including an empty delta.
 #[cfg(any(feature = "benchmark-hooks", test))]
 pub fn record_first_message_delta(session_id: &str) {
     record_first_event(session_id, "first_message_delta", None);
@@ -746,6 +802,43 @@ mod tests {
         };
         let timeline = read_timeline("never-existed").unwrap();
         assert!(timeline.is_empty());
+    }
+
+    /// ADR-0024 read-surface register: the aux-id timeline read is exercised
+    /// (the aux panel's hydration/send re-reads it by id, plus the desktop
+    /// `chat:done` authoritative refresh — never through the sidebar lists
+    /// that exclude aux ids) but not load-bearing for rendering (the
+    /// hydration path try/catches to empty, the chat:done refresh keeps the
+    /// local projection on failure, and the aux panel does not project
+    /// timelineEvents) — the normative point is that `read_timeline` (and
+    /// the `get_session_timeline` command on top of it, pinned in
+    /// `app/commands/timeline.rs` tests) must keep reading `aux-<parent>`
+    /// ids: grow no id-class rejection on this read surface.
+    #[test]
+    fn read_timeline_reads_aux_ids_for_panel_hydration() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-timing-aux-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        // The derived aux id form (aux-<parent>) must roundtrip through the
+        // timing sidecar path resolution and the reader without rejection.
+        let sid = "aux-l5cz0m8xq2k1b";
+        start_turn(sid);
+        finish_turn(sid, "Completed", None);
+
+        let timeline = read_timeline(sid).unwrap();
+        assert_eq!(timeline.len(), 2, "aux timing events must stay readable");
+        assert_eq!(timeline[0].event, "user_start");
+        assert_eq!(timeline[1].event, "assistant_done");
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
@@ -1122,6 +1215,88 @@ mod tests {
             "stale unsubmitted-cancel residue must not receive a terminal"
         );
 
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn engine_startup_observation_is_folded_into_existing_terminal_write() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-engine-startup-timing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: this test holds platform::paths::tests::ENV_LOCK; env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        let sid = "engine-startup-observation";
+        start_turn(sid);
+        record_engine_ready(
+            sid,
+            EngineAcquireTiming {
+                kind: "cold",
+                total_ms: 321,
+                runtime_lock_ms: 1,
+                prepare_model_ms: 2,
+                reclaim_ms: 0,
+                finalize_bridge_ms: 3,
+                tool_setup_ms: 4,
+                materialize_skills_ms: 5,
+                spawn_engine_ms: 300,
+                load_session_ms: 2,
+                sync_session_ms: 4,
+            },
+        );
+        record_engine_ready(
+            sid,
+            EngineAcquireTiming {
+                kind: "reused",
+                total_ms: 1,
+                runtime_lock_ms: 1,
+                prepare_model_ms: 0,
+                reclaim_ms: 0,
+                finalize_bridge_ms: 0,
+                tool_setup_ms: 0,
+                materialize_skills_ms: 0,
+                spawn_engine_ms: 0,
+                load_session_ms: 0,
+                sync_session_ms: 0,
+            },
+        );
+        record_first_output(sid);
+        record_first_message_delta(sid);
+        finish_turn(sid, "Completed", None);
+
+        let raw = std::fs::read_to_string(crate::platform::paths::session_timing_events(sid))
+            .expect("timing sidecar");
+        let events = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            3,
+            "test builds also retain the eval first-delta row"
+        );
+        let terminal = events
+            .iter()
+            .find(|event| event["event"] == "assistant_done")
+            .expect("terminal event");
+        assert_eq!(terminal["engine_startup"]["engine_acquire"]["kind"], "cold");
+        assert_eq!(
+            terminal["engine_startup"]["engine_acquire"]["total_ms"],
+            321
+        );
+        assert!(terminal["engine_startup"]["engine_ready_timestamp"].is_i64());
+        assert!(terminal["engine_startup"]["first_output_timestamp"].is_i64());
+        assert!(
+            !raw.contains("workspace") && !raw.contains("model_name"),
+            "fixed schema must not grow content-bearing fields"
+        );
+
+        unsafe { std::env::remove_var("PINVOU3_HOME") };
         let _ = std::fs::remove_dir_all(tmp);
     }
 

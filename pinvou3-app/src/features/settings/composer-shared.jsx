@@ -145,9 +145,7 @@ window.addEventListener('pinvou:chat-round-committed', (event) => {
         bridge.models.saveModel(next)
           .then(() => { setOpen(false); setEffortSaveError(''); })
           .catch((error) => {
-            const message = (error && error.message)
-              ? error.message
-              : ((t && t.saveModelFailed) || '保存失败');
+            const message = (error && error.message) ? error.message : t.saveModelFailed;
             setEffortSaveError(message);
           });
       }
@@ -389,22 +387,25 @@ window.addEventListener('pinvou:chat-round-committed', (event) => {
         }
         : { minWidth: '100%', minHeight: '100%' };
       const frameStyle = () => {
+        // color-scheme is driven by the themed CSS class on the iframe (below),
+        // not pinned to dark here — a pinned dark scheme renders unstyled
+        // documents light-on-dark even in the light theme.
         if (box && scaled) {
-          return { position: 'absolute', left: 0, top: 0, width: box.w + 'px', height: box.h + 'px', transform: 'scale(' + box.scale + ')', transformOrigin: 'top left', colorScheme: 'dark' };
+          return { position: 'absolute', left: 0, top: 0, width: box.w + 'px', height: box.h + 'px', transform: 'scale(' + box.scale + ')', transformOrigin: 'top left' };
         }
-        if (managedZoom && box) return { width: box.w + 'px', height: box.h + 'px', minHeight: '480px', colorScheme: 'dark' };
-        return { width: '100%', height: '100%', minHeight: '480px', colorScheme: 'dark' };
+        if (managedZoom && box) return { width: box.w + 'px', height: box.h + 'px', minHeight: '480px' };
+        return { width: '100%', height: '100%', minHeight: '480px' };
       };
       const wrapStyle = managedZoom
         ? { minHeight: 0, height: '100%', overflow: zoomMode === 'fit' ? 'hidden' : 'auto' }
         : (scaled ? { height: scaledH } : { minHeight: 480, height: '100%' });
       return (
-        <div ref={wrapRef} data-testid="artifact-html-preview-scroll" onWheel={handleWheel} className="relative w-full bg-[#15171a]" style={wrapStyle}>
-          {!ready && <div className="h-[480px] bg-[#15171a]"></div>}
+        <div ref={wrapRef} data-testid="artifact-html-preview-scroll" onWheel={handleWheel} className="relative w-full bg-white dark:bg-[#15171a]" style={wrapStyle}>
+          {!ready && <div className="h-[480px] bg-white dark:bg-[#15171a]"></div>}
           <div data-testid="artifact-html-preview-stage" style={managedZoom ? stageStyle : (box && scaled ? { width: scaledW + 'px', height: scaledH + 'px', position: 'relative' } : { width: '100%', height: '100%' })}>
             <div style={box && scaled ? { width: scaledW + 'px', height: scaledH + 'px', position: 'relative', flex: '0 0 auto' } : (managedZoom && box ? { width: box.w + 'px', height: box.h + 'px', flex: '0 0 auto' } : { width: '100%', height: '100%' })}>
               <iframe ref={frameRef} sandbox="allow-same-origin allow-scripts" title={title || 'Artifact preview'} data-testid="artifact-html-preview-frame" onLoad={() => { measure(); if (onFrameLoad) { onFrameLoad(frameRef.current); } setTimeout(() => setReady(true), 80); }}
-                className={`border-0 block bg-[#15171a] transition-opacity duration-300 ${ready ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
+                className={`border-0 block bg-white dark:bg-[#15171a] [color-scheme:light] dark:[color-scheme:dark] transition-opacity duration-300 ${ready ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
                 data-zoom-mode={zoomMode}
                 data-zoom-scale={box ? String(box.scale) : ''}
                 style={frameStyle()}
@@ -562,10 +563,15 @@ window.addEventListener('pinvou:chat-round-committed', (event) => {
               // generation failure rolls back to backend truth (re-read the
               // disabled/visibility/project-skills tri-state) instead of replaying
               // the local snapshot; the pending uncommitted "on" is inverted by
-              // pre-toggle membership.
+              // pre-toggle membership. bumpPendingVersion recomputes the
+              // pending-dependent row locks immediately instead of waiting for
+              // the backend-truth refetch to land (or for an unrelated render);
+              // the optimistic switch itself is only corrected when the
+              // refetch succeeds.
               if (!writeGateRef.current.isCurrent(id, generation)) return;
               refreshToolsMenu(() => true);
               if (wasPending) pending.ids.add(id); else pending.ids.delete(id);
+              bumpPendingVersion();
               const copy = t && t.uiToolStore && t.uiToolStore.operationFailedWith;
               setToggleError(copy ? copy(String(error)) : String(error));
             });
@@ -589,6 +595,7 @@ window.addEventListener('pinvou:chat-round-committed', (event) => {
             if (!writeGateRef.current.isCurrent(TOGGLE_WRITE_KEY_PROJECT_SKILLS, generation)) return;
             refreshToolsMenu(() => true);
             pending.projectSkills = wasPending;
+            bumpPendingVersion();
             const copy = t && t.uiToolStore && t.uiToolStore.operationFailedWith;
             setToggleError(copy ? copy(String(error)) : String(error));
           });

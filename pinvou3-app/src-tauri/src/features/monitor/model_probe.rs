@@ -2,8 +2,8 @@
 //!
 //! 职责边界——本模块只管「向 upstream 探一次模型健康 + 拉本地 vLLM `/metrics`」，
 //! 不涉及系统自指标采集（CPU/GPU/内存见 [`super::self_metrics`]）。
-//! 入口：[`active_model_snapshot`] / [`vllm_snapshot`] / [`snapshot_for_model_config`]。
-//! 对外类型：[`VllmSnapshot`] / [`VllmStatus`]。
+//! Entrypoints: [`active_model_snapshot`] / [`snapshot_for_model_config`].
+//! 对外类型：[`VllmSnapshot`] / [`VllmStatus`] / [`HealthStatus`] / [`MonitorDiagnostic`]。
 
 use std::time::Duration;
 
@@ -13,8 +13,15 @@ use crate::core::model_endpoint::{is_anthropic_endpoint, models_probe_url, strip
 use crate::platform::credential_store::{CredentialStore, SystemCredentialStore};
 use crate::platform::prefs::{ModelPreset, SavedModel, UserPrefs};
 
+/// Upper bound on a buffered `/metrics` body. The poll runs at ~1 Hz and
+/// reqwest buffers the whole response in `text()`, so a misbehaving local
+/// endpoint must not balloon memory; a real vLLM export is tens to a few
+/// hundred KiB. Applies to the declared `Content-Length` only — chunked
+/// responses are bounded by the 3 s request timeout instead.
+const MAX_METRICS_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
 /// 当前模型运行态 + 本地 vLLM 指标。字段名暂保留 vllm 兼容前端。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct VllmSnapshot {
     pub status: VllmStatus,
     /// vLLM `/v1/models` 返回的真实模型名。
@@ -27,9 +34,35 @@ pub struct VllmSnapshot {
     pub target_kind: String,
     /// vLLM Prometheus 指标是否适用(= `target_kind == "local"`);云端 API 无 /metrics。
     pub metrics_applicable: bool,
-    /// `verified` / `unverified` / `missing_api_key` / `auth_failed` / `offline` / `mismatch`。
-    pub health_status: String,
+    /// The authoritative health verdict. The enum renders through serde to
+    /// the established snake_case wire strings (the values the frontend and
+    /// CLI already consume, unchanged); an enum rather than a `String` so the
+    /// producer and its consumers cannot drift on a literal (round-2 review:
+    /// a one-letter typo silently dropped a diagnostic with zero red tests).
+    pub health_status: HealthStatus,
+    /// Refinement of `health_status`, with the invariant
+    /// `diagnostic.is_some() == (health_status == HealthStatus::Offline)`:
+    /// `offline` refines to `models_http_error` (with `http_status`) or
+    /// `models_unreachable` (with `transport` / `endpoint`); every other
+    /// verdict is self-describing and carries `None`. Entries hold only
+    /// machine-decidable fields, never prose — UI copy maps `code` through
+    /// `shared/i18n.js` (see `MonitorDiagnostic`).
+    pub diagnostic: Option<MonitorDiagnostic>,
+    /// Non-fatal notices with stable codes, independent of the health verdict:
+    /// `metrics_unavailable` when a local `/metrics` is unreachable or its
+    /// body parses to no vLLM series (an all-`None` metric set is never left
+    /// silently readable as "no traffic"); `context_window_inferred` when the
+    /// display window came from model-name / preset inference — this one
+    /// fires for remote targets too (`metrics_applicable == false`), so never
+    /// gate rendering of this vec on metrics applicability.
+    pub notices: Vec<MonitorDiagnostic>,
     pub max_model_len: Option<u32>,
+    /// vLLM queue-depth gauges (the Busy source for `status`; the CLI human
+    /// line renders them as `queue=R/W`). Summed across every series of the
+    /// metric, so under data-parallel (`engine="0"/"1"`) this is the fleet
+    /// total in flight, not engine 0's queue.
+    pub num_requests_running: Option<f64>,
+    pub num_requests_waiting: Option<f64>,
     /// prefix cache 原始计数器（hits_total / queries_total）。前端「清除统计」
     /// 用基准点对各累计 counter 做减法重算命中率,必须拿到原始分子/分母,
     /// 只给百分比无法做区间重算。
@@ -42,9 +75,10 @@ pub struct VllmSnapshot {
     pub ttft_count: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VllmStatus {
+    #[default]
     Offline,
     Ready,
     Busy,
@@ -52,34 +86,68 @@ pub enum VllmStatus {
     Mismatch,
 }
 
-impl VllmSnapshot {
-    /// 构造一份带核心标识字段的快照,所有 vLLM `/metrics` 派生字段(`prefix_cache_*` /
-    /// `ttft_*` / `max_model_len`)缺省 None。调用方(健康探测的各早退分支 +
-    /// happy-path 起点)共享同一组「指标缺失」默认值,happy-path 再逐项覆盖真实解析值。
-    ///
-    /// 这是原来散落在 `snapshot_for_model_config` 中的「离线 / 早退」构造块与
-    /// `base_model_snapshot` helper 的收敛入口——行为保持:字段值与原三处构造完全一致。
-    fn with_base(
-        status: VllmStatus,
-        model: Option<String>,
-        configured_model: Option<String>,
-        target_kind: &str,
-        metrics_applicable: bool,
-        health_status: &str,
-    ) -> Self {
-        VllmSnapshot {
-            status,
-            model,
-            configured_model,
-            target_kind: target_kind.to_string(),
-            metrics_applicable,
-            health_status: health_status.to_string(),
-            max_model_len: None,
-            prefix_cache_hits: None,
-            prefix_cache_queries: None,
-            ttft_sum_s: None,
-            ttft_count: None,
+/// Health verdict. The serde rendering (`rename_all = "snake_case"`) is
+/// byte-identical to the pre-existing wire strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    Verified,
+    AuthFailed,
+    #[default]
+    Offline,
+    MissingApiKey,
+    Unverified,
+    Mismatch,
+}
+
+impl HealthStatus {
+    /// Human label, byte-identical to the serde rendering (the CLI human line
+    /// uses it). Pinned by the CLI's
+    /// `health_label_matches_the_serde_rendering_of_every_variant` together
+    /// with explicit literal asserts, so a `rename_all` change cannot move the
+    /// wire silently.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HealthStatus::Verified => "verified",
+            HealthStatus::AuthFailed => "auth_failed",
+            HealthStatus::Offline => "offline",
+            HealthStatus::MissingApiKey => "missing_api_key",
+            HealthStatus::Unverified => "unverified",
+            HealthStatus::Mismatch => "mismatch",
         }
+    }
+}
+
+/// A structured diagnostic entry: machine-decidable facts only. `code` is the
+/// stable classification and UI copy must map it through `shared/i18n.js`;
+/// the snapshot carries no prose — reqwest's `Display` embeds the full
+/// request URL (a user base_url may carry userinfo, a token-shaped query, or
+/// a token path segment), so every entry is built from parsed fields and
+/// never from error text.
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorDiagnostic {
+    pub code: String,
+    /// Status code when the failure is an HTTP error.
+    pub http_status: Option<u16>,
+    /// Transport class when the failure is a transport error. Same vocabulary
+    /// as `core::model_endpoint::model_probe_transport_code` (`timeout` /
+    /// `dns_failed` / `connection_refused` / `network_error`), but decided
+    /// from reqwest's structured flags: a real reqwest error's `Display`
+    /// omits the source chain, so that helper's string arms are dead for it.
+    pub transport: Option<&'static str>,
+    /// The `scheme://host:port` subset of the target — the credential-safe
+    /// part of the URL: userinfo is stripped by reqwest at request build, and
+    /// the path and query are dropped here by construction.
+    pub endpoint: Option<String>,
+}
+
+impl VllmSnapshot {
+    /// 后端在线判定(live dot / CLI `monitor status` 的 `vllm_online` 共用):
+    /// 健康态 `verified` 且进程 Ready/Busy。原先该谓词在 GUI command 与
+    /// CLI status_payload 各自手写一遍字面量匹配,单点收口避免字符串漂移。
+    pub fn is_online(&self) -> bool {
+        self.health_status == HealthStatus::Verified
+            && matches!(self.status, VllmStatus::Ready | VllmStatus::Busy)
     }
 }
 
@@ -112,21 +180,6 @@ pub async fn active_model_snapshot() -> Option<VllmSnapshot> {
         preset,
         api_key.as_deref(),
         configured_context,
-    )
-    .await
-}
-
-/// 兼容旧调用。优先用于本地 vLLM 探测；active-model 面板走 `active_model_snapshot()`。
-pub async fn vllm_snapshot(
-    upstream: &str,
-    configured_model: Option<String>,
-) -> Option<VllmSnapshot> {
-    snapshot_for_model_config(
-        upstream,
-        configured_model,
-        ModelPreset::LocalVllm,
-        None,
-        None,
     )
     .await
 }
@@ -197,13 +250,13 @@ async fn snapshot_for_model_config(
     let mut request = client.get(models_url).timeout(Duration::from_secs(3));
     if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
         if is_anthropic_endpoint(upstream) {
-            request = request
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01");
+            request = crate::core::model_endpoint::apply_anthropic_auth_headers(request, key);
         } else {
             request = request.bearer_auth(key);
         }
     }
+    let request =
+        crate::core::model_endpoint::with_opencode_session_header(request, upstream, "model-probe");
     let should_probe_models =
         target_kind == "local" || api_key.map(str::trim).is_some_and(|key| !key.is_empty());
     let models_resp = if should_probe_models {
@@ -217,95 +270,129 @@ async fn snapshot_for_model_config(
             if r.status() == reqwest::StatusCode::UNAUTHORIZED
                 || r.status() == reqwest::StatusCode::FORBIDDEN =>
         {
-            return Some(VllmSnapshot::with_base(
-                VllmStatus::Offline,
-                configured_model.clone(),
+            // auth_failed is the verdict itself; no refinement diagnostic.
+            return Some(VllmSnapshot {
+                status: VllmStatus::Offline,
+                model: configured_model.clone(),
                 configured_model,
-                target_kind,
+                target_kind: target_kind.to_string(),
                 metrics_applicable,
-                "auth_failed",
-            ));
+                health_status: HealthStatus::AuthFailed,
+                ..VllmSnapshot::default()
+            });
         }
-        Some(Ok(_)) => {
+        Some(Ok(r)) => {
             if target_kind == "local" {
-                return Some(VllmSnapshot::with_base(
-                    VllmStatus::Offline,
-                    configured_model.clone(),
+                return Some(VllmSnapshot {
+                    status: VllmStatus::Offline,
+                    model: configured_model.clone(),
                     configured_model,
-                    target_kind,
+                    target_kind: target_kind.to_string(),
                     metrics_applicable,
-                    "offline",
-                ));
+                    health_status: HealthStatus::Offline,
+                    diagnostic: Some(MonitorDiagnostic {
+                        code: "models_http_error".to_string(),
+                        http_status: Some(r.status().as_u16()),
+                        transport: None,
+                        endpoint: endpoint_root(Some(r.url())),
+                    }),
+                    ..VllmSnapshot::default()
+                });
             }
             None
         }
-        Some(Err(_)) => {
+        Some(Err(err)) => {
             if target_kind == "local" {
-                return Some(VllmSnapshot::with_base(
-                    VllmStatus::Offline,
-                    configured_model.clone(),
+                // Structured detail instead of reqwest's `Display`: the Display
+                // embeds the full request URL (a user base_url may carry
+                // userinfo, a token-shaped query, or a token path segment, and
+                // the generic scrub misses digit-free values), so the
+                // diagnostic is built from parsed fields only — `endpoint` is
+                // the scheme/host/port subset of `err.url()`; no error text
+                // ever enters the snapshot.
+                return Some(VllmSnapshot {
+                    status: VllmStatus::Offline,
+                    model: configured_model.clone(),
                     configured_model,
-                    target_kind,
+                    target_kind: target_kind.to_string(),
                     metrics_applicable,
-                    "offline",
-                ));
+                    health_status: HealthStatus::Offline,
+                    diagnostic: Some(MonitorDiagnostic {
+                        code: "models_unreachable".to_string(),
+                        http_status: None,
+                        transport: Some(transport_class(&err)),
+                        endpoint: endpoint_root(err.url()),
+                    }),
+                    ..VllmSnapshot::default()
+                });
             }
             None
         }
-        None if target_kind == "local" => {
-            return Some(VllmSnapshot::with_base(
-                VllmStatus::Offline,
-                None,
-                configured_model,
-                target_kind,
-                metrics_applicable,
-                "offline",
-            ));
-        }
+        // `None` only happens for remote targets with no API key (the probe
+        // is skipped for them); local targets always probe above, so no
+        // local arm is needed here.
         None => None,
     };
 
-    let (served_model, max_model_len) = match models_resp {
+    let (served_model, mut max_model_len, listed_entries) = match models_resp {
         Some(r) => match r.json::<serde_json::Value>().await.ok() {
             Some(v) => {
-                parse_models_response(v, configured_model.as_deref()).unwrap_or((None, None))
+                // Roster size for the native follow-up's attribution gate
+                // (a configured=None snapshot may only follow a
+                // single-model listing — see
+                // `local_native_display_window`).
+                let listed = v.get("data").and_then(|d| d.as_array()).map(|a| a.len());
+                let (served, len) =
+                    parse_models_response(v, configured_model.as_deref()).unwrap_or((None, None));
+                (served, len, listed)
             }
-            None => (None, None),
+            None => (None, None, None),
         },
-        None => (None, None),
+        None => (None, None, None),
     };
+    // Ollama's and LM Studio's OpenAI-compatible `/v1/models` never carry a
+    // window fact. For a local target whose listed window is missing, follow
+    // up on the native API (`local_native_display_window`: kind- and
+    // locality-gated, `/api/ps` fresh per poll, `/api/show` 60s-cached in
+    // core, LM Studio `/api/v0/models` per poll). This keeps the monitor
+    // denominator on the same deployment truth the engine route limits use
+    // (`core::model_context::resolve_context_window` single scale) instead
+    // of the preset fallback diverging from the engine's probed value.
+    if target_kind == "local" && max_model_len.is_none() {
+        max_model_len = local_native_display_window(
+            upstream,
+            api_key,
+            configured_model.as_deref(),
+            served_model.as_deref(),
+            listed_entries,
+        )
+        .await;
+    }
 
     // 2) /metrics（用 host 根目录，不带 /v1）
+    // 鉴权与上方 /v1/models 探测同模式：本地引擎以 `--api-key` 启动时
+    // /metrics 同样要求 bearer（Tachyon 驭光即如此），裸 GET 会 401 落进
+    // metrics_unavailable 诊断。
     let metrics_url = metrics_applicable
         .then(|| strip_v1_suffix(upstream).map(|h| format!("{h}/metrics")))
         .flatten();
     let metrics_resp = match metrics_url {
-        Some(u) => client
-            .get(&u)
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-            .ok(),
+        Some(u) => {
+            let mut request = client.get(&u).timeout(Duration::from_secs(3));
+            if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+                request = request.bearer_auth(key);
+            }
+            request.send().await.ok()
+        }
         None => None,
     };
     let metrics_text = match metrics_resp {
-        Some(r) if r.status().is_success() => r.text().await.ok(),
+        Some(r) if r.status().is_success() => match r.content_length() {
+            Some(n) if n > MAX_METRICS_BODY_BYTES => None,
+            _ => r.text().await.ok(),
+        },
         _ => None,
     };
-    // The display window goes through the unified precedence (see
-    // display_context_window): an explicit user declaration wins first, a local
-    // deployment's probe value min-clamps; a cloud probe value (usually a list
-    // entry from a proxy/gateway, unrelated to or stale for the configured
-    // model) must not override the user declaration, otherwise saving 1M gets
-    // the progress bar knocked back to 131K. Probe and catalog/preset fallbacks
-    // only fill in when no declaration exists.
-    let inferred = infer_context_window(
-        preset,
-        configured_model.as_deref().or(served_model.as_deref()),
-    );
-    let (max_model_len, _window_from_inference) =
-        display_context_window(configured_context, target_kind, max_model_len, inferred);
-
     let running = metrics_text
         .as_deref()
         .and_then(|t| parse_prom_metric(t, "vllm:num_requests_running"));
@@ -320,11 +407,50 @@ async fn snapshot_for_model_config(
     let prefix_cache_queries = metrics_text
         .as_deref()
         .and_then(|t| parse_prom_metric(t, "vllm:prefix_cache_queries_total"));
-
     let perf = metrics_text
         .as_deref()
         .map(parse_perf_metrics)
         .unwrap_or_default();
+
+    // An unreachable /metrics and a /metrics that answers 200 with a body no
+    // vLLM series parses leave every metric field None alike; flag both so an
+    // all-None snapshot is never silently read as "no traffic".
+    let mut notices = Vec::new();
+    if metrics_applicable
+        && running.is_none()
+        && waiting.is_none()
+        && prefix_cache_hits.is_none()
+        && prefix_cache_queries.is_none()
+        && perf == PerfMetrics::default()
+    {
+        notices.push(MonitorDiagnostic {
+            code: "metrics_unavailable".to_string(),
+            http_status: None,
+            transport: None,
+            endpoint: None,
+        });
+    }
+    // The display window goes through the unified precedence (see
+    // display_context_window): an explicit user declaration wins first, a local
+    // deployment's probe value min-clamps; a cloud probe value (usually a list
+    // entry from a proxy/gateway, unrelated to or stale for the configured
+    // model) must not override the user declaration, otherwise saving 1M gets
+    // the progress bar knocked back to 131K. Probe and catalog/preset fallbacks
+    // only fill in when no declaration exists.
+    let inferred = infer_context_window(
+        preset,
+        configured_model.as_deref().or(served_model.as_deref()),
+    );
+    let (max_model_len, window_from_inference) =
+        display_context_window(configured_context, target_kind, max_model_len, inferred);
+    if window_from_inference {
+        notices.push(MonitorDiagnostic {
+            code: "context_window_inferred".to_string(),
+            http_status: None,
+            transport: None,
+            endpoint: None,
+        });
+    }
 
     let mut status = match (running, waiting) {
         (Some(r), _) if r > 0.0 => VllmStatus::Busy,
@@ -341,38 +467,79 @@ async fn snapshot_for_model_config(
         );
     }
     let health_status = match status {
-        VllmStatus::Mismatch => "mismatch",
+        VllmStatus::Mismatch => HealthStatus::Mismatch,
+        // No `Offline` arm: `status` is only ever Ready/Busy here (built from
+        // the queue gauges, then possibly downgraded to Mismatch); every
+        // Offline snapshot exits through the early returns above, which carry
+        // the offline refinement diagnostic themselves.
         _ if target_kind == "remote"
             && api_key
                 .map(str::trim)
                 .filter(|key| !key.is_empty())
                 .is_none() =>
         {
-            "missing_api_key"
+            HealthStatus::MissingApiKey
         }
-        _ if target_kind == "remote" && served_model.is_none() => "unverified",
-        _ => "verified",
+        _ if target_kind == "remote" && served_model.is_none() => HealthStatus::Unverified,
+        _ => HealthStatus::Verified,
     };
 
-    // happy-path:从带默认值的 base 起步,再逐项覆盖真实解析值。
-    let mut snapshot = VllmSnapshot::with_base(
+    // Happy path: a full literal with no `..default()`, so adding a field to
+    // the struct fails to compile here (the early exits use struct-update and
+    // stay quiet; the CLI key-set pin catches the widening on that side).
+    Some(VllmSnapshot {
         status,
-        if target_kind == "remote" {
+        model: if target_kind == "remote" {
             configured_model.clone().or(served_model)
         } else {
             served_model
         },
         configured_model,
-        target_kind,
+        target_kind: target_kind.to_string(),
         metrics_applicable,
         health_status,
-    );
-    snapshot.max_model_len = max_model_len;
-    snapshot.prefix_cache_hits = prefix_cache_hits;
-    snapshot.prefix_cache_queries = prefix_cache_queries;
-    snapshot.ttft_sum_s = perf.ttft_sum_s;
-    snapshot.ttft_count = perf.ttft_count;
-    Some(snapshot)
+        diagnostic: None,
+        notices,
+        max_model_len,
+        num_requests_running: running,
+        num_requests_waiting: waiting,
+        prefix_cache_hits,
+        prefix_cache_queries,
+        ttft_sum_s: perf.ttft_sum_s,
+        ttft_count: perf.ttft_count,
+    })
+}
+
+/// The `scheme://host:port` subset of a URL — the part that may safely enter
+/// the snapshot: reqwest strips userinfo at request build, and the path and
+/// query are dropped here by construction, so a base_url carrying credentials
+/// in any of those positions cannot leak into a diagnostic.
+fn endpoint_root(url: Option<&reqwest::Url>) -> Option<String> {
+    let url = url?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
+}
+
+/// Transport class of a failed request, from reqwest's structured flags
+/// rather than its `Display` text (a real reqwest error's Display omits the
+/// source chain, so `model_probe_transport_code`'s string arms are dead for
+/// it). Vocabulary kept in step with that helper.
+fn transport_class(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_dns() {
+        // Must precede `is_connect()`: hyper-util files resolver failures
+        // under its Connect kind too, so the DNS check only classifies if it
+        // runs first.
+        "dns_failed"
+    } else if err.is_connect() {
+        "connection_refused"
+    } else {
+        "network_error"
+    }
 }
 
 fn parse_models_response(
@@ -393,11 +560,23 @@ fn parse_models_response(
     // only.
     let configured = configured.map(str::trim).filter(|name| !name.is_empty());
     let matched = configured.and_then(|name| {
-        entries.iter().find(|entry| entry.id == name).or_else(|| {
-            entries
-                .iter()
-                .find(|entry| entry.id.eq_ignore_ascii_case(name))
-        })
+        entries
+            .iter()
+            .find(|entry| entry.id == name)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.id.eq_ignore_ascii_case(name))
+            })
+            // Ollama lists the canonical `name:latest`; a hand-typed
+            // tagless configured name must still find its own entry (the
+            // same fold as `ollama_ps_context_lookup`) — without it served
+            // degrades to the first entry and the attribution gate below
+            // refuses the native follow-up in every roster shape.
+            .or_else(|| {
+                let canonical = crate::core::model_endpoint::ollama_canonical_name(name);
+                entries.iter().find(|entry| entry.id == canonical)
+            })
     });
     let entry = matched.or_else(|| entries.first())?;
     let window = if matched.is_some() || configured.is_none() {
@@ -406,6 +585,138 @@ fn parse_models_response(
         None
     };
     Some((Some(entry.id.clone()), window))
+}
+
+/// Window-attribution gate for the native display follow-up: the queried
+/// entry must belong to the configured model. With a configured name the
+/// served entry must be that model (trimmed, ASCII case-insensitive — the
+/// same fold as `parse_models_response`; the lookups use `served`, the
+/// server-canonical id, so this adopts the model's own window, never
+/// another entry's); without one (local_vllm snapshots carry no configured
+/// name) the served entry is the display subject — see
+/// `local_native_display_window` for the single-model roster restriction
+/// on that arm. A partial roster (configured name absent from the list)
+/// must not borrow the first entry's window — the same "a window is never
+/// borrowed from another model" principle as `parse_models_response` /
+/// `resolve_served_model_from_entries`. Note the engine route's adoption
+/// gate (`adopts_probed_facts`) matches exactly instead of
+/// case-insensitively: a case-mismatched route is already a Mismatch
+/// display state, and there the display may adopt a window the engine
+/// route keeps its fallback for — accepted, since loosening the engine
+/// gate would change pre-existing vLLM adoption semantics. Both gates
+/// fold Ollama's `name:latest` canonicalization ([`ollama_canonical_name`]
+/// — a hand-typed tagless configured name must resolve to its own entry
+/// on both sides), so the remaining asymmetry is the ASCII-case fold: on a
+/// list whose configured name matches only case-insensitively this gate
+/// passes while the engine's exact-plus-canonical gate never adopts that
+/// shape, and the keyed native maps (queried by the server-canonical
+/// served id) can hand back a ps fact the engine route does not adopt.
+fn native_display_window_adoptable(configured: Option<&str>, served: Option<&str>) -> bool {
+    let Some(served) = served else {
+        return false;
+    };
+    match configured.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(configured) => {
+            served.eq_ignore_ascii_case(configured)
+                || served.eq_ignore_ascii_case(&crate::core::model_endpoint::ollama_canonical_name(
+                    configured,
+                ))
+        }
+        None => true,
+    }
+}
+
+/// Native window fact for a local target whose `/v1/models` listing carried
+/// none. Gates, in order:
+/// 1. attribution (`native_display_window_adoptable`) — a window is never
+///    borrowed across model names;
+/// 2. locality — the same `base_url_uses_local_or_private` classification
+///    the engine route uses, so a public base_url saved under a local
+///    preset gets no native probes on either path;
+/// 3. roster — a configured=None snapshot attributes the listing to its
+///    first entry, so only an unambiguous single-model roster may follow it
+///    (a multi-model Ollama behind a local_vllm preset would otherwise
+///    display the first-downloaded model's window);
+/// 4. kind — an already-cached positive classification decides the native
+///    API: Ollama → `/api/ps` effective context (fresh; the deployment
+///    truth for loaded models) → `/api/show` (`num_ctx` declaration, 60s
+///    cached in core and shared with the engine path; a show response
+///    without one yields no fact — the GGUF trained cap is a capability
+///    ceiling, not the served window), LM Studio → `/api/v0/models` served
+///    window. An uncached kind (never probed — e.g. a monitor-only target
+///    the engine never classified) still tries the Ollama-shaped `/api/ps`
+///    probe, and a non-Ollama shape ends the lookup; a known other kind
+///    skips the fetch entirely — no per-poll doomed `/api/ps` for servers
+///    the engine already identified. (vLLM listings carry `max_model_len`
+///    so there is nothing to follow up; llama.cpp-class listings usually
+///    don't — the engine also skips native for those kinds, so the display
+///    here shows the same preset fallback the engine's budget uses instead
+///    of a diverging native fact.) That skip is TTL-scoped like every
+///    cached kind: 60s after the last engine-side classification the
+///    monitor resumes the probe; a monitor-only target the engine never
+///    classified keeps paying one small doomed 404 per poll for as long
+///    as it stays unclassified (the monitor deliberately only reads the
+///    cache), bounded by the shared 3s probe client. One honest
+///    exception: while `/api/show` itself
+///    persistently errors (5xx / hang), those responses are `Unreachable`
+///    and deliberately uncached — a busy server must not be pinned to "no
+///    window" — so the lookup re-POSTs show once per poll until the server
+///    recovers, and each POST is a server-side GGUF re-read. Bounded at 1
+///    small request/s with the shared 3s timeout; the frontend in-flight
+///    guard keeps slow polls from piling up.
+async fn local_native_display_window(
+    upstream: &str,
+    api_key: Option<&str>,
+    configured: Option<&str>,
+    served: Option<&str>,
+    listed_entries: Option<usize>,
+) -> Option<u32> {
+    use crate::core::model_endpoint::LocalServerKind;
+    if !native_display_window_adoptable(configured, served) {
+        return None;
+    }
+    if !crate::core::model_endpoint::base_url_uses_local_or_private(upstream) {
+        return None;
+    }
+    if configured
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .is_none()
+        && listed_entries != Some(1)
+    {
+        return None;
+    }
+    let name = served?;
+    match crate::core::model_endpoint::cached_local_server_kind(upstream) {
+        Some(LocalServerKind::LmStudio) => {
+            crate::core::model_endpoint::fetch_lmstudio_served_context(upstream, api_key, name)
+                .await
+        }
+        // Ollama, or never classified (monitor-only target): try the
+        // Ollama-shaped ps probe. The lookup is the same tag-tolerant one
+        // the engine route uses, and the attribution gate above folds the
+        // same canonical form, so a tagless configured name reaches its
+        // own canonical `/api/ps` entry exactly as the engine budget does;
+        // unlike `fetch_ollama_model_context`, a non-Ollama-shaped ps
+        // response ends the lookup here (a never-classified target must not
+        // pay the show fallback POST).
+        None | Some(LocalServerKind::Ollama) => {
+            let contexts =
+                crate::core::model_endpoint::fetch_ollama_contexts(upstream, api_key).await?;
+            if let Some(ctx) =
+                crate::core::model_endpoint::ollama_ps_context_lookup(&contexts, name)
+            {
+                return Some(ctx);
+            }
+            crate::core::model_endpoint::cached_ollama_show_context(upstream, api_key, name).await
+        }
+        // A known other kind: the engine's own adoption also skips native
+        // for it, so the display must not dial a doomed per-poll request.
+        // vLLM listings carry `max_model_len` (nothing to follow up);
+        // llama.cpp-class listings usually don't, and the display then
+        // shows the same preset fallback the engine's budget uses.
+        Some(_) => None,
+    }
 }
 
 /// Display-side context window (the monitor card + the progress-bar denominator
@@ -465,7 +776,7 @@ fn infer_context_window(preset: ModelPreset, model: Option<&str>) -> Option<u32>
 }
 
 /// 推理性能相关的累计指标（TTFT 直方图），统一解析、统一缺省 None。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct PerfMetrics {
     ttft_sum_s: Option<f64>,
     ttft_count: Option<f64>,
@@ -478,36 +789,85 @@ fn parse_perf_metrics(text: &str) -> PerfMetrics {
     }
 }
 
-/// 从 Prometheus 文本里抽某个指标的第一个数值，例如：
-/// `vllm:num_requests_running{engine="0",model_name="/model"} 0.0` → 0.0
+/// Sum a metric across every one of its series in the Prometheus text, e.g.
+/// `vllm:num_requests_running{engine="0"} 3` plus `{engine="1"} 2` → `5.0`.
+/// vLLM with `data_parallel_size > 1` exports one series per `engine` label,
+/// and every metric consumed here is additive (queue gauges, monotonic
+/// counters, histogram `_sum`/`_count`), so the engine-wide total is the
+/// honest published number — returning the first series would silently
+/// report engine 0 only. `None` when no finite series exists.
+///
+/// Per-line robustness: comment lines are skipped; the metric name must end
+/// at a boundary (space, tab, `{`, or end of line), so same-prefix longer
+/// names (`_created` siblings, `vllm:num_requests_waiting_by_reason`) never
+/// match; a truncated labels block or a non-numeric sample skips only that
+/// line; `NaN` / `±Inf` samples (which `f64::from_str` accepts) are skipped
+/// rather than summed.
 fn parse_prom_metric(text: &str, name: &str) -> Option<f64> {
+    let mut total: Option<f64> = None;
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') {
+        if line.starts_with('#') || !line.starts_with(name) {
             continue;
         }
-        if !line.starts_with(name) {
-            continue;
-        }
-        // 跳过指标名称 + 可选 `{labels}`，找最后一个空格后的数字
         let after_name = &line[name.len()..];
-        let value_part = if after_name.starts_with('{') {
-            let close = after_name.find('}')?;
-            after_name[close + 1..].trim()
+        match after_name.chars().next() {
+            None | Some('{') | Some(' ') | Some('\t') => {}
+            _ => continue,
+        }
+        let value_part = if let Some(rest) = after_name.strip_prefix('{') {
+            match closing_label_brace(rest) {
+                Some(close) => rest[close + 1..].trim(),
+                // Truncated labels block: this line only.
+                None => continue,
+            }
         } else {
             after_name.trim()
         };
-        let token = value_part.split_whitespace().next()?;
+        let Some(token) = value_part.split_whitespace().next() else {
+            continue;
+        };
         if let Ok(v) = token.parse::<f64>() {
-            return Some(v);
+            if v.is_finite() {
+                *total.get_or_insert(0.0) += v;
+            }
+        }
+    }
+    total
+}
+
+/// Offset of the labels-block closing `}` in `rest` (the text after the
+/// opening `{`), honoring quoted label values — a `}` inside quotes is part
+/// of the value (vLLM's `--served-model-name` is arbitrary text), not the
+/// block end. `None` means the block never closes.
+fn closing_label_brace(rest: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+        } else {
+            match ch {
+                '\\' if in_quotes => escaped = true,
+                '"' => in_quotes = !in_quotes,
+                '}' if !in_quotes => return Some(i),
+                _ => {}
+            }
         }
     }
     None
 }
 
-/// 按 base_url 主机段判后端类型:环回/私有 IP 段 = 本地推理引擎(`local`,自托管 vLLM,
-/// 有 Prometheus 指标);公网域名/IP = 云端 API(`remote`);空/解析失败 = 配置异常(`invalid`)。
-/// 前端监控卡的「本地模型/远端模型/配置异常」标签 + 指标适用性 + 小窗口告警都据此。
+/// Classify the backend kind by the base_url host: loopback/private IP
+/// ranges (including docker host aliases) = local inference engine
+/// (`local`, self-hosted vLLM with Prometheus metrics); public domain/IP =
+/// cloud API (`remote`); empty/unparseable = invalid config (`invalid`).
+/// Drives the monitor card's local/remote/invalid label, metric
+/// applicability, and the native-window alert. The local/private decision
+/// shares core's `base_url_uses_local_or_private` with engine routing (one
+/// source of truth; the `local_native_display_window` gate uses it too) —
+/// no more separate string parsing: `host.docker.internal`-style aliases
+/// and trailing-dot local hosts classify as local instead of cloud.
 fn vllm_target_kind(upstream: &str) -> &'static str {
     let s = upstream.trim();
     if s.is_empty() {
@@ -528,45 +888,11 @@ fn vllm_target_kind(upstream: &str) -> &'static str {
     if host.is_empty() {
         return "invalid";
     }
-    if host == "localhost" || host == "::1" {
+    if crate::core::model_endpoint::base_url_uses_local_or_private(s) {
         return "local";
-    }
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        let o = ip.octets();
-        let private = o[0] == 127
-            || o[0] == 10
-            || (o[0] == 172 && (16..=31).contains(&o[1]))
-            || (o[0] == 192 && o[1] == 168);
-        return if private { "local" } else { "remote" };
     }
     // 域名或公网 IPv6 → 云端 API
     "remote"
-}
-
-/// Lightweight local vLLM probe: one `/v1/models` fetch yields two things —
-/// the actual served model name and `max_model_len` (context window). The
-/// name is for monitor display only; the model name used for inference must
-/// go through [`resolve_served_model`] (this function returns the first list
-/// entry, which is only correct for single-model vLLM servers). The window
-/// fills `active_route_limits.context_tokens` so compaction thresholds derive
-/// from the real window (see docs/context-compaction-设计.md). On probe
-/// failure (vLLM down/timeout) returns `(None, None)`, and the caller falls
-/// back to the configured values plus the name hint. See
-/// `core::model_endpoint::apply_bearer` for `bearer` semantics: authenticated
-/// vLLM (`--api-key`) 401s on `/v1/models` without credentials,
-/// so pass a key from the same origin as real inference.
-pub async fn probe_vllm_model_info(
-    base_url: &str,
-    bearer: Option<&str>,
-) -> (Option<String>, Option<u32>) {
-    // HTTP layer and URL assembly reuse the shared core probe (no /v1/models
-    // semantics drift). Local single-model probe: no configured name to match,
-    // so the first list entry stays the served-name source (unchanged here;
-    // the configured-name matching lives in `snapshot_for_model_config`).
-    match crate::core::model_endpoint::fetch_v1_models(base_url, bearer).await {
-        Some(v) => parse_models_response(v, None).unwrap_or((None, None)),
-        None => (None, None),
-    }
 }
 
 /// Final link of the "probe → user picks → use the pick" chain: decides the
@@ -609,9 +935,10 @@ fn resolve_served_model_from_entries(
 }
 
 /// Fetches `/v1/models` and decides the actual model name via
-/// [`resolve_served_model_from_entries`]. On probe failure returns the
-/// configured name with `None` window/limit. `bearer` semantics match
-/// [`probe_vllm_model_info`] (inference-same-origin key).
+/// `resolve_served_model_from_entries` (private helper). On probe failure
+/// returns the configured name with `None` window/limit. Pass `bearer` from
+/// the same origin as real inference: authenticated engines (`--api-key`)
+/// 401 on `/v1/models` without credentials.
 pub async fn resolve_served_model(
     base_url: &str,
     bearer: Option<&str>,
@@ -631,10 +958,19 @@ pub async fn resolve_served_model(
 /// name actually sent to the endpoint: routes that follow the served name
 /// (vLLM, whose name is usually corrected to the entry itself) may always
 /// adopt; routes that do not rename adopt only when the configured name
-/// exactly hits the list — in the single-entry "borrowed name" scenario the
-/// returned served name is unrelated to the configured one and its facts
-/// belong to another model, so they must not tighten this route's
-/// window/output caps.
+/// exactly hits the list, or its Ollama canonical form does
+/// (`ollama_canonical_name`: a hand-typed tagless name on a
+/// single-entry Ollama roster *is* the listed model under Ollama's
+/// `name:latest` canonicalization, not a borrowed one — without the fold
+/// the whole native adoption is skipped there and the 8192-fallback
+/// collapse survives the engine's lifetime; the fold matches only
+/// `served == configured + ":latest"`, so a genuinely unrelated single
+/// entry still refuses). The ps lookup this gate feeds folds the same way
+/// (`ollama_ps_context_lookup`), so an adopted gate always resolves a fact.
+/// In the remaining single-entry "borrowed name" scenario the returned
+/// served name is unrelated to the configured one and its facts belong to
+/// another model, so they must not tighten this route's window/output
+/// caps.
 ///
 /// Known exception (intentional trade-off): with vLLM +
 /// `pins_scheduled_model` the served-name correction is suppressed and the
@@ -644,77 +980,16 @@ pub async fn resolve_served_model(
 /// strict one 404s on the configured name (facts have no effect), so no
 /// extra condition complexity is added for that corner.
 pub fn adopts_probed_facts(follows_served_name: bool, configured: &str, served: &str) -> bool {
-    follows_served_name || served == configured
-}
-
-/// 当前 monitor/探测应使用的 vLLM base_url。
-/// 优先级：环境变量 `DEEPSEEK_BASE_URL` > settings.json `custom_base_url` > 默认值。
-/// 与 Engine 使用的逻辑保持一致（见 `bridge::Pinvou3Bridge::base_url`）。
-pub fn vllm_base_url() -> String {
-    if let Ok(v) = std::env::var("DEEPSEEK_BASE_URL") {
-        return v;
-    }
-    let prefs = crate::platform::prefs::UserPrefs::load();
-    prefs
-        .active_model()
-        .map(|m| m.base_url.clone())
-        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string())
-}
-
-/// 用户配置的模型名（用于 monitor 显示"配置目标"）。
-/// 优先级：环境变量 `DEEPSEEK_MODEL` > settings.json `custom_model_name` > None。
-pub fn vllm_configured_model() -> Option<String> {
-    if let Ok(v) = std::env::var("DEEPSEEK_MODEL") {
-        return Some(v);
-    }
-    let prefs = crate::platform::prefs::UserPrefs::load();
-    match prefs.active_model() {
-        // 本地 vLLM 动态跟随实际 served name(见 EnginePool::fresh_bridge_for),
-        // 不声明固定配置目标 → 监控不做 mismatch 误报,只显示 vLLM 实际名字。
-        Some(m) if m.preset == crate::platform::prefs::ModelPreset::LocalVllm => None,
-        Some(m) => Some(m.model.clone()),
-        None => None,
-    }
+    follows_served_name
+        || served == configured
+        || served == crate::core::model_endpoint::ollama_canonical_name(configured)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::tests::ENV_LOCK;
     use crate::platform::prefs::ModelPreset;
-
-    #[tokio::test]
-    #[ignore]
-    async fn live_probe_returns_window() {
-        let base = std::env::var("PINVOU3_LIVE_VLLM")
-            .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
-        let (name, window) = probe_vllm_model_info(&base, None).await;
-        eprintln!("live probe @ {base}: name={name:?} max_model_len={window:?}");
-        let window = window.expect("真机 vLLM 必须探测到 max_model_len(客户 bug 的核心修复)");
-        assert!(
-            window >= 100_000,
-            "窗口应为真实 max_model_len(期望 262144),实得 {window}"
-        );
-        // 端到端佐证:探测窗口喂进 derive 公式应得按窗口缩放的 T(非写死 190K)。
-        // 复算 derive_compaction_threshold(bridge 私有,此处内联同公式):
-        //   E = W − O − 1024; T = (E−S)/1.5 − 22000, clamp[4096, 0.75W].
-        // O = the window-tier declaration — taken from the same source as
-        // production, core::model_context::operator_owned_output_declaration;
-        // do not inline a copy again.
-        let o = crate::core::model_context::operator_owned_output_declaration(Some(window))
-            .expect("a real-machine window >=100K always yields a tier declaration");
-        let e = (window as usize)
-            .saturating_sub(o as usize)
-            .saturating_sub(1_024);
-        let t = (e.saturating_sub(4_000).saturating_mul(2) / 3)
-            .saturating_sub(22_000)
-            .clamp(4_096, window as usize * 3 / 4);
-        eprintln!("derived token_threshold for W={window}: T={t}  E={e}");
-        assert!(
-            t < e,
-            "推导 T({t}) 必须低于紧急线 E({e})——nice 主路径先于 emergency(不倒置);\
-             按真实窗口缩放,而非写死单值"
-        );
-    }
 
     #[test]
     fn vllm_target_kind_classifies_by_host() {
@@ -724,6 +999,13 @@ mod tests {
         assert_eq!(vllm_target_kind("http://localhost:8000/v1"), "local");
         assert_eq!(vllm_target_kind("http://192.168.1.5:8000/v1"), "local");
         assert_eq!(vllm_target_kind("http://172.16.0.9:8000/v1"), "local");
+        // docker host alias (host.docker.internal): shares the core
+        // classifier with engine routing, so it classifies local like the
+        // engine does
+        assert_eq!(
+            vllm_target_kind("http://host.docker.internal:8000/v1"),
+            "local"
+        );
         // 云端 API:公网域名 / 公网 IP
         assert_eq!(vllm_target_kind("https://api.deepseek.com/v1"), "remote");
         assert_eq!(vllm_target_kind("http://8.8.8.8:8000/v1"), "remote");
@@ -817,6 +1099,875 @@ mod tests {
         let (id, max) = parse_models_response(json, Some("user-picked")).unwrap();
         assert_eq!(id.as_deref(), Some("user-picked"));
         assert_eq!(max, None);
+    }
+
+    /// Ollama display follow-up attribution gate: the queried entry must be
+    /// the configured model's own (trimmed, ASCII case-insensitive — the
+    /// same scale as parse_models_response); with no configured name the
+    /// served entry is the display subject; a partial roster never borrows
+    /// the first entry's window; no served name → nothing to query.
+    #[test]
+    fn native_display_window_gate_never_borrows_across_names() {
+        assert!(native_display_window_adoptable(
+            Some("ollama-model"),
+            Some("ollama-model")
+        ));
+        assert!(native_display_window_adoptable(
+            Some("Ollama-Model"),
+            Some("ollama-model")
+        ));
+        assert!(native_display_window_adoptable(
+            Some("  ollama-model\t"),
+            Some("ollama-model")
+        ));
+        assert!(native_display_window_adoptable(None, Some("served")));
+        assert!(
+            !native_display_window_adoptable(Some("configured"), Some("first-entry")),
+            "a partial roster must not borrow the first entry's window"
+        );
+        assert!(!native_display_window_adoptable(Some("m"), None));
+        assert!(!native_display_window_adoptable(None, None));
+    }
+
+    /// /metrics 拉取携带与 /v1/models 同源 bearer（round-1 评审 minor 补钉）：以
+    /// `--api-key` 启动的本地引擎（如驭光 Tachyon）对裸 GET 会 401，修复前落
+    /// metrics_unavailable 误诊。mock 逐路径记录 Authorization，两个方向都钉：
+    /// 有 key 时两路径同带 `Bearer secret`；keyless 时不带任何 Authorization。
+    #[tokio::test]
+    async fn metrics_fetch_carries_the_same_origin_bearer() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let metrics_body = "vllm:num_requests_running 1\nvllm:num_requests_waiting 0\n".to_string();
+        // The snapshot's health request goes through `models_probe_url`,
+        // which appends `/models` directly on a bare-host base (no `/v1`).
+        let mock = models_mock::spawn(&[
+            (
+                "/models",
+                200,
+                r#"{"object":"list","data":[{"id":"qwen3.8","max_model_len":131072}]}"#.into(),
+            ),
+            ("/metrics", 200, metrics_body.clone()),
+        ]);
+        let snap = snapshot_for_model_config(
+            &mock.base_url,
+            Some("qwen3.8".to_string()),
+            ModelPreset::LocalVllm,
+            Some("secret"),
+            None,
+        )
+        .await
+        .expect("snapshot with key");
+        assert_eq!(
+            mock.auth_for("/models").as_deref(),
+            Some("Bearer secret"),
+            "the health probe keeps the existing bearer semantics"
+        );
+        assert_eq!(
+            mock.auth_for("/metrics").as_deref(),
+            Some("Bearer secret"),
+            "/metrics must carry the same-origin bearer (--api-key servers 401 a bare GET)"
+        );
+        assert_eq!(
+            snap.status,
+            VllmStatus::Busy,
+            "metrics body parses once authorized (running=1 surfaces as Busy)"
+        );
+
+        let mock = models_mock::spawn(&[
+            (
+                "/models",
+                200,
+                r#"{"object":"list","data":[{"id":"qwen3.8","max_model_len":131072}]}"#.into(),
+            ),
+            ("/metrics", 200, metrics_body),
+        ]);
+        let snap = snapshot_for_model_config(
+            &mock.base_url,
+            Some("qwen3.8".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot keyless");
+        assert_eq!(
+            mock.auth_for("/metrics"),
+            None,
+            "keyless servers must not receive an Authorization header"
+        );
+        assert_eq!(snap.status, VllmStatus::Busy);
+    }
+
+    /// The happy-path snapshot surfaces the parsed queue gauges under the
+    /// verified health with no diagnostic and no notice. Red arms: swapping
+    /// the two queue assignments, hardwiring either gauge to `None`, or
+    /// inventing a diagnostic/notice on the verified path must all go red
+    /// here.
+    #[tokio::test]
+    async fn snapshot_happy_path_surfaces_queue_gauges_without_diagnostics() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mock = models_mock::spawn(&[
+            (
+                "/models",
+                200,
+                r#"{"data":[{"id":"happy-model","max_model_len":131072}]}"#.into(),
+            ),
+            (
+                "/metrics",
+                200,
+                "vllm:num_requests_running 2\n\
+                 vllm:num_requests_waiting 1\n\
+                 vllm:prefix_cache_hits_total 30\n\
+                 vllm:prefix_cache_queries_total 40\n"
+                    .into(),
+            ),
+        ]);
+        let snap = snapshot_for_model_config(
+            &mock.base_url,
+            Some("happy-model".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("a local target yields a snapshot");
+        assert_eq!(snap.status, VllmStatus::Busy, "running=2 is Busy");
+        assert_eq!(snap.num_requests_running, Some(2.0));
+        assert_eq!(snap.num_requests_waiting, Some(1.0));
+        assert_eq!(snap.health_status, HealthStatus::Verified);
+        assert!(snap.diagnostic.is_none(), "verified carries no diagnostic");
+        assert!(
+            snap.notices.is_empty(),
+            "a listed window over a served /metrics must carry no notices: {:?}",
+            snap.notices
+        );
+    }
+
+    /// The snapshot wiring sums multi-engine `/metrics` series: a
+    /// `data_parallel_size > 1` export must publish the engine-wide queue
+    /// depth and cache counters, not engine 0's series — and the Busy state
+    /// follows the fleet total.
+    #[tokio::test]
+    async fn snapshot_sums_multi_engine_metrics() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mock = models_mock::spawn(&[
+            ("/models", 200, r#"{"data":[{"id":"dp-model"}]}"#.into()),
+            (
+                "/metrics",
+                200,
+                "vllm:num_requests_running{engine=\"0\"} 0\n\
+                 vllm:num_requests_running{engine=\"1\"} 2\n\
+                 vllm:num_requests_waiting{engine=\"0\"} 1\n\
+                 vllm:num_requests_waiting{engine=\"1\"} 1\n\
+                 vllm:prefix_cache_hits_total{engine=\"0\"} 10\n\
+                 vllm:prefix_cache_hits_total{engine=\"1\"} 20\n\
+                 vllm:prefix_cache_queries_total{engine=\"0\"} 40\n\
+                 vllm:prefix_cache_queries_total{engine=\"1\"} 60\n"
+                    .into(),
+            ),
+        ]);
+        let snap = snapshot_for_model_config(
+            &mock.base_url,
+            Some("dp-model".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            snap.status,
+            VllmStatus::Busy,
+            "engine 0 idle + engine 1 busy is Busy for the fleet"
+        );
+        assert_eq!(snap.num_requests_running, Some(2.0));
+        assert_eq!(snap.num_requests_waiting, Some(2.0));
+        assert_eq!(snap.prefix_cache_hits, Some(30.0));
+        assert_eq!(snap.prefix_cache_queries, Some(100.0));
+    }
+
+    /// A /metrics that answers HTTP 200 with a body no vLLM series parses
+    /// must flag itself: the resulting all-None snapshot must not be silently
+    /// readable as "no traffic". (Transport failure and non-200 are pinned by
+    /// the per-branch test below.)
+    #[tokio::test]
+    async fn snapshot_flags_a_metrics_body_with_no_parseable_series() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mock = models_mock::spawn(&[
+            ("/models", 200, r#"{"data":[{"id":"m"}]}"#.into()),
+            ("/metrics", 200, "<html>not prometheus</html>".into()),
+        ]);
+        let snap = snapshot_for_model_config(
+            &mock.base_url,
+            Some("m".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(snap.status, VllmStatus::Ready);
+        assert!(snap.num_requests_running.is_none());
+        let codes: Vec<_> = snap.notices.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.contains(&"metrics_unavailable"),
+            "an HTTP 200 body with no parseable series must flag itself: {codes:?}"
+        );
+    }
+
+    /// A hostname that cannot resolve classifies as `dns_failed`, not
+    /// `connection_refused`: hyper-util wraps resolver failures in its
+    /// Connect kind, so `is_connect()` alone mislabels them (round-2
+    /// adjudication finding). `.invalid` is reserved by RFC 6761 to never
+    /// resolve.
+    #[tokio::test]
+    async fn snapshot_classifies_dns_failures_as_dns_failed() {
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let snap = snapshot_for_model_config(
+            "http://pinvou-monitor-probe.invalid:1",
+            Some("m".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("a local-preset target yields a snapshot even when unresolvable");
+        let diagnostic = snap.diagnostic.expect("offline carries a diagnostic");
+        assert_eq!(diagnostic.code, "models_unreachable");
+        assert_eq!(diagnostic.transport, Some("dns_failed"));
+        assert_eq!(
+            diagnostic.endpoint.as_deref(),
+            Some("http://pinvou-monitor-probe.invalid:1")
+        );
+    }
+
+    /// Every branch carries the right structured diagnostic. The offline
+    /// refinement is built from parsed fields, never from reqwest's
+    /// `Display` (which embeds the full request URL): a token-shaped query
+    /// on the base_url must stay out of the snapshot entirely, so replacing
+    /// the endpoint construction with the raw error Display must go red
+    /// here. The other health verdicts (`auth_failed` / `missing_api_key` /
+    /// `unverified` / `mismatch`) are self-describing and carry
+    /// `diagnostic: None` — their producer strings are enum variants now,
+    /// so a typo is a compile error rather than a silent drift (round-2
+    /// audit: the stringly-typed producer could drop the diagnostic with
+    /// zero red tests).
+    #[tokio::test]
+    async fn snapshot_carries_structured_diagnostics_per_health_branch() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Transport error → models_unreachable with the transport class and
+        // the scheme/host/port endpoint; the query never leaks.
+        let refused = snapshot_for_model_config(
+            "http://127.0.0.1:1?token=secret5",
+            Some("m".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("a local target yields a snapshot even when unreachable");
+        assert_eq!(refused.status, VllmStatus::Offline);
+        assert_eq!(refused.health_status, HealthStatus::Offline);
+        let unreachable = refused.diagnostic.expect("offline carries a diagnostic");
+        assert_eq!(unreachable.code, "models_unreachable");
+        assert_eq!(
+            unreachable.transport,
+            Some("connection_refused"),
+            "a refused loopback connect classifies as connection_refused"
+        );
+        assert!(
+            unreachable.http_status.is_none(),
+            "a transport failure carries no HTTP status"
+        );
+        assert_eq!(
+            unreachable.endpoint.as_deref(),
+            Some("http://127.0.0.1:1"),
+            "the endpoint keeps scheme/host/port for diagnosis"
+        );
+        let rendered = format!("{unreachable:?}");
+        assert!(
+            !rendered.contains("secret5") && !rendered.contains("token="),
+            "the diagnostic must not echo the request URL or its query: {rendered}"
+        );
+
+        // Non-success HTTP (not 401/403) → models_http_error with the status.
+        let mock = models_mock::spawn(&[("/models", 500, "boom".into())]);
+        let http_err = snapshot_for_model_config(
+            &mock.base_url,
+            Some("m".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(http_err.health_status, HealthStatus::Offline);
+        let http_diag = http_err
+            .diagnostic
+            .expect("http error carries a diagnostic");
+        assert_eq!(http_diag.code, "models_http_error");
+        assert_eq!(http_diag.http_status, Some(500));
+        assert!(http_diag.transport.is_none());
+
+        // 401 with a key → auth_failed; the verdict is the answer, so no
+        // refinement diagnostic rides along.
+        let mock = models_mock::spawn(&[("/models", 401, "{}".into())]);
+        let auth = snapshot_for_model_config(
+            &mock.base_url,
+            Some("m".to_string()),
+            ModelPreset::LocalVllm,
+            Some("secret"),
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(auth.health_status, HealthStatus::AuthFailed);
+        assert!(
+            auth.diagnostic.is_none(),
+            "auth_failed is self-describing and carries no refinement: {:?}",
+            auth.diagnostic
+        );
+
+        // /metrics missing → metrics_unavailable (a local target classifies
+        // any loopback base, so this fires for a Deepseek-preset model too).
+        let mock = models_mock::spawn(&[(
+            "/models",
+            200,
+            r#"{"data":[{"id":"windowless-model","max_model_len":8192}]}"#.into(),
+        )]);
+        let no_metrics = snapshot_for_model_config(
+            &mock.base_url,
+            Some("windowless-model".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            no_metrics
+                .notices
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>(),
+            ["metrics_unavailable"]
+        );
+
+        // Mismatch → the verdict itself; no refinement diagnostic.
+        let mock = models_mock::spawn(&[
+            ("/models", 200, r#"{"data":[{"id":"served-other"}]}"#.into()),
+            ("/metrics", 200, "".into()),
+        ]);
+        let mismatch = snapshot_for_model_config(
+            &mock.base_url,
+            Some("configured-name".to_string()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(mismatch.health_status, HealthStatus::Mismatch);
+        assert!(
+            mismatch.diagnostic.is_none(),
+            "mismatch is self-describing and carries no refinement"
+        );
+    }
+
+    /// The inferred-window notice fires for local targets too (a listing
+    /// without a window whose native follow-up fails, with a recognizable
+    /// model name) — the message must stay endpoint-neutral. Pins that
+    /// stripping the push or the code must go red.
+    #[tokio::test]
+    async fn snapshot_reports_context_window_inferred_on_local_targets() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mock = models_mock::spawn(&[
+            (
+                "/models",
+                200,
+                r#"{"data":[{"id":"deepseek-v4-pro"}]}"#.into(),
+            ),
+            // Non-Ollama local: the native follow-up stops with the 404.
+            ("/api/ps", 404, "{}".into()),
+            ("/metrics", 200, "".into()),
+        ]);
+        let snap = snapshot_for_model_config(
+            &mock.base_url,
+            Some("deepseek-v4-pro".to_string()),
+            ModelPreset::Deepseek,
+            None,
+            None,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            snap.max_model_len,
+            Some(1_000_000),
+            "the inferred v4 window must reach the display scale"
+        );
+        // The mock's empty 200 /metrics body parses to no series, so the
+        // metrics notice rides alongside; the inferred-window notice is the
+        // second entry (index pinned — a copy of the first notice's code would
+        // pass a `contains` check).
+        let codes: Vec<_> = snap.notices.iter().map(|d| d.code.as_str()).collect();
+        assert_eq!(codes, ["metrics_unavailable", "context_window_inferred"]);
+        let inferred = &snap.notices[1];
+        assert!(
+            inferred.http_status.is_none() && inferred.transport.is_none(),
+            "an inferred-window notice is a plain code, no transport/http detail: {inferred:?}"
+        );
+    }
+
+    /// The display follow-up on a local Ollama endpoint: /api/ps effective
+    /// value wins (fresh, loaded ground truth); an Ollama-shaped ps with no
+    /// entry for the model falls through to /api/show (positively cached for
+    /// the TTL, and misses — no `num_ctx` — cached alike); a non-Ollama-shaped
+    /// ps (404 — vLLM/LM Studio/generic locals) ends the lookup with no
+    /// native follow-up at all. Each segment uses its own model name so the
+    /// shared static cache cannot collide even if the OS reuses a mock port;
+    /// the hit-count pins across two calls run under the crate ENV_LOCK so
+    /// a concurrent cache-clearing core test (same lock) can never wipe an
+    /// entry in between.
+    #[tokio::test]
+    async fn local_native_display_window_ps_then_show_then_stop() {
+        use crate::core::model_endpoint::models_mock;
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Loaded: ps wins, show unqueried.
+        let mock = models_mock::spawn(&[
+            (
+                "/api/ps",
+                200,
+                r#"{"models":[{"name":"loaded-a","context_length":131072}]}"#.into(),
+            ),
+            ("/api/show", 200, r#"{"model_info":{}}"#.into()),
+        ]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("loaded-a"),
+                Some("loaded-a"),
+                None
+            )
+            .await,
+            Some(131_072)
+        );
+        assert_eq!(mock.hits_for("/api/show"), 0);
+        // Ollama-shaped but model not loaded: show fallback (cached).
+        let mock = models_mock::spawn(&[
+            ("/api/ps", 200, r#"{"models":[]}"#.into()),
+            (
+                "/api/show",
+                200,
+                r#"{"parameters":"num_ctx 32768","model_info":{"qwen3.context_length":40960}}"#
+                    .into(),
+            ),
+        ]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("declared-b"),
+                Some("declared-b"),
+                None
+            )
+            .await,
+            Some(32_768)
+        );
+        assert_eq!(
+            mock.hits_for("/api/show"),
+            1,
+            "first poll pays one /api/show"
+        );
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("declared-b"),
+                Some("declared-b"),
+                None
+            )
+            .await,
+            Some(32_768)
+        );
+        assert_eq!(
+            mock.hits_for("/api/show"),
+            1,
+            "the 1 Hz poll must be served from the 60s show cache"
+        );
+        // Not loaded and no num_ctx declaration: the show response only has
+        // the GGUF trained cap (a capability ceiling, not the served
+        // window) — the display stays without a native fact instead of
+        // adopting it, and the miss is cached for the TTL: the 1 Hz poll
+        // must not re-read GGUF metadata every second until the first load.
+        let mock = models_mock::spawn(&[
+            ("/api/ps", 200, r#"{"models":[]}"#.into()),
+            (
+                "/api/show",
+                200,
+                r#"{"model_info":{"qwen3.context_length":131072}}"#.into(),
+            ),
+        ]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("cap-only-c"),
+                Some("cap-only-c"),
+                None
+            )
+            .await,
+            None,
+            "the trained cap must not become the display window"
+        );
+        assert_eq!(
+            mock.hits_for("/api/show"),
+            1,
+            "first poll pays one /api/show for the miss"
+        );
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("cap-only-c"),
+                Some("cap-only-c"),
+                None
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            mock.hits_for("/api/show"),
+            1,
+            "misses are cached for the TTL too — no per-poll /api/show repeat"
+        );
+        // Non-Ollama local (ps 404): lookup stops, no show request.
+        let mock = models_mock::spawn(&[("/api/ps", 404, "{}".into())]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("stopped-d"),
+                Some("stopped-d"),
+                None
+            )
+            .await,
+            None
+        );
+        assert_eq!(mock.hits_for("/api/show"), 0);
+        // Partial roster: the gate declines before any request.
+        let mock = models_mock::spawn(&[(
+            "/api/ps",
+            200,
+            r#"{"models":[{"name":"roster-e","context_length":8}]}"#.into(),
+        )]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("configured"),
+                Some("first-entry"),
+                None
+            )
+            .await,
+            None
+        );
+        assert_eq!(mock.hits_for("/api/ps"), 0);
+    }
+
+    /// New native-display gates (round-3 review): a public base_url saved
+    /// under a local preset gets no native probes (same locality
+    /// classification as the engine route); a configured=None snapshot may
+    /// only follow a single-model roster (multi-model rosters would
+    /// attribute the first entry's window to an unrelated pick); a known
+    /// non-Ollama/LM Studio kind (positive kind cache) skips the native
+    /// fetch entirely.
+    #[tokio::test]
+    async fn local_native_display_window_gates_locality_roster_and_kind() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::core::model_endpoint::models_mock;
+        // Public base_url under a local preset (target_kind forced "local"
+        // by the caller): the locality gate ends the lookup before any
+        // request. Pinned without touching the network: the mock is
+        // loopback-bound, but `::ffff:127.0.0.1` classifies as a non-local
+        // IPv6 literal (the conservative arm of `base_url_uses_local_or_
+        // private`) while still routing to the mock — a hit on the mock
+        // proves the gate ran, so deleting the gate turns both assertions
+        // red (the ps fact would come back and the hit counter moves).
+        let mock = models_mock::spawn(&[(
+            "/api/ps",
+            200,
+            r#"{"models":[{"name":"a","context_length":8}]}"#.into(),
+        )]);
+        let port = mock
+            .base_url
+            .rsplit(':')
+            .next()
+            .expect("mock base_url carries a port");
+        let v4mapped = format!("http://[::ffff:127.0.0.1]:{port}");
+        assert_eq!(
+            local_native_display_window(&v4mapped, None, Some("a"), Some("a"), Some(1)).await,
+            None
+        );
+        assert_eq!(
+            mock.hits_for("/api/ps"),
+            0,
+            "the locality gate must end the lookup before any request"
+        );
+        // configured=None with a multi-model roster: first-entry attribution
+        // would borrow an unrelated model's window — declined before any
+        // request.
+        let mock = models_mock::spawn(&[(
+            "/api/ps",
+            200,
+            r#"{"models":[{"name":"first","context_length":8}]}"#.into(),
+        )]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                None,
+                Some("first"),
+                Some(3) // three listed entries → ambiguous subject
+            )
+            .await,
+            None
+        );
+        assert_eq!(mock.hits_for("/api/ps"), 0);
+        // configured=None with a single-model roster: unambiguous — adopt.
+        let mock = models_mock::spawn(&[
+            (
+                "/api/ps",
+                200,
+                r#"{"models":[{"name":"only","context_length":131072}]}"#.into(),
+            ),
+            ("/api/show", 200, r#"{"model_info":{}}"#.into()),
+        ]);
+        assert_eq!(
+            local_native_display_window(&mock.base_url, None, None, Some("only"), Some(1)).await,
+            Some(131_072)
+        );
+        // A cached non-Ollama/LM Studio kind (vLLM) skips the native fetch:
+        // pre-seed the kind cache by probing the mock as vLLM, then assert
+        // the display pays no /api/ps.
+        let mock = models_mock::spawn(&[
+            (
+                "/v1/models",
+                200,
+                r#"{"data":[{"id":"m","owned_by":"vllm","max_model_len":4096}]}"#.into(),
+            ),
+            (
+                "/api/ps",
+                200,
+                r#"{"models":[{"name":"m","context_length":8}]}"#.into(),
+            ),
+        ]);
+        crate::core::model_endpoint::probe_local_server_kind(&mock.base_url, None).await;
+        assert_eq!(
+            local_native_display_window(&mock.base_url, None, Some("m"), Some("m"), Some(1)).await,
+            None,
+            "a known vLLM kind takes its window from the listing, not a native follow-up"
+        );
+        assert_eq!(mock.hits_for("/api/ps"), 0);
+        // The vLLM classification above seeded the shared kind cache with
+        // this mock's live port; clear it under the ENV_LOCK serializer (the
+        // same lock engine-side cache tests hold) so a later test whose mock
+        // reuses the port within the 60s kind TTL cannot inherit the stale
+        // classification and skip its own probe.
+        crate::core::model_endpoint::clear_probe_kind_cache();
+    }
+
+    /// A cached LM Studio kind routes the display follow-up to the v0
+    /// served-window API, not the Ollama ps probe: dropping the dispatch
+    /// arm would send LM Studio targets to a doomed 404 `/api/ps` and the
+    /// served window (#726's 12918-vs-131072 shape) would never display.
+    #[tokio::test]
+    async fn local_native_display_window_uses_lmstudio_served_api() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::core::model_endpoint::models_mock;
+        let mock = models_mock::spawn(&[
+            (
+                "/api/v0/models",
+                200,
+                r#"{"data":[{"id":"m","state":"loaded","max_context_length":131072,"loaded_context_length":12918}]}"#
+                    .into(),
+            ),
+            (
+                "/api/ps",
+                200,
+                r#"{"models":[{"name":"m","context_length":8}]}"#.into(),
+            ),
+        ]);
+        // Seed the kind cache through the real classification (the v0
+        // signature is LM Studio's; the battery never dials /api/ps).
+        crate::core::model_endpoint::probe_local_server_kind(&mock.base_url, None).await;
+        assert_eq!(
+            local_native_display_window(&mock.base_url, None, Some("m"), Some("m"), Some(1)).await,
+            Some(12_918),
+            "the served window, fetched from the v0 API the kind selects"
+        );
+        assert_eq!(
+            mock.hits_for("/api/ps"),
+            0,
+            "the LmStudio arm must not fall through to the Ollama ps probe"
+        );
+        // Same cross-test hygiene as the vLLM-kind gate test: the LM Studio
+        // classification seeded the shared kind cache with this mock's live
+        // port — clear it under ENV_LOCK so a port-reusing later test cannot
+        // inherit the stale kind.
+        crate::core::model_endpoint::clear_probe_kind_cache();
+    }
+
+    /// A hand-typed tagless configured name against a single-model Ollama
+    /// roster: served is the canonical `llama3:latest`, so the attribution
+    /// gate must fold the same canonical form the engine's adoption gate
+    /// does — without the fold the display falls back to preset inference
+    /// while the engine adopts the ps truth (display/engine divergence in
+    /// exactly the motivating hand-typed-name shape).
+    #[tokio::test]
+    async fn local_native_display_window_follows_tagless_single_entry() {
+        use crate::core::model_endpoint::models_mock;
+        let mock = models_mock::spawn(&[
+            (
+                "/api/ps",
+                200,
+                r#"{"models":[{"name":"llama3:latest","context_length":131072}]}"#.into(),
+            ),
+            ("/api/show", 200, r#"{"model_info":{}}"#.into()),
+        ]);
+        assert_eq!(
+            local_native_display_window(
+                &mock.base_url,
+                None,
+                Some("llama3"),
+                Some("llama3:latest"),
+                Some(1)
+            )
+            .await,
+            Some(131_072),
+            "the tagless configured name must follow its own canonical ps entry"
+        );
+        assert_eq!(
+            mock.hits_for("/api/show"),
+            0,
+            "the ps fact wins; the show fallback stays unqueried"
+        );
+    }
+
+    /// The same fold at the listing-match level: a tagless configured name
+    /// must find its canonical entry wherever it sits in the roster —
+    /// served degrading to the first (unrelated) entry used to refuse the
+    /// whole follow-up even with a tag-tolerant attribution gate.
+    #[test]
+    fn parse_models_response_folds_ollama_tagless_names() {
+        let (served, window) = parse_models_response(
+            serde_json::json!({
+                "data": [{"id": "deepseek-r1:14b"}, {"id": "llama3:latest"}]
+            }),
+            Some("llama3"),
+        )
+        .expect("a well-formed listing parses");
+        assert_eq!(
+            served.as_deref(),
+            Some("llama3:latest"),
+            "the tagless configured name must match its canonical entry, not the first entry"
+        );
+        assert_eq!(window, None, "Ollama listings carry no window fact");
+    }
+
+    /// The snapshot wiring end to end: a local (LocalVllm-preset) target
+    /// whose `/v1/models` listing carries no window must reach the native
+    /// follow-up through the real `snapshot_for_model_config` glue — the
+    /// `listed_entries` extraction, the served-vs-configured threading, and
+    /// the `target_kind == "local" && max_model_len.is_none()` trigger —
+    /// and land the `/api/ps` fact on the snapshot's display window. A
+    /// listing that already carries the window (a real vLLM) must never dial
+    /// the native API. Every gate test above calls
+    /// `local_native_display_window` directly; this one pins its call site.
+    #[tokio::test]
+    async fn snapshot_wiring_drives_native_display_window() {
+        use crate::core::model_endpoint::models_mock;
+        // The snapshot's listing leg requests `{base}/models`
+        // (`models_probe_url` deliberately never appends `/v1`).
+        let mock = models_mock::spawn(&[
+            (
+                "/models",
+                200,
+                r#"{"data":[{"id":"wiring-e2e-model"}]}"#.into(),
+            ),
+            (
+                "/api/ps",
+                200,
+                r#"{"models":[{"name":"wiring-e2e-model","context_length":131072}]}"#.into(),
+            ),
+            ("/api/show", 200, r#"{"model_info":{}}"#.into()),
+            ("/metrics", 200, "".into()),
+        ]);
+        let snapshot = snapshot_for_model_config(
+            &mock.base_url,
+            Some("wiring-e2e-model".into()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("a local target yields a snapshot");
+        assert_eq!(
+            mock.hits_for("/api/ps"),
+            1,
+            "the follow-up must run exactly once per snapshot"
+        );
+        assert_eq!(
+            snapshot.max_model_len,
+            Some(131_072),
+            "the native fact must reach the display window through the snapshot wiring"
+        );
+        // A listing that already carries the window ends the lookup before
+        // the native follow-up (a real vLLM deployment must not be probed
+        // with the Ollama API).
+        let listed = models_mock::spawn(&[
+            (
+                "/models",
+                200,
+                r#"{"data":[{"id":"wiring-e2e-listed","max_model_len":262144}]}"#.into(),
+            ),
+            ("/metrics", 200, "".into()),
+        ]);
+        let snapshot = snapshot_for_model_config(
+            &listed.base_url,
+            Some("wiring-e2e-listed".into()),
+            ModelPreset::LocalVllm,
+            None,
+            None,
+        )
+        .await
+        .expect("a local target yields a snapshot");
+        assert_eq!(snapshot.max_model_len, Some(262_144));
+        assert_eq!(
+            listed.hits_for("/api/ps"),
+            0,
+            "a listed window must skip the native follow-up entirely"
+        );
     }
 
     /// A user-declared window (cloud; probe value 131072 from a gateway list):
@@ -1037,6 +2188,11 @@ mod tests {
             "user-picked",
             "first-downloaded"
         ));
+        // Case-differing names are NOT an exact match: the gate must stay
+        // case-sensitive even though the display matching folds ASCII case
+        // (loosening this silently changes which routes adopt probed /
+        // native windows — pin the divergence).
+        assert!(!adopts_probed_facts(false, "user-picked", "User-Picked"));
     }
 
     #[test]
@@ -1062,6 +2218,111 @@ mod tests {
     fn prom_metric_returns_none_for_missing() {
         let text = "some_other_metric 1.0";
         assert!(parse_prom_metric(text, "vllm:num_requests_running").is_none());
+    }
+
+    /// Prometheus exports `NaN` / `+Inf` for degenerate series and Rust's
+    /// f64 FromStr accepts both spellings; they are not measurements. The
+    /// parser must skip them and keep scanning — a later finite series of
+    /// the same name wins, an all-degenerate family yields None.
+    #[test]
+    fn prom_metric_skips_non_finite_values() {
+        let text = "vllm:prefix_cache_hits_total NaN\n\
+                    vllm:prefix_cache_hits_total{engine=\"0\"} 5.0\n";
+        assert_eq!(
+            parse_prom_metric(text, "vllm:prefix_cache_hits_total"),
+            Some(5.0)
+        );
+        let text = "vllm:prefix_cache_hits_total{engine=\"0\"} +Inf\n";
+        assert_eq!(
+            parse_prom_metric(text, "vllm:prefix_cache_hits_total"),
+            None
+        );
+    }
+
+    /// With `data_parallel_size > 1` vLLM exports one series per `engine`
+    /// label; every metric consumed here is additive, so the parser must sum
+    /// the series — returning the first would publish engine 0 only. Also
+    /// pins that a `_created` sibling never joins a sum and that a non-finite
+    /// series is skipped, not summed and not fatal.
+    #[test]
+    fn prom_metric_sums_series_across_engine_labels() {
+        let text = "vllm:num_requests_running{engine=\"0\",model_name=\"m\"} 3\n\
+                    vllm:num_requests_running{engine=\"1\",model_name=\"m\"} 2\n\
+                    vllm:num_requests_waiting{engine=\"0\"} 0\n\
+                    vllm:num_requests_waiting{engine=\"1\"} 4\n\
+                    vllm:prefix_cache_hits_total_created 1.7e9\n\
+                    vllm:prefix_cache_hits_total{engine=\"0\"} 30\n\
+                    vllm:prefix_cache_hits_total{engine=\"1\"} 10\n\
+                    vllm:prefix_cache_queries_total{engine=\"0\"} NaN\n\
+                    vllm:prefix_cache_queries_total{engine=\"1\"} 7\n";
+        assert_eq!(
+            parse_prom_metric(text, "vllm:num_requests_running"),
+            Some(5.0)
+        );
+        assert_eq!(
+            parse_prom_metric(text, "vllm:num_requests_waiting"),
+            Some(4.0)
+        );
+        assert_eq!(
+            parse_prom_metric(text, "vllm:prefix_cache_hits_total"),
+            Some(40.0),
+            "the _created sibling must never join the sum"
+        );
+        assert_eq!(
+            parse_prom_metric(text, "vllm:prefix_cache_queries_total"),
+            Some(7.0),
+            "a non-finite series is skipped, not summed"
+        );
+    }
+
+    /// A labels block that never closes (truncated body) must cost only its
+    /// own line, and a `}` inside a quoted label value must not be mistaken
+    /// for the block end.
+    #[test]
+    fn prom_metric_skips_malformed_lines_without_aborting_the_scan() {
+        let truncated = "vllm:num_requests_running{engine=\"0\" 3\n\
+             vllm:num_requests_running{engine=\"1\"} 2\n";
+        assert_eq!(
+            parse_prom_metric(truncated, "vllm:num_requests_running"),
+            Some(2.0),
+            "one malformed line must not void the later series"
+        );
+        let quoted = "vllm:num_requests_running{model_name=\"a}b\"} 4\n\
+                      vllm:num_requests_running{model_name=\"c\"} 1\n";
+        assert_eq!(
+            parse_prom_metric(quoted, "vllm:num_requests_running"),
+            Some(5.0),
+            "a quoted '}}' is part of the label value, not the block end"
+        );
+    }
+
+    /// Name boundary: a longer metric sharing the prefix must never pass as
+    /// this metric's reading. Real vLLM exports carry
+    /// `vllm:num_requests_waiting_by_reason` (gauge, >= v0.20) and a
+    /// `<name>_created` timestamp series for every counter; both labeled and
+    /// labelless shapes are pinned. Removing the boundary check together with
+    /// taking the last token instead of the first must go red here (the
+    /// timestamp token would be summed as a counter value).
+    #[test]
+    fn prom_metric_name_boundary_rejects_prefix_extensions() {
+        let text = "vllm:num_requests_waiting_by_reason{engine=\"0\",reason=\"capacity\"} 7.0\n\
+                    vllm:num_requests_waiting{engine=\"0\"} 3.0\n\
+                    vllm:prefix_cache_hits_total_created{engine=\"0\"} 1.7654321e+09\n\
+                    vllm:prefix_cache_hits_total{engine=\"0\"} 30.0\n\
+                    vllm:prefix_cache_queries_total_created 1.7654321e+09\n\
+                    vllm:prefix_cache_queries_total 40.0\n";
+        assert_eq!(
+            parse_prom_metric(text, "vllm:num_requests_waiting"),
+            Some(3.0)
+        );
+        assert_eq!(
+            parse_prom_metric(text, "vllm:prefix_cache_hits_total"),
+            Some(30.0)
+        );
+        assert_eq!(
+            parse_prom_metric(text, "vllm:prefix_cache_queries_total"),
+            Some(40.0)
+        );
     }
 
     /// 2026-06-10 本机 vLLM nightly(NVFP4) /metrics 实抓片段（TTFT 相关行）。
@@ -1090,6 +2351,11 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
 
     /// 运行状态上下文长度推断：覆盖设置页全部云端模型（2026-07 逐厂商核实，
     /// 依据为仓库 catalog + 底座启发式 + 各厂商官方文档，见 pinvou_known_context_window 注释）。
+    /// Exemptions: aggregator org-prefixed ids and the per-deployment context
+    /// figures behind self-hosted Coding Plan gateways are not mirrored one by
+    /// one (see the aggregator/Coding Plan group comments in model-catalog.js);
+    /// such ids not covered by the base chain fall to the preset fallback and
+    /// are pinned at the fallback values below.
     #[test]
     fn infer_context_window_cloud_models() {
         let cases: &[(ModelPreset, &str, u32)] = &[
@@ -1105,8 +2371,12 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
             (ModelPreset::Kimi, "kimi-k2.7-code", 262_144),
             (ModelPreset::Kimi, "kimi-k2.7-code-highspeed", 262_144),
             (ModelPreset::Kimi, "kimi-k2.6", 262_144),
-            // Kimi Coding Plan 走 openai_compatible 预设
-            (ModelPreset::OpenaiCompatible, "kimi-for-coding", 262_144),
+            // The Kimi Coding Plan rides the openai_compatible preset. Bare
+            // kimi-for-coding serves K2.8 Preview since 2026-09 (officially
+            // 1M on every plan tier), corrected by the PINVOU_OVERRIDES entry;
+            // the highspeed variant stays on K2.7 Code HighSpeed's 256K and
+            // must keep outranking it in the override table.
+            (ModelPreset::OpenaiCompatible, "kimi-for-coding", 1_048_576),
             (
                 ModelPreset::OpenaiCompatible,
                 "kimi-for-coding-highspeed",
@@ -1117,33 +2387,89 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
             (ModelPreset::OpenaiCompatible, "k3-256k", 262_144),
             (ModelPreset::OpenaiCompatible, "k3", 262_144),
             // GLM: 5.2 / 5.3 are 1M, 5.1/5-turbo are 202,752, 4.7 is officially 200K
+            (ModelPreset::Glm, "glm-5.3-flashx", 1_000_000),
             (ModelPreset::Glm, "glm-5.2", 1_000_000),
             (ModelPreset::Glm, "glm-5.3", 1_000_000),
             (ModelPreset::Glm, "glm-5.1", 202_752),
             (ModelPreset::Glm, "glm-5-turbo", 202_752),
             (ModelPreset::Glm, "glm-4.7", 204_800),
-            // MiniMax：M3 是 1M，M2.x 全系 204,800
+            // MiniMax: M3 is 1M, the whole M2.x family is 204,800 (carried
+            // over from the 2026-09-11 verification; current official pages
+            // no longer publish per-model context figures for M2.x)
             (ModelPreset::Minimax, "MiniMax-M3", 1_000_000),
+            // M3.1 Flash Preview (2026-09-26) is 1M; the exact "MiniMax-M3"
+            // spelling cannot suffix-match the m3.1 wire id.
+            (
+                ModelPreset::Minimax,
+                "MiniMax-M3.1-Flash-Preview",
+                1_000_000,
+            ),
             (ModelPreset::Minimax, "MiniMax-M2.7", 204_800),
             (ModelPreset::Minimax, "MiniMax-M2.7-highspeed", 204_800),
             (ModelPreset::Minimax, "MiniMax-M2.5", 204_800),
             (ModelPreset::Minimax, "MiniMax-M2.5-highspeed", 204_800),
-            // MiMo：v2.5 全系 1M
+            // MiMo: the v2.5 family is 1M; v2.6 (2026-09-22 default) is 1M
+            // as well, carried by the core::model_context supplemental table
+            // (the base has no v2.6 rows)
             (ModelPreset::Mimo, "mimo-v2.5-pro", 1_000_000),
             (ModelPreset::Mimo, "mimo-v2.5", 1_000_000),
+            (ModelPreset::Mimo, "mimo-v2.6-pro", 1_000_000),
+            (ModelPreset::Mimo, "mimo-v2.6-flash", 1_000_000),
+            (ModelPreset::Mimo, "mimo-v2.6-pro-ultraspeed", 1_000_000),
             // Qwen：3.7 全系 / 3.6-flash 均 1M
             (ModelPreset::Qwen, "qwen3.7-plus", 1_000_000),
             (ModelPreset::Qwen, "qwen3.7-max", 1_000_000),
             (ModelPreset::Qwen, "qwen3.7-flash", 1_000_000),
             (ModelPreset::Qwen, "qwen3.6-flash", 1_000_000),
-            // Doubao: evolving is already 1M; the 2.x family is officially 256k
-            // (volcengine 1330310, checked 2026-09-12), carried by the
-            // core::model_context supplemental table — the base has no doubao
-            // rows, and without the supplemental table the engine side falls to
-            // 128K, diverging from the monitor page
+            // New Token Plan rows (auto / the 0813 snapshot / v4.1-flash) and
+            // legacy/unmatched ids (qwen3-coder-plus / qwen3-coder-next left
+            // the Qwen Coding Plan group on 2026-10-13; the only remaining
+            // bare glm-5 row is the Alibaba Coding Plan group, and no
+            // GLM-preset group lists it): ids not covered by the base chain
+            // fall to the Qwen preset fallback (131,072). The bare deepseek
+            // rows ride the base v4 heuristic; the vendor-prefixed
+            // deepseek/deepseek-flash spelling lacks the "v4" substring, so
+            // it is anchored in core::model_context instead.
+            (ModelPreset::Qwen, "auto", 131_072),
+            (ModelPreset::Qwen, "deepseek-v4-pro-0813", 1_000_000),
+            (ModelPreset::Qwen, "deepseek-v4.1-flash", 1_000_000),
+            // The 2026-10-13 Token Plan additions: the current primary
+            // deepseek spellings ride the same base v4 heuristic (the -0813
+            // alias above stays pinned), the vendor-prefixed
+            // deepseek/deepseek-flash is anchored in core::model_context
+            // (no "v4" substring, no vendor-prefix tolerance), and
+            // mimo-v2.6-flash rides the core::model_context supplemental
+            // table — pinned here so the settings-page rows stay covered by
+            // this charter.
+            (ModelPreset::Qwen, "deepseek-v4-pro-202606", 1_000_000),
+            (ModelPreset::Qwen, "deepseek-v4-flash-202605", 1_000_000),
+            (ModelPreset::Qwen, "deepseek/deepseek-flash", 1_000_000),
+            (ModelPreset::Qwen, "mimo-v2.6-flash", 1_000_000),
+            (ModelPreset::Qwen, "qwen3.6-plus", 131_072),
+            (ModelPreset::Qwen, "qwen3-coder-plus", 131_072),
+            (ModelPreset::Qwen, "qwen3-coder-next", 131_072),
+            (ModelPreset::Qwen, "glm-5", 131_072),
+            // The 2026-10-13 Alibaba Coding Plan addition rides the
+            // PINVOU_KNOWN row (officially 1M; listed here so the
+            // settings-page row is covered by this charter too, same as the
+            // opus-5-5 precedent below).
+            (ModelPreset::Qwen, "qwen3.5-plus", 1_000_000),
+            // Doubao: evolving is already 1M; the 2-1 -260628 generation and
+            // the 2-0 snapshots are officially 256k, while the -260915
+            // snapshots moved to 1024k (volcengine 1330310, re-checked
+            // 2026-09-28), carried by the core::model_context supplemental
+            // table — the base has no doubao rows, and without the
+            // supplemental table the engine side falls to 128K, diverging
+            // from the monitor page
             (ModelPreset::Doubao, "doubao-seed-evolving", 1_048_576),
             (ModelPreset::Doubao, "doubao-seed-2-1-pro-260628", 262_144),
             (ModelPreset::Doubao, "doubao-seed-2-1-turbo-260628", 262_144),
+            (ModelPreset::Doubao, "doubao-seed-2-1-pro-260915", 1_048_576),
+            (
+                ModelPreset::Doubao,
+                "doubao-seed-2-1-lite-260915",
+                1_048_576,
+            ),
             (
                 ModelPreset::Doubao,
                 "doubao-seed-2-0-code-preview-260215",
@@ -1151,12 +2477,51 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
             ),
             (ModelPreset::Doubao, "doubao-seed-2-0-pro-260215", 262_144),
             (ModelPreset::Doubao, "doubao-seed-2-0-lite-260428", 262_144),
+            // Ark Coding Plan dot spellings (same underlying models, plan
+            // model list) ride their own supplemental rows.
+            (
+                ModelPreset::OpenaiCompatible,
+                "doubao-seed-2.1-pro",
+                1_048_576,
+            ),
+            (
+                ModelPreset::OpenaiCompatible,
+                "doubao-seed-2.0-mini",
+                262_144,
+            ),
+            (
+                ModelPreset::OpenaiCompatible,
+                "kimi-k2.8-preview",
+                1_048_576,
+            ),
+            // Remaining Ark Coding Plan rows: the lite dot spelling rides its
+            // supplemental row; glm-5.3-flash / deepseek-v4.1-flash go through
+            // the base exact row and the v4 heuristic; ark-code-latest is the
+            // Auto shell model with no official per-model context figure, so
+            // both sides keep the conservative fallback (the disclosed gateway
+            // pattern: engine 128K / monitor page 131,072).
+            (
+                ModelPreset::OpenaiCompatible,
+                "doubao-seed-2.1-lite",
+                1_048_576,
+            ),
+            (ModelPreset::OpenaiCompatible, "glm-5.3-flash", 1_000_000),
+            (
+                ModelPreset::OpenaiCompatible,
+                "deepseek-v4.1-flash",
+                1_000_000,
+            ),
+            (ModelPreset::OpenaiCompatible, "ark-code-latest", 131_072),
             // OpenAI 兼容示例：gpt-5.6 全系 1.05M
             (ModelPreset::OpenaiCompatible, "gpt-5.6-terra", 1_050_000),
             (ModelPreset::OpenaiCompatible, "gpt-5.6-luna", 1_050_000),
             (ModelPreset::OpenaiCompatible, "gpt-5.6-sol", 1_050_000),
             // xAI: the base known table lists grok-4.6 / grok-4.5 at 500K (checked 2026-09-11)
             (ModelPreset::Xai, "grok-4.6", 500_000),
+            // grok-4.7 (September 2026 default) is 500K per the release
+            // notes; the base has no row yet, filled by the
+            // core::model_context supplemental table.
+            (ModelPreset::Xai, "grok-4.7", 500_000),
             // The base known table still records grok-4.20-0309-* as 2M; the
             // core::model_context override table corrects it first to the 1M
             // re-checked from docs.x.ai on 2026-09-11 (matching the catalog desc).
@@ -1176,7 +2541,18 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
             // figures (the engine-side resolved was None → 128K, diverging from
             // the monitor page fallback).
             (ModelPreset::Openai, "gpt-6-astra", 1_050_000),
+            // The 2026-09-28 listing rows: same anchor logic as astra (no
+            // base gpt-6 row); official 1,050,000 per their model pages.
+            (ModelPreset::Openai, "gpt-6-sol", 1_050_000),
+            (ModelPreset::Openai, "gpt-6-luna", 1_050_000),
             (ModelPreset::Gemini, "gemini-3.8-flash", 1_048_576),
+            // The 2026-10-13 GA flagship joins the catalog: the base gemini
+            // exact rows stop at 3.7/3.1 (no gemini-4 row), so the
+            // core::model_context override table fills it in — official
+            // unified 1M context (ai.google.dev gemini-4-argon model page,
+            // checked 2026-10-14); listed here so the settings-page row is
+            // covered by this charter too.
+            (ModelPreset::Gemini, "gemini-4-argon", 1_048_576),
             // Anthropic models covered by the base catalog (haiku 200K) and the
             // PINVOU_OVERRIDES entries (opus-5 / fable-5-1 both 1M) go through
             // resolved_context_window; preset fallbacks are covered by the prefs
@@ -1186,6 +2562,17 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
             (ModelPreset::Anthropic, "claude-haiku-4-5", 200_000),
             (ModelPreset::Anthropic, "claude-opus-5", 1_000_000),
             (ModelPreset::Anthropic, "claude-fable-5-1", 1_000_000),
+            // 2026-09-22 default recommendation: rides the claude-opus-5
+            // override row via suffix tolerance (model_context tests pin it;
+            // listed here so the settings-page row is covered by this
+            // charter too).
+            (ModelPreset::Anthropic, "claude-opus-5-5", 1_000_000),
+            // The 2026-10-13 settings rows: both officially 1M (the whole
+            // 5.5 generation, per the models-overview comparison table) via
+            // their PINVOU_OVERRIDES anchors; listed here so the
+            // settings-page rows are covered by this charter too.
+            (ModelPreset::Anthropic, "claude-sonnet-5-5", 1_000_000),
+            (ModelPreset::Anthropic, "claude-haiku-5-5", 1_000_000),
         ];
         for (preset, model, expected) in cases {
             assert_eq!(
@@ -1222,7 +2609,7 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
     /// page displayed 1M for exactly this reason). This test turns "changing a
     /// default must pass the resolution chain" into an explicit gate; the
     /// expected values are the vendor official figures and, together with
-    /// `default_model_matches_vendor_docs_2026_09` and the frontend
+    /// `default_model_matches_vendor_docs_2026_10_13` and the frontend
     /// MODEL_PRESET_DEFS lock tests, form a three-layer default-value defense.
     #[test]
     fn preset_default_models_resolve_engine_context_window() {
@@ -1248,6 +2635,12 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"qwen36_35b_256k\"
             // frontend), but as a default_model() output it must likewise pass
             // the shared resolution entry (base gpt-5.6 exact list → 1.05M).
             (ModelPreset::OpenaiCompatible, 1_050_000),
+            // Since 2026-10-13 the Openai preset default is gpt-6.1-sol —
+            // the (Openai, 1_050_000) row above covers it via the shared
+            // core::model_context override anchor. The openai_responses
+            // custom-endpoint fallback prefills the same id and must resolve
+            // through the same entry.
+            (ModelPreset::OpenaiResponses, 1_050_000),
         ];
         for (preset, expected) in cases {
             let model = preset.default_model();

@@ -12,9 +12,19 @@
 // plan_card 的终态文案存 statusKey（approved/discarded/superseded/historical），
 // 三语文案在渲染层按 key 组装（与 compactPhase 同一约定）。
 
-import { projectDeepSeekConversation, conversationItemsForMode } from '../conversation/deepseek-conversation.js';
+import { projectDeepSeekConversation, conversationItemsForMode, timelineDisplayError } from '../conversation/deepseek-conversation.js';
 import { annotateAgentSpawnGroups } from '../multiagent/spawn-aggregation.mjs';
-import { isInternalRuntimeEnvelopeText, isInternalUserMessage } from '../../shared/internal-message.mjs';
+import { isInternalUserMessage, isKnownInternalMetadataBlock } from '../../shared/internal-message.mjs';
+
+// Native controls are session-owned; bridge state belongs to the separate
+// chat workspace. Only a loaded model whose controls belong to this very
+// session identifies the provider behind an error. During a session handoff
+// (or before controls load) no model attribution is safer than borrowing the
+// previous native session or the chat workspace's default model.
+export function nativeModelServiceContext(sessionId, controlsSessionId, modelId, savedModels) {
+  if (!sessionId || controlsSessionId !== sessionId || !modelId) return null;
+  return { currentSessionModelId: modelId, savedModels };
+}
 
 export function createNativeLane() {
   return {
@@ -128,18 +138,6 @@ function currentTurnStart(lane) {
     if (lane.items[i] && lane.items[i].type === 'user') return i + 1;
   }
   return 0;
-}
-
-/// Unconditional redaction before a bare-string fallback is displayed:
-/// gateway/proxy custom bodies and raw provider messages the gate missed
-/// would still reach system items / red text. Classification may miss,
-/// credentials must not. Returns the input unchanged when the helper is
-/// missing (classic script not loaded), degrading to existing behavior.
-function redactDisplayError(error, options = {}) {
-  if (!error) return error;
-  const helper = globalThis.PinvouModelServiceErrors;
-  if (!helper || typeof helper.redactTechnicalDetail !== 'function') return error;
-  return helper.redactTechnicalDetail(String(error), options.language);
 }
 
 /// Native-lane model-service error bubble, mirroring
@@ -315,9 +313,10 @@ export function applyNativeChatEvent(lane, name, payload, options = {}) {
     case 'chat:user_message': {
       const content = String(p.content || '');
       if (!content) return false;
-      // 内部运行时信封（subagent handoff / background shell 完成等）：与 bridge 实时
-      // 路径一致不上屏；后续 transcript 重载同样会被 hydrate 过滤，两条路径行为对齐。
-      if (isInternalRuntimeEnvelopeText(content)) return false;
+      // Internal runtime messages (subagent handoff / background shell
+      // completion / context update): match the bridge live path and never
+      // render; the transcript reload hydrate filter keeps both paths aligned.
+      if (isInternalUserMessage([{ type: 'text', text: content }])) return false;
       // accept_plan 的用户回声（本地/远端批准都会广播）：先把命中的 active 方案卡
       // 置为已批准（对齐 bridge chat-events.js 的 action === "accept_plan" 处理），
       // 再走普通用户消息去重/插入。
@@ -509,7 +508,7 @@ export function applyNativeChatEvent(lane, name, payload, options = {}) {
       if (!p.error) return false;
       // Bare-string fallbacks are redacted too (gateway/provider bodies
       // the gate missed must not reach the screen with credentials).
-      const displayError = redactDisplayError(p.error, options);
+      const displayError = timelineDisplayError(p.error, { language: options.language });
       // Model-service errors go through the unified
       // classification/redaction/tri-lingual bubble; local tool errors
       // keep the bare-string fallback.
@@ -660,7 +659,7 @@ export function applyNativeChatEvent(lane, name, payload, options = {}) {
         // fallback shares the transient fallback's redacted text so the
         // same-text dedup can hit.
         const timelineTakesOver = Boolean(terminalRecord && terminalRecord.error);
-        const notice = `⚠️ ${redactDisplayError(p.error, options)}`;
+        const notice = `⚠️ ${timelineDisplayError(p.error, { language: options.language })}`;
         const start = currentTurnStart(lane);
         let existing = null;
         for (let i = start; i < lane.items.length; i += 1) {
@@ -717,10 +716,17 @@ function messageText(blocks) {
     .trim();
 }
 
-// 与 src/shared/internal-message.mjs 的内部运行时消息判定同源（bridge 侧的
-// 超集实现见 src/shared/bridge-messages.js）：CodeWhale 内部运行时信封
-// （subagent handoff / background shell 完成等）以 role=user 持久化供父模型
-// 上下文使用，展示层不得渲染为用户气泡。
+function userMessageText(blocks) {
+  return messageText(blocks.filter(block => !(
+    block && block.type === 'text' && isKnownInternalMetadataBlock(block.text)
+  )));
+}
+
+// Same classifier family as src/shared/internal-message.mjs (the classic
+// bridge equivalent lives in src/shared/bridge-messages.js): CodeWhale's
+// internal runtime messages (sub-agent handoff / background shell completion /
+// context update) are persisted as role=user for the parent model's context
+// and must never render as user bubbles.
 
 /// SavedSession messages → lane.items（hydration 是 rerenderFromMessages 的精简版：
 /// 覆盖 user / assistant text / thinking / tool_use+tool_result / request_user_input /
@@ -770,18 +776,20 @@ export function hydrateNativeLane(lane, saved, timelineEvents = []) {
       : (typeof raw === 'string' && raw ? [{ type: 'text', text: raw }] : []);
     if (role === 'user') {
       if (isInternalUserMessage(blocks)) continue; // 内部运行时信封/交接：保留在模型上下文，不上屏
-      const text = messageText(blocks);
+      const text = userMessageText(blocks);
       if (text) lane.items.push({ id: nextId(lane), type: 'user', text });
       for (const block of blocks) {
         if (!block || block.type !== 'tool_result') continue;
         const item = [...lane.items].reverse().find(candidate => (
           candidate && candidate.type === 'tool' && candidate.toolId === block.tool_use_id
         ));
-        if (item) {
-          item.output = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-          item.success = !block.is_error;
-          item.state = 'done';
+        if (!item) {
+          continue;
         }
+
+        item.output = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+        item.success = !block.is_error;
+        item.state = 'done';
       }
       continue;
     }
@@ -798,7 +806,11 @@ export function hydrateNativeLane(lane, saved, timelineEvents = []) {
     for (const block of blocks) {
       if (!block) continue;
       if (block.type === 'text') {
-        textBuf += block.text || '';
+        // Adjacent text blocks are separate markdown blocks: join with a blank
+        // line (same as the shared rerenderFromMessagesCore hydration) so a
+        // table that follows plain text still parses.
+        const blockText = block.text || '';
+        textBuf = textBuf ? `${textBuf}\n\n${blockText}` : blockText;
       } else if (block.type === 'thinking') {
         flushText();
         const reasoning = String(block.thinking || block.text || '');
@@ -857,20 +869,19 @@ export function hydrateNativeLane(lane, saved, timelineEvents = []) {
     }
     flushText();
     // 本条 assistant 消息用过 plan 工具 → 还原一张只读历史方案卡。
-    if (sawPlanTool && (planSnap || todosSnap)) {
-      const snaps = { plan: planSnap, todos: todosSnap };
-      lane.items.push({
-        id: nextId(lane),
-        type: 'plan_card',
-        plan: planSnap,
-        todos: todosSnap,
-        planMarkdown: composeNativePlanMarkdown(snaps),
-        planId: null,
-        cardState: 'frozen',
-        resolved: true,
-        statusKey: 'historical',
-      });
-    }
+    if (!sawPlanTool || (!planSnap && !todosSnap)) continue;
+    const snaps = { plan: planSnap, todos: todosSnap };
+    lane.items.push({
+      id: nextId(lane),
+      type: 'plan_card',
+      plan: planSnap,
+      todos: todosSnap,
+      planMarkdown: composeNativePlanMarkdown(snaps),
+      planId: null,
+      cardState: 'frozen',
+      resolved: true,
+      statusKey: 'historical',
+    });
   }
   // 未被 tool_result 回填的工具卡按失败收尾，避免历史里残留"执行中"。
   for (const item of lane.items) {
@@ -912,15 +923,13 @@ export function hydrateNativeLane(lane, saved, timelineEvents = []) {
 /// lane → ConversationTimeline 使用的 turn 投影。
 export function projectNativeLane(lane, sessionId, options = {}) {
   // legacyConversationOnly items (terminal error bubbles) are filtered
-  // here: the flag is only consumed by conversationItemsForMode, the
-  // native lane has no legacy mode and is always filtered as unified -
-  // otherwise a terminal-upgraded error would show both the bubble and
-  // the timeline error card.
+  // by conversationItemsForMode, so the native lane never shows both
+  // the bubble and the timeline error card.
   // Spawn annotation runs on the projection input, mirroring ChatView:
   // without it the timeline's ToolCard would render one degenerate
   // "spawned 1 agent" count row per spawn call.
   return projectDeepSeekConversation({
-    chatItems: conversationItemsForMode(annotateAgentSpawnGroups(lane ? lane.items : []), true),
+    chatItems: conversationItemsForMode(annotateAgentSpawnGroups(lane ? lane.items : [])),
     busy: Boolean(lane && lane.busy),
     thinking: lane ? lane.thinking : null,
     tokens: lane ? lane.tokens : null,

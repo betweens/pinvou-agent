@@ -7,6 +7,7 @@ import {
   Terminal, Trash2, Upload, X,
 } from '../../components/icons.jsx';
 import { invokeTauri, isTauriAvailable, tauriEvents } from '../../platform/tauri/client.js';
+import { ModalShell } from '../../components/ModalShell.jsx';
 import {
   markAcpModelsProbePending,
   reseedDraftControlsAfterProviderSwitch,
@@ -47,27 +48,35 @@ function KeyDot({ hasCredential, copy }) {
   );
 }
 
-// Confirm card dialog (backdrop click closes + card stopPropagation + right-aligned pill button footer). Two
+// Confirm card dialog (backdrop click closes + right-aligned pill button footer). Two
 // isomorphic sites: provider delete / CLI uninstall; the uninstall "also clean up config" checkbox comes in via
 // children. The confirm callback keeps the caller's semantics: remove/uninstall setXxx(null) before awaiting
 // (confirm closes the dialog, failure lands in the red error area); this component knows nothing of close timing.
+// Built on the shared ModalShell (portal + focus restore + Escape): Esc now closes too, matching
+// the backdrop/cancel paths; dismissal stays available while a confirm is disabled.
 function CardConfirm({ title, desc, children, confirmLabel, cancelLabel, confirmTestId, confirmDisabled, onConfirm, onCancel, width }) {
   return (
-    // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop click-to-close layer; the keyboard path is handled by the cancel button inside the dialog
-    // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer, a non-interactive container
-    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200" onClick={onCancel}>
-      {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling handling */}
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer, a non-interactive container */}
-      <div onClick={event => event.stopPropagation()} className={`${width} rounded-[24px] p-6 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E8EAED]`}>
-        <h3 className="text-[16px] font-semibold">{title}</h3>
-        <p className="mt-2 text-[13px] leading-relaxed opacity-75">{desc}</p>
-        {children || null}
+    <ModalShell
+      zIndexClass="z-[110]"
+      backdropClass="absolute inset-0 cursor-default bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200"
+      backdropLabel={cancelLabel}
+      panelClass={`${width} rounded-[24px] p-6 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E8EAED]`}
+      onCancel={onCancel}
+      title={
+        <>
+          <h3 className="text-[16px] font-semibold">{title}</h3>
+          <p className="mt-2 text-[13px] leading-relaxed opacity-75">{desc}</p>
+        </>
+      }
+      footer={
         <div className="mt-6 flex justify-end gap-2">
           <button type="button" onClick={onCancel} className="h-9 px-4 rounded-full text-[13px] font-semibold border border-black/[0.08] dark:border-white/[0.12]">{cancelLabel}</button>
           <button type="button" data-testid={confirmTestId} onClick={onConfirm} disabled={confirmDisabled} className="h-9 px-4 rounded-full bg-red-500 text-white text-[13px] font-semibold disabled:opacity-50">{confirmLabel}</button>
         </div>
-      </div>
-    </div>
+      }
+    >
+      {children || null}
+    </ModalShell>
   );
 }
 
@@ -76,18 +85,18 @@ function CardConfirm({ title, desc, children, confirmLabel, cancelLabel, confirm
 // content and close handler differ). Children render verbatim inside the card so the
 // pinned testids (acp-provider-export-json etc.) and DOM order survive: the export
 // "select all" button resolves the textarea via closest('div').previousElementSibling,
-// which requires the footer to directly follow the textarea.
+// which requires the footer to directly follow the textarea. Built on the shared
+// ModalShell (portal + focus restore + Escape to close).
 function TransferModalShell({ onClose, children }) {
   return (
-    // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop click-to-close layer; the keyboard path is handled by the close/cancel buttons inside the dialog
-    // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer, a non-interactive container
-    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200" onClick={onClose}>
-      {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling handling */}
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer, a non-interactive container */}
-      <div onClick={event => event.stopPropagation()} className={`w-[min(560px,calc(100vw-24px))] rounded-[24px] p-6 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E8EAED]`}>
-        {children}
-      </div>
-    </div>
+    <ModalShell
+      zIndexClass="z-[110]"
+      backdropClass="absolute inset-0 cursor-default bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200"
+      panelClass="w-[min(560px,calc(100vw-24px))] rounded-[24px] p-6 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E8EAED]"
+      onCancel={onClose}
+    >
+      {children}
+    </ModalShell>
   );
 }
 
@@ -149,6 +158,17 @@ export function ProvidersSection({ t }) {
   // 或重开窗口从缓存恢复。
   const [installLog, setInstallLog] = useState(INSTALL_LOG_CACHE.log);
   const [installPhase, setInstallPhase] = useState(() => INSTALL_LOG_CACHE.phase);
+  // The status this instance last fetched itself after mount, as
+  // { agent, seq }: the cross-mount heal trusts only self-fetched data — a
+  // status snapshot restored from the module cache may predate the current
+  // install's start (carrying the previous install's outcome). seq is the
+  // install-run sequence captured when the fetch was DISPATCHED (not when
+  // it landed): a command event for the active agent bumps the sequence, so
+  // a snapshot issued before an observed run — including one still in
+  // flight when the event arrives — can never satisfy the heal's freshness
+  // check, and the next dispatch after the event re-arms it.
+  const fetchedStatusRef = useRef(null);
+  const installRunSeqRef = useRef(0);
   // 阶段同步进模块缓存：关设置窗口重开后恢复结束态/进行中态展示。
   useEffect(() => {
     INSTALL_LOG_CACHE.phase = installPhase;
@@ -245,6 +265,11 @@ export function ProvidersSection({ t }) {
   activeAgentRef.current = activeAgent; // eslint-disable-line react-hooks/refs -- synchronously mirror the latest activeAgent during render so async callbacks can tell "still the current tab"
   const loadAgent = useCallback(async (agent, recheck = false, quiet = false) => {
     if (!quiet && agent === activeAgentRef.current) setLoading(true);
+    // Capture the install-run sequence at dispatch: a response for a fetch
+    // issued before a run was observed must not re-establish freshness after
+    // that run's command event invalidates it (the snapshot would carry the
+    // previous run's outcome with installing=false).
+    const seqAtDispatch = installRunSeqRef.current;
     try {
       const [nextView, nextStatus] = await Promise.all([
         invokeTauri('list_acp_providers', { agent }),
@@ -256,6 +281,7 @@ export function ProvidersSection({ t }) {
       if (agent === activeAgentRef.current) {
         setView(nextView);
         setStatus(nextStatus);
+        fetchedStatusRef.current = { agent, seq: seqAtDispatch };
       }
     } catch (e) {
       if (agent === activeAgentRef.current) setError(String(e));
@@ -308,12 +334,21 @@ export function ProvidersSection({ t }) {
     };
   }, [activeAgent]);
 
-  // 安装中轮询：installing 期间每 2 秒读一次状态。installing 标志来自后端
-  // 内存里的安装锁，与 CLI 探测无关——用缓存读（不 recheck）+ quiet（不闪
-  // loading），避免每 2 秒真跑一遍 --version 探测造成的页面抖动。
-  // 本地 busy 也触发轮询：安装命令从发起到后端登记安装锁之间有探测延迟，
-  // 靠轮询把 status.installing 接上（取消按钮随之出现）。
-  const installInFlight = installing || busy === 'install:' + activeAgent;
+  // Poll every 2s while installing. The installing flag comes from the
+  // backend install lifecycle (entry through recorded outcome), independent
+  // of CLI probes — read from cache (no recheck) + quiet (no loading flash)
+  // to avoid re-running a --version probe every 2s and jittering the page.
+  // Local busy also arms the poller: between issuing the install command and
+  // the backend registering the install there is probe latency; polling
+  // picks up status.installing (the cancel button appears with it).
+  // An install observed through command events (started at another entrance
+  // while this panel was mounted) may hold a stale status.installing=false,
+  // so the installing phase itself — scoped to the agent whose card is
+  // showing — arms the poller too, until the heal observes that run's own
+  // terminal and the phase leaves installing.
+  const installInFlight = installing
+    || busy === 'install:' + activeAgent
+    || (installPhase === 'installing' && installLog && installLog.agent === activeAgent);
   useEffect(() => {
     if (!installInFlight) return;
     const timer = window.setInterval(() => {
@@ -333,6 +368,13 @@ export function ProvidersSection({ t }) {
         const payload = event.payload || {};
         if (payload.agent !== activeAgentRef.current) return;
         if (payload.kind === 'command') {
+          // A command event means a new install run started — possibly from
+          // another entrance while this panel was mounted. Invalidate status
+          // freshness captured before it: the heal must not consume the
+          // previous run's outcome (a pre-run snapshot shows installing=false
+          // with that outcome), and the next dispatch after this event
+          // re-arms freshness for the new run.
+          installRunSeqRef.current += 1;
           setInstallPhase('installing');
           applyInstallLog({ agent: payload.agent, command: payload.value }); // eslint-disable-line react-hooks/immutability -- applyInstallLog is declared below; the closure is ready by the time event callbacks run
         } else if (payload.value) {
@@ -371,6 +413,49 @@ export function ProvidersSection({ t }) {
       }));
     }
   }, [status, activeAgent]);
+
+  // Cross-mount install heal: while an install runs, this component can be
+  // unmounted (settings panel closed / settings section switched), and
+  // install_acp_agent's terminal state is delivered only to the unmounted
+  // initiator — the "downloading" phase restored from the module cache would
+  // never converge. The backend records the real outcome into
+  // status.install_finished when install_acp_agent wraps up (cleared when the
+  // next install starts), and this instance converges the stalled in-progress
+  // phase from it. Guards map one-to-one to mis-convergence surfaces: busy
+  // match = the initiating instance still converges via its own await, not
+  // here; the log must exist and belong to the active agent (the checking
+  // phase has no log and is not converged here — the phase is switched by the
+  // command event); only a status this instance fetched itself, for this
+  // agent, dispatched after the last observed run start is trusted —
+  // freshness records the install-run sequence captured at dispatch, and a
+  // command event bumps it, so a snapshot from before the current install
+  // (which may carry the previous run's outcome with installing=false)
+  // cannot close the heal; the status must belong to the active agent and
+  // the backend must no longer be installing. The backend guarantees
+  // installing covers the whole lifecycle up to the recorded outcome, so
+  // "!status.installing with an outcome" means this run has wrapped up.
+  useEffect(() => {
+    if (installPhase !== 'installing') return;
+    if (busy === 'install:' + activeAgent) return;
+    if (!installLog || installLog.agent !== activeAgent) return;
+    const fresh = fetchedStatusRef.current;
+    if (!fresh || fresh.agent !== activeAgent || fresh.seq !== installRunSeqRef.current) return;
+    if (!status || status.agent_id !== activeAgent || status.installing) return;
+    const outcome = status.install_finished;
+    if (!outcome) return;
+    // Aligned with the initiating instance's catch branch: on failure
+    // (non-cancelled) echo the error cause recorded in this run's outcome
+    // (same source as the command return value's chain; cancelled stays out
+    // of the red error area).
+    const failureDetail = outcome.ok || outcome.cancelled
+      ? null
+      : String(outcome.error || '').trim() || null;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- same cross-mount restore as the effect above: converge the stale in-progress phase with the outcome already recorded by the backend
+    setInstallPhase(outcome.cancelled ? 'cancelled' : outcome.ok ? 'done' : 'failed');
+    if (failureDetail) {
+      setError(failureDetail);
+    }
+  }, [status, installPhase, busy, activeAgent, installLog]);
 
   useEffect(() => {
     return () => {
@@ -638,7 +723,7 @@ export function ProvidersSection({ t }) {
               className={`rounded-xl px-3 py-2.5 text-[12px] text-red-500 shadow-lg backdrop-blur-md bg-[#FEF2F2]/95 dark:bg-[#2A1A1A]/95`}
             >
               {error}
-              <button type="button" onClick={refresh} className="ml-2 underline">{copy.retry}</button>
+              <button type="button" onClick={() => refresh(true)} className="ml-2 underline">{copy.retry}</button>
             </div>
           )}
           {notice && (
@@ -742,7 +827,7 @@ export function ProvidersSection({ t }) {
         </button>
         <button type="button"
           data-testid="acp-provider-refresh"
-          onClick={refresh}
+          onClick={() => refresh(true)}
           className="h-9 px-3 rounded-full text-[12px] font-medium border border-black/[0.08] dark:border-white/[0.12] inline-flex items-center gap-1.5"
         >
           <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />

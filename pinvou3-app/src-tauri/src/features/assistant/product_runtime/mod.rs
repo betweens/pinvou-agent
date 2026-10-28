@@ -36,6 +36,13 @@ mod headless_bridge_contract_tests;
 pub struct SessionSpec {
     pub session_id: String,
     pub model_selection: Option<EvalModelSelection>,
+    /// Workspace recorded in the new session's `metadata.workspace`. `None`
+    /// keeps the pool's default (bridge) workspace — right for scratch
+    /// sessions. Only the display/binding metadata is affected here; the
+    /// durable `--workspace` binding is a separate sidecar the caller writes
+    /// (see `bind_session_workspace`). Recording the task directory in both
+    /// places keeps the GUI list/detail honest for bound headless sessions.
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 /// 单轮提交输入（产品级，不暴露 Op/EngineConfig）
@@ -264,8 +271,22 @@ impl EnginePoolRuntime {
         self.pool.discard_eval_suite_model(suite);
     }
 
+    pub(crate) fn pin_eval_model_selection(&self, model_id: &str) -> Result<EvalModelSelection> {
+        self.pool.pin_eval_model_selection(model_id)
+    }
+
     pub(crate) async fn close_eval_session_result(&self, session_id: &str) -> Result<()> {
         self.pool.delete_eval_session(session_id).await
+    }
+
+    /// Headless stub-cleanup delete: the durable delete is guarded — under
+    /// the turn gate a record that carries messages is a started transcript
+    /// and is kept (only the engine reclaimed), never destroyed as a stub.
+    #[cfg(any(feature = "benchmark-hooks", test))]
+    pub(crate) async fn delete_headless_stub_session(&self, session_id: &str) -> Result<()> {
+        self.pool
+            .delete_chat_session_if_still_empty(session_id)
+            .await
     }
 
     pub(crate) fn eval_session_execution_root(
@@ -310,7 +331,11 @@ impl EnginePoolRuntime {
     /// 确保会话已创建并就绪
     pub(crate) async fn prepare(&self, spec: &SessionSpec) -> Result<()> {
         self.pool
-            .prepare_eval_session(&spec.session_id, spec.model_selection.as_ref())
+            .prepare_eval_session(
+                &spec.session_id,
+                spec.model_selection.as_ref(),
+                spec.workspace.as_deref(),
+            )
             .await
     }
 
@@ -318,20 +343,14 @@ impl EnginePoolRuntime {
     pub(crate) async fn submit(&self, input: &TurnInput) -> Result<TurnHandle> {
         let turn_id = timing::start_turn(&input.session_id);
         if let Some(policy_id) = input.eval_tool_policy {
-            let policy = match policy_id {
-                eval_tool_policy::EvalToolPolicy::ProductV1 => {
-                    eval_tool_policy::resolve_eval_policy("pinvou-read-only-web/v1")?
-                }
-                eval_tool_policy::EvalToolPolicy::GaiaPublicWebV1 => {
-                    eval_tool_policy::resolve_eval_policy("pinvou-gaia-public-web/v1")?
-                }
-                eval_tool_policy::EvalToolPolicy::GaiaOfflineV1 => {
-                    eval_tool_policy::resolve_eval_policy("pinvou-gaia-offline/v1")?
-                }
+            let policy = eval_tool_policy::resolve_eval_policy(match policy_id {
+                eval_tool_policy::EvalToolPolicy::ProductV1 => "pinvou-read-only-web/v1",
+                eval_tool_policy::EvalToolPolicy::GaiaPublicWebV1 => "pinvou-gaia-public-web/v1",
+                eval_tool_policy::EvalToolPolicy::GaiaOfflineV1 => "pinvou-gaia-offline/v1",
                 eval_tool_policy::EvalToolPolicy::GaiaFinalAnswerOnlyV1 => {
-                    eval_tool_policy::resolve_eval_policy("pinvou-gaia-final-answer-only/v1")?
+                    "pinvou-gaia-final-answer-only/v1"
                 }
-            };
+            })?;
             self.pool
                 .send_eval_user_message(&input.session_id, input.content.clone(), policy)
                 .await?;
@@ -399,13 +418,15 @@ impl EnginePoolRuntime {
         // kept (StopDropInbox).
         self.pool.cancel(session_id, false).await;
     }
+}
 
-    /// 删除本次评测的临时会话（释放引擎资源且不污染用户历史）
-    pub(crate) async fn close(&self, session_id: &str) {
-        if let Err(error) = self.pool.delete_chat_session(session_id).await {
-            eprintln!("[eval] failed to delete temporary session {session_id}: {error:#}");
-        }
-    }
+/// Best-effort note on stderr: Rust ignores SIGPIPE, so a closed stderr
+/// (the headless CLI's `2>&1 | head`) turns a plain `eprintln!` into a
+/// panic (exit 101) that also loses the run report these diagnostics
+/// accompany. A failed note is dropped and the run carries on.
+pub(crate) fn note_stderr(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{message}");
 }
 
 #[cfg(test)]

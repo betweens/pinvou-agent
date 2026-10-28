@@ -1,7 +1,7 @@
 
 # drive +task_result
 
-> **前置条件：** 先阅读 [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) 了解认证、全局参数和安全规则。
+> **前置条件：** 先阅读 [`../../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) 了解认证、全局参数和安全规则。
 
 查询异步任务结果。该 shortcut 聚合了导入、导出、Drive 文件/文件夹移动/删除、Wiki 节点 / 文档迁入 Wiki、Wiki 节点移出 Wiki、Wiki 删除等多种异步任务的结果查询，统一接口方便调用。
 
@@ -10,7 +10,7 @@
 >
 > 此时结果里会额外返回 `permission_grant` 字段，明确说明授权结果：
 > - `status = granted`：当前 CLI 用户已获得该导入结果的可管理权限
-> - `status = skipped`：本地没有可用的当前用户 `open_id`，或最终结果缺少可授权的在线文档目标，因此不会自动授权；可提示用户按 [`lark-shared`](../../lark-shared/SKILL.md) 的按需授权流程（`auth login --scope ...`）完成用户身份登录，再让 AI / agent 继续使用应用身份（bot）授予当前用户权限
+> - `status = skipped`：本地没有可用的当前用户 `open_id`，或最终结果缺少可授权的在线文档目标，因此不会自动授权；可提示用户按 [`lark-shared`](../../lark-shared/SKILL.md) 的按需授权流程完成用户身份登录（命令见 lark-shared，勿在会话内直接执行登录），再让 AI / agent 继续使用应用身份（bot）授予当前用户权限
 > - `status = failed`：导入结果已就绪，但自动授权用户失败；会带上失败原因，并提示稍后重试或继续使用 bot 身份处理该文档
 >
 > `permission_grant.perm = full_access` 表示该资源已授予“可管理权限”。
@@ -263,12 +263,12 @@ lark-cli drive +task_result --scenario import --ticket <IMPORT_TICKET>
 ### 配合 +move 使用
 
 ```bash
-# 1. 移动文件夹（异步操作）
+# 1. 移动文件夹
 lark-cli drive +move --file-token <FOLDER_TOKEN> --type folder --folder-token <TARGET_FOLDER_TOKEN>
-# 若轮询窗口内完成：直接返回 ready=true
+# 已完成时返回 ready=true，无需继续查询
 # 若内置轮询结束仍未完成：返回 ready=false、task_id 和 next_command
 
-# 2. 轮询移动结果
+# 2. 仅在 ready=false 时继续查询
 lark-cli drive +task_result --scenario task_check --task-id <TASK_ID>
 ```
 

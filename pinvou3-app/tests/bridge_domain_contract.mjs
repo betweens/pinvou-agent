@@ -2,32 +2,41 @@ export const desktopBridgeApi = {
   lifecycle: ['init'],
   state: ['get', 'getMany', 'subscribe', 'subscribeMany'],
   platform: ['refreshConnectorAuthGates'],
-  chat: ['cancelGeneration', 'cancelShellTask', 'editQueued', 'getComposerDraft', 'interruptAndSendQueued', 'prefillComposer', 'prioritizeQueued', 'removeQueued', 'retryFirstTurn', 'sendMessage', 'sendMessageToSession', 'setComposerDraft'],
-  voice: ['appendVoiceText', 'cancelVoiceAsrSetup', 'cancelVoiceInput', 'clearVoiceInput', 'closeVoiceAsrSetup', 'installVoiceAsr', 'setVoiceShortcutEnabled', 'startVoiceInput', 'syncVoiceShortcutRecording'],
+  chat: ['cancelGeneration', 'cancelShellTask', 'editQueued', 'getComposerDraft', 'interruptAndSendQueued', 'prefillComposer', 'prioritizeQueued', 'removeQueued', 'restoreTaskDraft', 'retryFirstTurn', 'sendMessage', 'sendMessageToSession', 'setComposerDraft'],
+  auxChat: ['ensure', 'reset', 'send', 'snapshot'],
+  voice: ['abandonVoiceResult', 'appendVoiceText', 'beginVoiceSubmission', 'cancelVoiceAsrSetup', 'cancelVoiceInput', 'clearVoiceInput', 'closeVoiceAsrSetup', 'completeVoiceSubmission', 'dismissVoiceInput', 'getVoiceOperationId', 'hasVoiceSubmissionPending', 'installVoiceAsr', 'setVoiceShortcutEnabled', 'startVoiceInput', 'syncVoiceShortcutRecording'],
   knowledge: ['downloadKbModel', 'kbModelStatus', 'listCollections', 'loadKnowledgeEmbedderAfterFirstFrame', 'mountCollection', 'mountRemoteCollection', 'removeCollection', 'removeRemoteCollection', 'setCollectionEnabled', 'setRemoteCollectionEnabled', 'unmountCollection'],
   scheduled: ['createScheduledTask', 'deleteScheduledTask', 'dismissScheduledTaskError', 'exitScheduledRunChat', 'loadScheduledTaskRecentRuns', 'loadScheduledTasks', 'openScheduledRunChat', 'pauseScheduledTask', 'refreshScheduledTaskData', 'resumeScheduledTask', 'runScheduledTaskNow', 'selectScheduledTask', 'startScheduledTaskChat', 'updateScheduledTask'],
-  sessions: ['archiveSession', 'createNewSession', 'deleteSession', 'exportSessionArchive', 'getSessionWorkspaceBinding', 'pickDraftWorkspace', 'renameSession', 'restoreArchivedSession', 'setDraftWorkspace', 'switchToSession', 'toggleSessionPinned'],
+  sessions: ['archiveSession', 'boundDraftMode', 'createNewSession', 'deleteSession', 'exportSessionArchive', 'getSessionWorkspaceBinding', 'onSessionDeleted', 'pickDraftWorkspace', 'rememberDraftWorkspaceRecent', 'renameSession', 'restoreArchivedSession', 'setDraftWorkspace', 'switchToSession', 'toggleSessionPinned'],
   monitor: ['clearMonitorStats', 'startMonitorPolling', 'stopMonitorPolling'],
-  settings: ['saveSearchSettings', 'saveSearchSettingsAndRestart', 'saveSettings', 'setSelectedPet'],
+
+  settings: ['listBuiltinFeatures', 'saveSearchSettings', 'saveSearchSettingsAndRestart', 'saveSettings', 'setBuiltinFeatureEnabled', 'setGlobalShortcutConfig', 'setSelectedPet'],
   feedback: ['submitFeedback'],
-  vllm: ['bootstrapLocalVllm', 'declineVllmSetup', 'detectLocalVllmSetup', 'dismissVllmSetup', 'discoverLocalVllm'],
+  vllm: ['discoverLocalVllm'],
   multiAgent: ['listSubagentTranscripts', 'readSubagentTranscript'],
   models: ['deleteModel', 'getImageInputCapability', 'loadSessionModel', 'probeLocalServerKind', 'revealModelApiKey', 'saveModel', 'setActiveModel', 'switchModel', 'testImageInputCapability', 'testModelConnection'],
   interaction: ['acceptPlan', 'cancelUserInput', 'confirmCodeYolo', 'discardPlan', 'dismissPinvouReview', 'editLastTurn', 'exitPlanToYolo', 'getCodePermissionPrefs', 'inspectPinvou', 'planStuckGo', 'planStuckReplan', 'resolvePinvouReview', 'setModeLane', 'setMultiAgentMode', 'setPlanModeNext', 'submitUserInput', 'summonPinvou', 'syncModeState', 'toggleSuperPerm'],
   rendering: ['renderMarkdown'],
-  remoteControl: ['getWebRelaySettings', 'refreshRemoteControlQr', 'setWebRelayAddress', 'startRemoteControl', 'stopRemoteControl'],
+  remoteControl: ['refreshRemoteControlQr', 'startRemoteControl', 'stopRemoteControl'],
   artifacts: ['artifactInfo', 'downloadArtifact', 'listDeliverableIndex', 'openArtifactExternal', 'openContainingFolder', 'openScheduledTaskFolder', 'openUserExternalUrl', 'readArtifactImageB64', 'readArtifactText', 'readArtifactThumbnail', 'renderArtifactVisual', 'revealSessionFolder', 'writeArtifactText'],
-  attachments: ['addAttachmentByPath', 'addPasteImage', 'openConversationAttachment', 'pickAndAttach', 'removeAttachment', 'resolveConversationAttachment', 'revealConversationAttachment', 'uploadDeviceFiles'],
-  files: ['pickFeedbackFiles', 'pickFiles', 'pickFolders', 'pickRebindFolder'],
+  attachments: ['addAttachmentByPath', 'addPasteImage', 'addPasteImageFromClipboard', 'openConversationAttachment', 'pickAndAttach', 'removeAttachment', 'resolveConversationAttachment', 'revealConversationAttachment', 'uploadDeviceFiles'],
+  files: [
+    'pickFeedbackFiles',
+    'pickFiles',
+    'pickFolders',
+    'pickManageFolder',
+    'pickRebindFolder',
+    'pickWorkspaceFolder',
+  ],
   personas: ['createPersona', 'deletePersona', 'equipPersona', 'getPersonas', 'loadPersonas', 'postCardCreatorIntro', 'readPersonaBody', 'unequipPersona', 'updatePersona'],
   memory: ['confirmMemoryCandidate', 'deleteMemoryItem', 'ignoreMemoryCandidate', 'loadMemoryOverview', 'loadOrganizeHistory', 'neverMemoryCandidate', 'organizeMemory', 'saveMemoryProfilePatch', 'updateMemoryItem'],
   updater: ['cancelUpdate', 'checkForUpdate', 'downloadAndInstallUpdate', 'restartApp'],
   dependencies: ['checkDependencies', 'installDependencies'],
-  projects: ['createProject', 'deleteProject', 'loadProjects', 'moveSessionToProject', 'rebindWorkspaceRoot', 'renameProject'],
+  projects: ['alignSessionToProject', 'createProject', 'deleteProject', 'ensureFolderProjects', 'loadProjects', 'moveSessionToProject', 'rebindWorkspaceRoot', 'renameProject', 'setNeverMaterialize', 'setPrimaryRoot', 'updateProjectRoots'],
   // Computer use drives the local machine: the desktop backend exposes it, the
   // web surface carries only rejecting stubs (the RPC allowlist excludes the
   // commands entirely, same policy as browser:*).
-  computerUse: ['confirm', 'deny', 'getStatus', 'grant', 'refreshStatus', 'requestPermissions', 'revoke', 'setEnabled', 'stop'],
+  computerUse: ['confirm', 'deny', 'grant', 'permissionStatus', 'refreshStatus', 'requestPermissions', 'revoke', 'setEnabled', 'stop'],
 };
 
 // These methods intentionally depend on desktop lifecycle or local machine
@@ -44,24 +53,49 @@ export const desktopOnlyBridgeApi = {
   // selector.
   // Session archive export writes the local-disk tar.xz via a native save
   // dialog over ~/.pinvou3/sessions; web keeps no local session store.
-  sessions: ['exportSessionArchive', 'pickDraftWorkspace', 'setDraftWorkspace'],
+  // boundDraftMode (round-11 M6) describes the posture a CHAT DRAFT takes
+  // once a workspace pick binds it — the workspace channel itself is
+  // desktop-only, so the web side has no such surface.
+  // rememberDraftWorkspaceRecent (round-18 M3) records the single-entry
+  // picker's pick into the recents list; without the desktop staging channel
+  // there is nothing to record, so it rides the same desktop-only lane.
+  sessions: ['exportSessionArchive', 'pickDraftWorkspace', 'rememberDraftWorkspaceRecent', 'setDraftWorkspace', 'boundDraftMode'],
   // The queued chip's zap-send goes through the foundation EnginePool and needs
   // the Tauri command channel; web has no such backend.
   chat: ['interruptAndSendQueued'],
+  // Clipboard-image paste fallback reads the machine the app window runs on.
+  // In a web relay session that is the remote desktop, not the browser user's
+  // machine — pasting must stay on the browser's own clipboardData there.
+  attachments: ['addPasteImageFromClipboard'],
+  // Builtin feature toggles: the registry read (list_builtin_features) is
+  // lane-agnostic and web-allowed (the session-mention gate in ChatView must
+  // see the host's switch state from a browser too, PR #586);
+  // set_builtin_feature_enabled stays a desktop-only write channel — the
+  // contract hook for future per-feature settings pages, no consumer yet.
   // saveSettingsAndRestart/saveSearchSettingsAndRestart restart the desktop
   // process in place; the web host has no restart channel.
-  settings: ['saveSearchSettingsAndRestart'],
-  // Vendor-edition one-click vLLM bootstrap is a vendor-edition desktop surface: the web capability bit is always
-  // false and the related commands are not in the access-policy allowlist.
-  vllm: ['bootstrapLocalVllm', 'declineVllmSetup', 'detectLocalVllmSetup', 'dismissVllmSetup', 'discoverLocalVllm'],
+  // setGlobalShortcutConfig registers an OS-wide key grab through the desktop
+  // Rust command; a browser has no such backend (the settings section is
+  // hidden behind !isWeb). list_builtin_features left this desktop-only list
+  // in PR #586: the registry read is lane-agnostic now (see above); only the
+  // write channel (set_builtin_feature_enabled) and the OS-wide key grab stay
+  // desktop-only.
+  settings: ['saveSearchSettingsAndRestart', 'setBuiltinFeatureEnabled', 'setGlobalShortcutConfig'],
+
+  // Local vLLM discovery probes loopback services on the desktop host; the web capability bit is always false
+  // and the command is not in the access-policy allowlist.
+  vllm: ['discoverLocalVllm'],
   // In-app upgrade: check/download/install/restart all depend on the local package manager; on the web
   // only the version-number read is available (the appUpdate capability bit is always false).
   updater: ['cancelUpdate', 'checkForUpdate', 'downloadAndInstallUpdate', 'restartApp'],
   // Remote control (desktop web-proxy management) depends on the web_access_* admin commands and is unavailable
   // on the web (the webAccessAdmin capability bit is always false).
-  remoteControl: ['getWebRelaySettings', 'refreshRemoteControlQr', 'setWebRelayAddress', 'startRemoteControl', 'stopRemoteControl'],
+  remoteControl: ['refreshRemoteControlQr', 'startRemoteControl', 'stopRemoteControl'],
   // One-click install of missing dependencies elevates via pkexec apt and is unavailable on the web (the dependencyInstall
-  // capability bit is always false); the re-check (check_dependencies) is shared by both hosts.
+  // capability bit is always false). The check_dependencies command is likewise not web-allowlisted: checkDependencies
+  // stays in the expected list above (the JS facade exists on both hosts), but the Rust command is policy-denied on web,
+  // and the web hides the whole dependency section behind that capability bit — do not move checkDependencies into this
+  // desktop-only list.
   dependencies: ['installDependencies'],
 };
 

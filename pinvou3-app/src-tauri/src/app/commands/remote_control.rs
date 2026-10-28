@@ -112,11 +112,13 @@ impl WebWorkspaceOperation {
 /// session store may embed host paths; folding them keeps Relay responses
 /// controlled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebSessionOperation {
+pub(super) enum WebSessionOperation {
     ListSessions,
     ListArchivedSessions,
     CreateSession,
     LoadSessionChunk,
+    GetOrCreateAuxSession,
+    ResetAuxSession,
 }
 
 impl WebSessionOperation {
@@ -126,6 +128,8 @@ impl WebSessionOperation {
             Self::ListArchivedSessions => "list_archived_sessions",
             Self::CreateSession => "create_session",
             Self::LoadSessionChunk => "load_session_chunk",
+            Self::GetOrCreateAuxSession => "get_or_create_aux_session",
+            Self::ResetAuxSession => "reset_aux_session",
         }
     }
 }
@@ -145,7 +149,7 @@ fn web_operation_result<T, E: std::fmt::Display>(
     })
 }
 
-fn web_session_result<T, E: std::fmt::Display>(
+pub(super) fn web_session_result<T, E: std::fmt::Display>(
     operation: WebSessionOperation,
     result: Result<T, E>,
 ) -> Result<T, String> {
@@ -208,19 +212,11 @@ pub fn web_access_rotate(
     manager.refresh()
 }
 
-/// 桌面专属：查询/设置自定义 Relay 地址。均不进 Web 命令白名单——Relay 指向
+/// 桌面专属：查询自定义 Relay 地址。不进 Web 命令白名单——Relay 指向
 /// 哪台服务器只能由桌面端决定。
 #[tauri::command]
 pub fn web_access_relay_settings(manager: State<'_, RemoteControlManager>) -> RelaySettingsInfo {
     manager.relay_settings()
-}
-
-#[tauri::command]
-pub fn web_access_set_relay(
-    address: String,
-    manager: State<'_, RemoteControlManager>,
-) -> Result<RelaySettingsInfo, String> {
-    manager.set_relay_address(&address)
 }
 
 /// Desktop-only readiness handshake. It is intentionally absent from the Web
@@ -321,10 +317,11 @@ pub fn web_access_list_host_files(
 pub async fn web_access_list_sessions(
     store: State<'_, SessionStore>,
     acp_pool: State<'_, AcpPool>,
+    projects: State<'_, crate::features::projects::ProjectStore>,
 ) -> Result<Vec<super::sessions::SessionListItem>, String> {
     let mut sessions = web_session_result(
         WebSessionOperation::ListSessions,
-        super::sessions::list_sessions(store, acp_pool).await,
+        super::sessions::list_sessions(store, acp_pool, projects).await,
     )?;
     super::sessions::project_session_list_for_web(&mut sessions);
     Ok(sessions)
@@ -352,10 +349,14 @@ pub async fn web_access_create_session(
     app: AppHandle,
     store: State<'_, SessionStore>,
     pool: State<'_, EnginePool>,
+    projects: State<'_, crate::features::projects::ProjectStore>,
 ) -> Result<WebSessionMetadata, String> {
     let metadata = web_session_result(
         WebSessionOperation::CreateSession,
-        super::sessions::create_session(Some(false), None, app, store, pool).await,
+        // Web-side P1 has only temporary / single-root sessions (§9.8): no
+        // keychain, no project-memory writes.
+        super::sessions::create_session(Some(false), None, None, None, app, store, pool, projects)
+            .await,
     )?;
     let transcript_revision = crate::features::sessions::transcript_revision(&[])
         .map_err(|error| format!("create empty transcript revision: {error:#}"))?;
@@ -648,6 +649,19 @@ async fn load_session_chunk_inner(
     })
 }
 
+/// The cancel gate re-uses the mint-side ownership rule
+/// (`manager::is_owned_session_download_id`, the same validator
+/// `begin_web_session_download` issues ids through). The former hand-rolled
+/// check here was laxer (no `download_` prefix, 8-char floor) — behaviorally
+/// nil since `cancel_web_session_download` is a keyed lookup, but two rules
+/// for one token class is drift waiting to happen.
+fn ensure_owned_session_download_id(download_id: &str) -> Result<(), String> {
+    if manager::is_owned_session_download_id(download_id) {
+        return Ok(());
+    }
+    Err("invalid Session download id".into())
+}
+
 /// Idempotently release a browser Session download that did not reach EOF.
 /// This is a separate bounded command because a dropped Relay connection can
 /// leave the desktop-side temporary file alive after the browser has stopped
@@ -660,14 +674,7 @@ pub fn web_access_cancel_session_download(
 ) -> Result<bool, String> {
     crate::features::sessions::validate_session_id(&id)
         .map_err(|error| format!("invalid Session id: {error:#}"))?;
-    if download_id.len() < 8
-        || download_id.len() > 128
-        || !download_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err("invalid Session download id".into());
-    }
+    ensure_owned_session_download_id(&download_id)?;
     manager.cancel_web_session_download(&download_id, &id)
 }
 
@@ -827,11 +834,14 @@ pub async fn web_access_create_session_and_chat(
     )
     .await
     {
-        pool.evict(&session_id).await;
-        let rollback = store
-            .delete(&session_id)
+        // Roll back through the gated, aux-aware pool delete (the same path
+        // delete_session uses): a bare store.delete would leave an aux engine
+        // bound to this session running as a handle-less orphan, and would
+        // skip the turn gate (round-13 M-B).
+        let rollback = pool
+            .delete_chat_session(&session_id)
+            .await
             .map_err(|rollback_error| format!("rollback Session {session_id}: {rollback_error:#}"));
-        pool.forget_session(&session_id);
         // The chat may have already run (possibly past start_turn):
         // process-level residual keys such as the timing queue / pending
         // user input are cleaned uniformly by the SessionPurgedHook fired
@@ -883,6 +893,7 @@ pub async fn web_access_create_codex_acp_session(
     store: State<'_, SessionStore>,
     pool: State<'_, EnginePool>,
     acp_pool: State<'_, AcpPool>,
+    projects: State<'_, crate::features::projects::ProjectStore>,
 ) -> Result<deepseek_tui::session_manager::SessionMetadata, String> {
     let outcome = async {
         // Validate before consuming the one-shot workspace grant. A malformed
@@ -908,10 +919,18 @@ pub async fn web_access_create_codex_acp_session(
             super::codex::create_codex_acp_session_with_workspace_binding(
                 workspace_path,
                 Some(agent_id),
+                // Web workspace authorization channel: single root (the
+                // authorized directory itself), no project-memory writes.
+                None,
+                None,
                 store,
                 pool,
                 acp_pool,
+                projects,
                 workspace_verifier,
+                // Web lane: no Tauri app handle — and project_id is None
+                // here anyway (NotApplicable, nothing to broadcast).
+                None,
             )
             .await
         };
@@ -1312,9 +1331,12 @@ fn project_acp_status_for_web(
     status.login_url = None;
     status.login_code = None;
     status.error = None;
-    // 安装命令行与输出可能含内部镜像源或主机路径，仅桌面端展示。
+    // Install command lines and output may contain internal mirror sources or
+    // host paths, so they are desktop-only; the install outcome's error field
+    // is an error chain too and is stripped alongside `error`.
     status.install_command = None;
     status.install_latest_line = None;
+    status.install_finished = None;
     status
 }
 
@@ -1322,15 +1344,15 @@ fn project_acp_status_for_web(
 pub async fn web_access_list_codex_acp_sessions(
     store: State<'_, SessionStore>,
     acp_pool: State<'_, AcpPool>,
+    projects: State<'_, crate::features::projects::ProjectStore>,
 ) -> Result<Vec<crate::app::commands::codex::CodexAcpSessionListItem>, String> {
-    let outcome = super::codex::list_codex_acp_sessions_for_web(&store, &acp_pool).await;
+    let outcome = super::codex::list_codex_acp_sessions_for_web(&store, &acp_pool, &projects).await;
     web_acp_result(WebAcpOperation::ListSessions, outcome)
 }
 
 #[tauri::command]
-pub async fn web_access_list_acp_agents(
-    _acp_pool: State<'_, AcpPool>,
-) -> Result<Vec<crate::features::codex_acp::AcpAgentDescriptor>, String> {
+pub async fn web_access_list_acp_agents()
+-> Result<Vec<crate::features::codex_acp::AcpAgentDescriptor>, String> {
     let outcome = super::codex::list_acp_agents_for_pool().await;
     web_acp_result(WebAcpOperation::ListAgents, outcome)
 }
@@ -1532,7 +1554,13 @@ pub fn web_access_read_artifact_chunk(
 pub async fn web_access_update_settings(
     patch: super::settings::WebSettingsPatch,
 ) -> Result<UserPrefs, String> {
-    super::settings::persist_web_settings(patch)
+    // Round-51 review: the settings transaction holds the cross-process
+    // settings.json.lock across keychain I/O — join the blocking body on a
+    // spawn_blocking worker like the desktop settings commands.
+    super::settings::join_blocking("web_access_update_settings", move || {
+        super::settings::persist_web_settings(patch)
+    })
+    .await
 }
 
 fn scoped_artifact_path(
@@ -1636,12 +1664,32 @@ pub async fn web_access_render_artifact_visual(
 mod tests {
     use super::{
         WebAcpOperation, WebSavedSession, WebSessionMetadata, WebSessionOperation,
-        WebWorkspaceOperation, ensure_web_chat_session_supported, web_acp_agent_id, web_acp_result,
-        web_artifact_storage_path, web_session_result, web_workspace_result,
+        WebWorkspaceOperation, ensure_owned_session_download_id, ensure_web_chat_session_supported,
+        web_acp_agent_id, web_acp_result, web_artifact_storage_path, web_session_result,
+        web_workspace_result,
     };
     use deepseek_tui::session_manager::{SavedSession, create_saved_session};
     use serde_json::{Value, json};
     use std::path::Path;
+
+    #[test]
+    fn cancel_download_gate_uses_the_mint_side_ownership_rule() {
+        // The gate must accept exactly what `begin_web_session_download` mints
+        // (`download_` prefix + ≥1 body char, ≤128, opaque alphabet) and
+        // reject the shapes the old hand-rolled command gate still let
+        // through (bare alnum id without the prefix, prefix-only id).
+        assert!(ensure_owned_session_download_id("download_abc123").is_ok());
+        assert!(ensure_owned_session_download_id("download_AbC-1_xY9").is_ok());
+        assert!(ensure_owned_session_download_id("abc12345").is_err());
+        assert!(ensure_owned_session_download_id("download_").is_err());
+        assert!(ensure_owned_session_download_id("dl_abc123").is_err());
+        let long_id = format!("download_{}", "a".repeat(119));
+        assert!(ensure_owned_session_download_id(&long_id).is_ok());
+        assert!(
+            ensure_owned_session_download_id(&format!("{long_id}x")).is_err(),
+            "ids beyond the mint-side 128-char ceiling must be refused"
+        );
+    }
 
     #[test]
     fn stable_web_error_codes_are_locked() {
@@ -1737,6 +1785,17 @@ mod tests {
             web_session_result(WebSessionOperation::LoadSessionChunk, error).unwrap_err(),
             "web_session_load_session_chunk_failed"
         );
+        // Round-30 B7: the two aux commands are web-allowlisted; their chains
+        // fold into stable codes too, never leaking host paths across Relay.
+        assert_eq!(
+            web_session_result(WebSessionOperation::GetOrCreateAuxSession, error).unwrap_err(),
+            "web_session_get_or_create_aux_session_failed"
+        );
+        // M6: the atomic reset is web-allowlisted through the same funnel.
+        assert_eq!(
+            web_session_result(WebSessionOperation::ResetAuxSession, error).unwrap_err(),
+            "web_session_reset_aux_session_failed"
+        );
     }
 
     fn saved_session_with_private_paths(
@@ -1801,6 +1860,69 @@ mod tests {
         assert!(ensure_web_chat_session_supported(false).is_ok());
         // 桌面开了多智能体开关的普通会话同样拒绝：Web 看不到也停不掉子智能体。
         assert!(ensure_web_chat_session_supported(true).is_err());
+    }
+
+    /// web_access_chat_for_session's session gates (validate_session_id →
+    /// multi_agent rejection → store.load existence) do not go through
+    /// list(). Auxiliary conversations (`aux-` prefixed) are filtered out of
+    /// the ordinary session list by store.list(), but all three gates pass
+    /// for them naturally — the WebUI auxChat domain (auxChatSend →
+    /// web_access_chat) is not hit by the visibility filtering.
+    #[test]
+    fn web_chat_preflight_accepts_aux_sessions() {
+        let _g = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-web-aux-preflight-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let previous = std::env::var("PINVOU3_HOME").ok();
+        // SAFETY: platform::paths::tests::ENV_LOCK is held; env writes are
+        // serialized in-process.
+        unsafe { std::env::set_var("PINVOU3_HOME", &root) };
+        let store = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+            root.join("scheduled"),
+        )
+        .expect("session store");
+        let main = store
+            .create_new("model".to_string(), None, root.clone())
+            .expect("create main session");
+        let aux = store
+            .create_aux_session(&main.metadata.id)
+            .expect("create aux session");
+
+        // Precondition: list isolation holds — the aux session is not in the
+        // ordinary session list.
+        assert!(
+            !store
+                .list()
+                .expect("list sessions")
+                .iter()
+                .any(|metadata| metadata.id == aux.id),
+            "aux sessions must stay out of the ordinary chat list"
+        );
+        // web_access_chat_for_session's three session gates each pass:
+        crate::features::sessions::validate_session_id(&aux.id).expect("aux id charset");
+        ensure_web_chat_session_supported(store.mode_state(&aux.id).multi_agent).expect(
+            "fresh aux sessions default to single-agent mode, and the flag cannot be \
+                     flipped on them at all: set_multi_agent_mode rejects aux- ids \
+                     (round-32 minor 20), so the aux tool-surface invariant \
+                     (scoped read-only at most, ADR-0024) rests on that refusal \
+                     plus the spawn pin and the per-turn gate",
+        );
+        store.load(&aux.id).expect("aux session loads by id");
+
+        match previous {
+            // SAFETY: platform::paths::tests::ENV_LOCK is held; env writes are
+            // serialized in-process.
+            Some(value) => unsafe { std::env::set_var("PINVOU3_HOME", value) },
+            // SAFETY: platform::paths::tests::ENV_LOCK is held; env writes are
+            // serialized in-process.
+            None => unsafe { std::env::remove_var("PINVOU3_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

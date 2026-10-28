@@ -70,22 +70,30 @@ pub(super) fn kimi_login_failure_detail(stdout: &str, stderr: &str) -> Option<St
         })
     })
 }
+/// Credential vocabulary that means "refuse to surface this detail at all":
+/// any of these in a lowercased kimi login-failure detail implies credential
+/// material in a shape `redact_secret` cannot see. `pub` (the module stays
+/// private) so the codex_acp facade can re-export it for the headless CLI's
+/// login-echo withhold gate — same sanctioned-surface pattern as the
+/// MIN_* version constants (was an unpinned inline literal).
+pub const KIMI_CREDENTIAL_MARKERS: [&str; 10] = [
+    "access_token",
+    "refresh_token",
+    "authorization:",
+    "bearer ",
+    "api_key",
+    "api-key",
+    "secret=",
+    "cookie:",
+    "user_code=",
+    "device_code=",
+];
+
 pub(super) fn sanitize_kimi_login_failure_detail(detail: &str) -> Option<String> {
     let normalized = detail.to_ascii_lowercase();
-    if [
-        "access_token",
-        "refresh_token",
-        "authorization:",
-        "bearer ",
-        "api_key",
-        "api-key",
-        "secret=",
-        "cookie:",
-        "user_code=",
-        "device_code=",
-    ]
-    .into_iter()
-    .any(|marker| normalized.contains(marker))
+    if KIMI_CREDENTIAL_MARKERS
+        .into_iter()
+        .any(|marker| normalized.contains(marker))
     {
         return None;
     }
@@ -199,24 +207,9 @@ pub(super) fn nonempty_env(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 pub(super) fn cli_status_success(executable: &Path, args: &[&str]) -> bool {
-    let mut command = crate::platform::process::external_command(executable);
-    command.args(args);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
+    let command = crate::platform::process::external_command(executable);
     // 15s：Node 版 CLI（npm 安装的 codex）冷启动实测 ~9s，3s 会误判
-    match child.wait_timeout(Duration::from_secs(15)) {
-        Ok(Some(status)) => status.success(),
-        Ok(None) | Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            false
-        }
-    }
+    super::install::probe_exit_status(command, args, Duration::from_secs(15))
 }
 
 #[cfg(test)]

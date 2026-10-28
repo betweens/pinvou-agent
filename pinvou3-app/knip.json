@@ -18,12 +18,14 @@
     "src/features/personas/personas-i18n.js",
     "src/features/updater/update-notice-logic.js",
     "src/shared/authority-sync-diagnostics.js",
+    "src/shared/tool-store-events.js",
     "src/shared/bridge-messages.js",
     "src/shared/chunked-file-upload.js",
     "src/shared/format-utils.js",
     "src/shared/legacy-polyfills.js",
     "src/shared/markdown-bridge-fallback.js",
     "src/shared/model-service-errors.js",
+    "src/shared/theme-boot.js",
     "src/app/reader-main.jsx",
     "src/features/reader/ReaderApp.jsx",
     "scripts/tauri/*.js",
@@ -36,6 +38,9 @@
   ],
   "ignore": [
     "src/vendor/**"
+  ],
+  "ignoreDependencies": [
+    "lightningcss"
   ],
   "ignoreExportsUsedInFile": true
 }

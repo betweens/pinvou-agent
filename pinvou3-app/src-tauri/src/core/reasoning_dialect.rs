@@ -22,9 +22,11 @@ use serde_json::{Value, json};
 /// `None / ThinkingDisabled / QwenEnableThinking / Minimax` 可由
 /// [`reasoning_dialect_from_base_url`] 从 URL 嗅探得出。
 ///
-/// `VllmChatTemplate` 只能由调用方按 `provider`/`preset`（`vllm` /
+/// `VllmChatTemplate` 只能由调用方按 `provider`/`preset`（`vllm` / `tachyon` /
 /// `LocalVllm`）判定，永远不来自 URL 嗅探；它留在统一枚举里是为了让
 /// 各 feature 的 dispatch 直接返回本类型，免去各自的本地枚举与 `From` 转换。
+/// Tachyon（驭光）的 off 开关与 vLLM 逐字节相同（`enable_thinking=false`），
+/// 共用此变体。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningDialect {
     None,
@@ -115,6 +117,32 @@ pub fn apply_reasoning_dialect_controls(body: &mut Value, dialect: ReasoningDial
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The aux one-shot body builders pin "no sampling parameters" at
+    /// construction; this pins the post-builder mutator. Dialect controls
+    /// only ever add thinking-related fields — a future vendor control must
+    /// not sneak a sampling parameter back into an aux body after the
+    /// builder runs, where no body-level pin would see it.
+    #[test]
+    fn reasoning_controls_never_write_sampling_parameters() {
+        let source = include_str!("reasoning_dialect.rs");
+        let start = source
+            .find("pub fn apply_reasoning_dialect_controls")
+            .expect("applier definition present");
+        let region = &source[start
+            ..source[start..]
+                .find("#[cfg(test)]")
+                .expect("test module present")
+                + start];
+        assert!(
+            !region.contains("\"temperature\""),
+            "reasoning dialect controls must not write a temperature field"
+        );
+        assert!(
+            !region.contains("\"top_p\""),
+            "reasoning dialect controls must not write a top_p field"
+        );
+    }
 
     #[test]
     fn deepseek_strips_v1_suffix() {

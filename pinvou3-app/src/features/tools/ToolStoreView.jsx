@@ -6,13 +6,15 @@ import { EmptyState } from '../../components/EmptyState.jsx';
 import { Spinner } from '../../components/Spinner.jsx';
 import { resolveOAuthInstallOutcome } from './oauth-marketplace-logic.js';
 import { notifyComposerToolsChanged } from './tool-events.js';
-import { localizeTool, mergeConfigFields, TsActionBtn, tsCategories, tsSkillIconByName, tsSkillsData, tsToolsData, tsToolWelcomeData, TOOL_TYPE_GROUPS, getToolTypeGroup, TOOL_BUSINESS_GROUPS, getToolBusinessGroup } from './tool-common.jsx';
+import { localizeTool, mergeConfigFields, TsActionBtn, BuiltinPluginCard, tsCategories, tsSkillIconByName, tsSkillsData, tsToolsData, tsToolWelcomeData, TOOL_TYPE_GROUPS, getToolTypeGroup, TOOL_BUSINESS_GROUPS, getToolBusinessGroup } from './tool-common.jsx';
+import { isBuiltinPlugin } from './builtin-plugin-logic.js';
 import { MAX_SKILL_ZIP_BYTES, pickSkillDrop, fileToBase64 } from './skill-import-logic.js';
 import { invokeTauri, isTauriAvailable, tauriEvents } from '../../platform/tauri/client.js';
 import { can } from '../../shared/platform.js';
 import { isImeComposing } from '../../shared/ime-guard.mjs';
 import { pathBasename } from '../../shared/path-utils.js';
 import { companionPackageMap } from '../../shared/companion-packages.js';
+import { applyConnectorFailure, CONSENT_SYNC_FAILURE_MARKER, connectorErrorCopy, connectorFailure, connectorUiStep } from './connector-ui-state.js';
 
 // 10 分钟:等待的是人完成浏览器 OAuth(2FA、慢邮箱登录、跨设备取码都可能
 // 超过旧值 90s)。后端本地回调等待自身有 300s 上限,到时后端先显式失败;
@@ -34,6 +36,18 @@ const releaseBusy = (busyId, toolId) => (busyId === toolId ? null : busyId);
 
 const canStartExternalAuth = () => can('oauth') && can('externalAuth');
 
+// Log connector failures by code and step only: raw backend errors can carry
+// URLs, device codes or account details that do not belong in the console.
+const reportConnectorFailure = (connector, value, phase) => {
+  const failure = connectorFailure(value, phase);
+  console.error('connector failed:', {
+    connector,
+    code: failure.errorCode,
+    step: connectorUiStep(null, phase),
+  });
+  return failure;
+};
+
 const isRestrictedExternalAuthTool = (tool) => !!tool && !!(
   tool.authRequired
   || tool.oauthMcp
@@ -45,20 +59,20 @@ const isRestrictedExternalAuthTool = (tool) => !!tool && !!(
 );
 
 const PlatformToolAction = ({ copy, t, ...props }) => {
+  const isRestricted = isRestrictedExternalAuthTool(props.tool);
+  // 无变更权限(Web 只读)或无法发起外部登录时,动作退化为纯状态徽标:
+  // 受限工具显示「已连接」,其余显示「已安装」;未安装则不渲染任何动作。
+  let statusLabel = null;
   if (!can('toolStoreMutations')) {
-    if (!props.tool?.installed) return null;
-    const label = isRestrictedExternalAuthTool(props.tool) ? copy.connected : copy.installed;
-    return (
-      <span className={`${props.size === 'lg' ? 'px-6 py-2.5 text-[15px]' : 'px-4 py-1.5 text-[13px]'} rounded-full font-bold bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 whitespace-nowrap`}>
-        {label}
-      </span>
-    );
+    statusLabel = isRestricted ? copy.connected : copy.installed;
+  } else if (!canStartExternalAuth() && isRestricted) {
+    statusLabel = copy.connected;
   }
-  if (!canStartExternalAuth() && isRestrictedExternalAuthTool(props.tool)) {
-    if (!props.tool.installed) return null;
+  if (statusLabel && !props.tool?.installed) return null;
+  if (statusLabel) {
     return (
       <span className={`${props.size === 'lg' ? 'px-6 py-2.5 text-[15px]' : 'px-4 py-1.5 text-[13px]'} rounded-full font-bold bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 whitespace-nowrap`}>
-        {copy.connected}
+        {statusLabel}
       </span>
     );
   }
@@ -104,7 +118,7 @@ const THIRD_PARTY_TOOL_LOGOS = {
   ima: 'assets/tool-icons/wb-ima-mcp.png',
   obsidian: 'assets/tool-icons/obsidian.ico',
   'yuandian-mcp': 'assets/tool-icons/wb-yuandian-mcp.svg',
-  3: 'assets/tool-icons/wb-qq-mail.png',
+  3: 'assets/tool-icons/wb-qq-mail.jpg',
   5: 'assets/tool-icons/wb-lexiang.png',
   11: 'assets/tool-icons/wb-tapd.png',
   12: 'assets/tool-icons/wb-cnb-api.svg',
@@ -168,7 +182,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const EMPTY_STEPS = [];
     const EMPTY_COPY = {};
     const NOOP = () => {};
-    const FeishuFlowCard = ({ flow, onRetry, onCancel, name = '', twoStep = true, browserAuth = false, steps = EMPTY_STEPS, copy = EMPTY_COPY, onBrowserOpenError = NOOP }) => {
+    const FeishuFlowCard = ({ flow, onRetry, onCancel, name = '', twoStep = true, browserAuth = false, steps = EMPTY_STEPS, copy = EMPTY_COPY, errors = EMPTY_COPY, onBrowserOpenError = NOOP }) => {
       if (!flow) return null;
       const isErr = flow.phase === 'error';
       return (
@@ -237,7 +251,9 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
             <div className="px-5 pb-5">
               <div className="rounded-xl border border-rose-200 dark:border-rose-500/30 bg-rose-50 dark:bg-rose-500/10 p-3">
                 <div className="text-[13px] font-medium text-rose-700 dark:text-rose-300 mb-1.5">{copy.connectionIncomplete}</div>
-                <pre className="text-[11.5px] leading-relaxed text-rose-800/80 dark:text-rose-200/70 whitespace-pre-wrap max-h-28 overflow-auto font-mono">{flow.err}</pre>
+                <div className="text-[12px] leading-relaxed text-rose-800/80 dark:text-rose-200/70">
+                  {connectorErrorCopy(errors, flow.errorCode) || errors.unknown || copy.connectionIncomplete}
+                </div>
                 <div className="flex gap-2 mt-3 justify-end">
                   <button type="button" onClick={onCancel} className="px-3 py-1.5 rounded-lg bg-slate-200 dark:bg-white/10 text-slate-700 dark:text-slate-100 text-[13px]">{copy.close}</button>
                   <button type="button" onClick={onRetry} className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-[13px]">{copy.retry}</button>
@@ -255,7 +271,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         : (flow.active === 'runtime' ? copy.extract(Math.round(flow.pct || 0)) : copy.connecting));
       return (
         <button type="button" onClick={(e) => { e.stopPropagation(); onClick(); }} title={copy.title} className="shrink-0 flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-full bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/30 text-blue-600 dark:text-blue-300 text-[12px] font-medium">
-          <Spinner size={12} tone="brand" />
+          <Spinner size={12} />
           <span className="tabular-nums whitespace-nowrap">{label}</span>
         </button>
       );
@@ -275,6 +291,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     //   connectedMode  apply=fire-and-forget skill write (feishu/wecom); applyAwait=await the skill write,
     //                  turning failure into a flow error (dingtalk); readinessAwait=re-verify the real login
     //                  state via bundle_readiness before writing skills (tmeet).
+    //   beginStage     Failure-reporting stage once connect begin is dispatched: feishu=register (two-stage), others=authorize.
     /* eslint-disable unicorn/no-this-outside-of-class -- module-level connection store singleton; object-literal methods reference itself via this, and converting to a class would just move the same complexity */
     const createFlowStore = () => ({
       flow: null,
@@ -303,12 +320,9 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const createConnectorFlow = (cfg) => {
       const conn = cfg.conn;
       // Backend connection events register only once (idempotent; no duplicate registration across repeated ToolStoreView mounts).
-      // connFailed/skillsFailed/authIncomplete match the original implementation: take the copy snapshot from the first install.
-      const ensureListeners = (copy = {}) => {
+      // Failures are stored as error codes and localized at render time, so a language switch after the first install still applies.
+      const ensureListeners = () => {
         if (conn.listenersReady) return;
-        const connFailed = copy.connFailed;
-        const skillsFailed = cfg.skillsFailedCopyKey ? copy[cfg.skillsFailedCopyKey] : null;
-        const authIncomplete = cfg.authIncompleteCopyKey ? copy[cfg.authIncompleteCopyKey] : null;
         const ev = isTauriAvailable() ? tauriEvents : null;
         if (!ev) return;
         conn.listenersReady = true;
@@ -316,12 +330,18 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           const p = e.payload || {};
           conn.stopTick();
           if (cfg.openAuthUrl && p.url) {
-            invokeTauri('open_external_url', { url: p.url }).catch(err => {
-              console.error('open tmeet auth url failed:', err);
+            // Log without the error: the rejection carries the full auth URL (device-code-bearing),
+            // which must not land in the console; reopening stays available via the card's button.
+            invokeTauri('open_external_url', { url: p.url }).catch(() => {
+              console.error('open tmeet auth url failed');
             });
           }
+          // Flow null = the card was closed (cancel/close) before the event landed;
+          // a late QR would fabricate a fresh card (and re-open wecom's modal) that
+          // the backend generation guards cannot cover across a reconnect.
           conn.setFlow(f => {
-            const prev = (f && f.steps) || {};
+            if (!f) return f;
+            const prev = f.steps || {};
             return {
               ...f, phase: 'qr', active: 'qr',
               steps: { ...prev, runtime: prev.runtime || 'done', cli: prev.cli === 'active' ? 'done' : (prev.cli || 'done'), ...(cfg.qrStepsExtra), qr: 'active' },
@@ -331,11 +351,39 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         });
         ev.listen(cfg.events.connected, cfg.connectedMode === 'apply' ? () => {
           conn.stopTick();
-          conn.setFlow(f => ({ ...f, phase: 'done', steps: { ...(f && f.steps), qr: 'done' } }));
+          // Flow null = the card was closed (cancel) before the event landed;
+          // writing would resurrect a zombie "done" card.
+          conn.setFlow(f => (f ? { ...f, phase: 'done', steps: { ...f.steps, qr: 'done' } } : f));
           // Connected → write skills per the rules (enabled by default) + broadcast refresh; view-independent, so it lives in the global listener.
-          invokeTauri(cfg.commands.applySkills).catch(() => {});
-          // Auto-collapse the flow card later (the detail dialog's "Connected" state is now driven by derived connection state)
-          setTimeout(() => conn.setFlow(null), 1800);
+          // Round-33 MAJOR 2 + round-35 MAJOR 1 (review #455): the fire-and-forget write is consent-critical — a lost
+          // row leaves the connector live with zero consent until the next boot's ledger-gated backfill, silently. The
+          // failure is surfaced ON THE CARD via applyConnectorFailure (the console-only reportConnectorFailure call was
+          // the round-35 review's finding — success toast + connected card while only the console saw the error): the
+          // backend message carries the shared consent marker (CONSENT_SYNC_FAILURE_MARKER, pinned on both sides —
+          // ima-pattern substring match) → the dedicated consent_persist_failed copy; anything else keeps the step's
+          // localized copy.
+          // Round-37 F2 (review #455): the collapse timer is armed only AFTER the write settles — arming it
+          // synchronously let a failure resolving after 1.8s land on a nulled flow (the null guard no-op'ing),
+          // re-creating the silent-failure state. A slow write keeps the done card up until it resolves; a failed
+          // write swaps in the error card and stays (no auto-collapse on errors, same as the awaited branch).
+          invokeTauri(cfg.commands.applySkills).then(
+            () => {
+              // Auto-collapse the flow card later (the detail dialog's "Connected" state is now driven by derived
+              // connection state). The collapse must only close a card that already reached 'done': a stale timer
+              // from the previous round must not destroy a card the user re-opened within the window (and strand the
+              // busy slot with it).
+              setTimeout(() => conn.setFlow(f => (f && f.phase === 'done' ? null : f)), 1800);
+            },
+            (e) => {
+              const msg = String(e && e.message ? e.message : e);
+              const failure = msg.includes(CONSENT_SYNC_FAILURE_MARKER)
+                ? { code: 'consent_persist_failed' }
+                : { code: 'skills_enable_failed' };
+              reportConnectorFailure(cfg.key, failure, 'cli');
+              // Same null guard as the awaited branch: a failure landing after the card was closed must not fabricate one.
+              conn.setFlow(f => (f ? applyConnectorFailure(f, failure, 'cli') : f));
+            },
+          );
         } : async () => {
           conn.stopTick();
           try {
@@ -343,25 +391,48 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
               // Double-check the real login state (unified readiness; the old tmeet_status call is retired)
               const status = await invokeTauri('bundle_readiness', { bundleId: cfg.readiness.bundleId });
               if (!(status && status.ready)) {
-                throw new Error(authIncomplete);
+                const authError = new Error('auth_failed');
+                authError.code = 'auth_failed';
+                throw authError;
               }
             }
             await invokeTauri(cfg.commands.applySkills);
-            conn.setFlow(f => ({ ...f, phase: 'done', steps: { ...(f && f.steps), qr: 'done' } }));
-            setTimeout(() => conn.setFlow(null), 1800);
+            // Same null guard as above: the awaited apply gives cancel a wide window.
+            conn.setFlow(f => (f ? { ...f, phase: 'done', steps: { ...f.steps, qr: 'done' } } : f));
+            // Same done-only collapse guard as the apply-mode listener above: a
+            // stale timer must not close a freshly re-opened card.
+            setTimeout(() => conn.setFlow(f => (f && f.phase === 'done' ? null : f)), 1800);
           } catch (e) {
-            conn.setFlow(f => ({ ...f, phase: 'error', err: cfg.applyErrorMessage(e, { skillsFailed, authIncomplete }), errStep: 'qr', steps: { ...(f && f.steps), qr: 'error' } }));
+            // readinessAwait (tmeet) passes the readiness re-check's auth_failed through; a consent-persist failure
+            // (the backend copy carries the shared marker) reports consent_persist_failed — "Try again" cannot fix a
+            // persist failure; every other failure after authorization completed (dingtalk's awaited apply, tmeet's
+            // own skill write) reports skills_enable_failed — the sign-in demonstrably succeeded on those paths.
+            // Round-35 MAJOR 1 (review #455): without this classification the consent_persist_failed catalog entry
+            // was unreachable for every connector.
+            const authIncomplete = cfg.connectedMode !== 'applyAwait' && e && e.code === 'auth_failed';
+            const msg = String(e && e.message ? e.message : e);
+            const failure = authIncomplete
+              ? e
+              : msg.includes(CONSENT_SYNC_FAILURE_MARKER)
+                ? { code: 'consent_persist_failed' }
+                : { code: 'skills_enable_failed' };
+            reportConnectorFailure(cfg.key, failure, 'qr');
+            // Same null guard: a failure landing after the card was closed must not fabricate one.
+            conn.setFlow(f => (f ? applyConnectorFailure(f, failure, 'qr') : f));
           }
         });
         ev.listen(cfg.events.error, (e) => {
           const p = e.payload || {};
+          reportConnectorFailure(cfg.key, p, p.phase);
           conn.stopTick();
-          conn.setFlow(f => { const step = (f && f.active) || 'cli'; return { ...(f || { steps: {} }), phase: 'error', err: String(p.message || connFailed), errStep: step, steps: { ...(f && f.steps), [step]: 'error' } }; });
+          // Flow null = the card was closed (cancel/close) before the event landed;
+          // applyConnectorFailure would resurrect a fresh error card from nothing.
+          conn.setFlow(f => (f ? applyConnectorFailure(f, p, p.phase) : f));
         });
       };
-      // Component-side quartet handlers: deps = { setBusyId, busyRef, storeCopy, detailCopy } (injected from the component closure
+      // Component-side quartet handlers: deps = { setBusyId, busyRef, detailCopy, ... } (injected from the component closure
       // at call time, same semantics as the original in-component quartet). busyId is cleared in event callbacks/error branches.
-      const connect = async ({ setBusyId, busyRef, storeCopy, detailCopy }) => {
+      const connect = async ({ setBusyId, busyRef, detailCopy }) => {
         // Single shared busy slot: starting while another operation is in flight
         // would steal its slot via setBusyId(cfg.key) and re-enable the other
         // operation's button mid-run, so refuse instead — same discipline as the
@@ -370,28 +441,34 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         // retry reuses this path and inherits the guard.
         if (busyRef.current) return;
         setBusyId(cfg.key);
-        ensureListeners(storeCopy);
+        ensureListeners();
         // Open the flow card (non-blocking dialog): start the "Prepare runtime" step. Written to the cross-view store, it survives switching away.
         conn.setFlow({ phase: 'running', steps: { runtime: 'active' }, active: 'runtime', pct: 0, sec: 0, log: '' });
         // Client-side stopwatch + crawling bar: the backend progress event overrides with a real pct when present; without one this still avoids looking frozen.
         conn.startTick();
+        let stage = 'cli';
         try {
           // ① Ensure CLI (installed online on first use)
           conn.setFlow(f => ({ ...f, active: 'cli', pct: 0, log: detailCopy.flow.installStarting, steps: { ...(f && f.steps), runtime: 'done', cli: 'active' } }));
           await invokeTauri(cfg.commands.ensureCli);
+          // A cancel/close during the (potentially long) CLI install closed the
+          // card; resetFlow already stopped the tick and released the busy slot.
+          // Starting a backend round now would run invisibly and emit onto
+          // nothing — stop instead of connecting for a dismissed card.
+          if (!conn.flow) return;
           conn.setFlow(cfg.twoStep
             // ② Connection orchestration (two-stage: advance the connect step; the backend emits qr / connected / error)
             ? f => ({ ...f, active: 'connect', pct: 100, steps: { ...(f && f.steps), cli: 'done', connect: 'active' } })
             : f => ({ ...f, pct: 100, steps: { ...(f && f.steps), cli: 'done' } }));
+          stage = cfg.beginStage;
           await invokeTauri(cfg.commands.begin);
         } catch (e) {
-          console.error(`${cfg.key} connect failed:`, e);
+          reportConnectorFailure(cfg.key, e, stage);
           conn.stopTick();
           setBusyId((current) => releaseBusy(current, cfg.key));
-          conn.setFlow(f => {
-            const step = (f && f.active) || 'cli';
-            return { ...(f || { steps: {} }), phase: 'error', err: String(e).slice(0, 300), errStep: step, steps: { ...(f && f.steps), [step]: 'error' } };
-          });
+          // Same null guard as the listeners: a rejection landing after the card
+          // was closed (cancel during ensureCli/begin) must not fabricate one.
+          conn.setFlow(f => (f ? applyConnectorFailure(f, e, stage) : f));
         }
       };
       // Cancel/close the flow card: mark cancelled + kill child processes + clear state.
@@ -421,7 +498,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     };
 
     const feishuFlowApi = createConnectorFlow({
-      key: 'feishu', conn: feishuConn, twoStep: true,
+      key: 'feishu', conn: feishuConn, twoStep: true, beginStage: 'register',
       events: { qr: 'feishu:qr', connected: 'feishu:connected', error: 'feishu:error' },
       commands: { ensureCli: 'feishu_ensure_cli', begin: 'feishu_connect_begin', cancel: 'feishu_cancel', logout: 'feishu_logout', applySkills: 'feishu_apply_skills' },
       qrStepsExtra: { connect: 'done' },
@@ -431,7 +508,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const ensureFeishuListeners = feishuFlowApi.ensureListeners;
 
     const wecomFlowApi = createConnectorFlow({
-      key: 'wecom', conn: wecomConn, twoStep: false,
+      key: 'wecom', conn: wecomConn, twoStep: false, beginStage: 'authorize',
       events: { qr: 'wecom:qr', connected: 'wecom:connected', error: 'wecom:error' },
       commands: { ensureCli: 'wecom_ensure_cli', begin: 'wecom_connect_begin', cancel: 'wecom_cancel', logout: 'wecom_logout', applySkills: 'wecom_apply_skills' },
       connectedMode: 'apply',
@@ -440,27 +517,23 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const ensureWecomListeners = wecomFlowApi.ensureListeners;
 
     const dingtalkFlowApi = createConnectorFlow({
-      key: 'dingtalk', conn: dingtalkConn, twoStep: false,
+      key: 'dingtalk', conn: dingtalkConn, twoStep: false, beginStage: 'authorize',
       events: { qr: 'dingtalk:qr', connected: 'dingtalk:connected', error: 'dingtalk:error' },
       commands: { ensureCli: 'dingtalk_ensure_cli', begin: 'dingtalk_connect_begin', cancel: 'dingtalk_cancel', logout: 'dingtalk_logout', applySkills: 'dingtalk_apply_skills' },
       qrPayloadExtra: p => ({ userCode: p.user_code }),
       connectedMode: 'applyAwait',
-      skillsFailedCopyKey: 'dingtalkSkillsFailed',
-      applyErrorMessage: (e, h) => h.skillsFailed(String(e).slice(0, 220)),
       disconnectedTitle: ({ storeCopy }) => storeCopy.disconnectedTool(storeCopy.toolNames.dingtalk),
     });
     const ensureDingtalkListeners = dingtalkFlowApi.ensureListeners;
 
     const tmeetFlowApi = createConnectorFlow({
-      key: 'tmeet', conn: tmeetConn, twoStep: false,
+      key: 'tmeet', conn: tmeetConn, twoStep: false, beginStage: 'authorize',
       events: { qr: 'tmeet:qr', connected: 'tmeet:connected', error: 'tmeet:error' },
       commands: { ensureCli: 'tmeet_ensure_cli', begin: 'tmeet_connect_begin', cancel: 'tmeet_cancel', logout: 'tmeet_logout', applySkills: 'tmeet_apply_skills' },
       qrPayloadExtra: () => ({ browserAuth: true }),
       openAuthUrl: true,
       connectedMode: 'readinessAwait',
       readiness: { bundleId: 'tmeet' },
-      authIncompleteCopyKey: 'tmeetAuthIncomplete',
-      applyErrorMessage: e => String(e && e.message ? e.message : e).slice(0, 220),
       disconnectedTitle: ({ detailCopy }) => detailCopy.actions.disconnectedTmeet,
     });
     const ensureTmeetListeners = tmeetFlowApi.ensureListeners;
@@ -472,10 +545,17 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     // mirrors store state into local rendering and finalizes on done/failure (alert dialog, connection-state
     // refresh). The real listeners/stopwatch live in the module-level conn singleton, surviving view switches.
     // tmeet's done toast uses a detailCopy phrase via doneTitle; others pass evaluated storeCopy.connectedTool(...).
-    const useConnectorFlowSubscription = ({ enabled, conn, ensureListeners, setFlow, storeCopy, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle, toolId }) => {
+    const useConnectorFlowSubscription = ({ enabled, conn, ensureListeners, setFlow, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle, toolId }) => {
+      // The subscription effect runs once per enabled state; the toast copy goes
+      // through a latest-ref so a "connected" toast raised after a mid-flow
+      // language switch uses the current language, like the failure card does.
+      const toastCopyRef = useRef(null);
+      useEffect(() => {
+        toastCopyRef.current = { doneTitle, enabledSubtitle: detailCopy.actions.enabled };
+      });
       useEffect(() => {
         if (!enabled) return;
-        ensureListeners(storeCopy);
+        ensureListeners();
         let prevPhase = conn.flow && conn.flow.phase;
         const unsub = conn.subscribe((flow) => {
           setFlow(flow);
@@ -484,7 +564,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
             if (ph === 'done') {
               setBusyId((current) => releaseBusy(current, toolId));
               loadBackendState();
-              setAlert({ visible: true, loading: false, title: doneTitle, subtitle: detailCopy.actions.enabled, isInstall: true, isError: false, toolId });
+              setAlert({ visible: true, loading: false, title: toastCopyRef.current && toastCopyRef.current.doneTitle, subtitle: toastCopyRef.current && toastCopyRef.current.enabledSubtitle, isInstall: true, isError: false, toolId });
               notifyComposerToolsChanged();
             } else if (ph === 'error') {
               setBusyId((current) => releaseBusy(current, toolId));
@@ -494,7 +574,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         });
         setFlow(conn.flow); // hydrate the current progress on (re)mount
         return unsub;
-      // eslint-disable-next-line react-hooks/exhaustive-deps -- subscription mounts/unmounts only with externalAuthAvailable; the copy snapshot is read on demand by the callback, so resubscribing is unnecessary
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- subscription mounts/unmounts only with externalAuthAvailable; failures are stored as error codes and localized at render time, so resubscribing on copy changes is unnecessary
       }, [enabled]);
     };
 
@@ -504,7 +584,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const ModalBackdrop = ({ onClose, onKeyDown, children }) => (
       // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer, non-interactive container
       <div
-        className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm"
+        className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm"
         onClick={onClose}
         onKeyDown={onKeyDown}
       >
@@ -519,9 +599,9 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const TsAlert = ({ alert, onDismiss, onNewChat, onCancelLoading, copy }) => {
       if (!alert.visible && !alert.loading) return null;
       return (
-        <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/40 backdrop-blur-sm">
+        <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm">
           <div
-            className="w-[280px] rounded-[20px] overflow-hidden shadow-2xl transition-transform duration-200 scale-100 bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]"
+            className="w-[280px] max-w-full rounded-[20px] overflow-hidden shadow-2xl transition-transform duration-200 scale-100 bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]"
             style={{ animation: 'tsAlertIn .2s ease-out' }}
           >
             {alert.loading ? (
@@ -594,16 +674,16 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     };
 
     // API Key 配置弹窗（需要 config_fields 的工具安装前弹出）
-    const TsConfigDialog = ({ config, onConfirm, onCancel, copy }) => {
+    const TsConfigDialog = ({ config, onConfirm, onCancel, copy, onBrowserOpenError = NOOP }) => {
+      const [values, setValues] = useState({});
       if (!config) return null;
-      const [values, setValues] = useState({}); // eslint-disable-line react-hooks/rules-of-hooks -- when config is null the component returns null before any other hook; for one instance config only goes null→object, so the hook count is stable
       const fields = config.fields || [];
       // required:false 的字段可留空；required:true 字段必须填写后才能连接。
       const canSubmit = fields.every(f => f.required === false || (values[f.key] || '').trim().length > 0);
       return (
         <ModalBackdrop>
           <div
-            className={`w-[300px] rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]`}
+            className={`w-[300px] max-w-full rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]`}
             style={{ animation: 'tsAlertIn .2s ease-out' }}
           >
             <div className="px-6 pt-6 pb-4 text-center max-h-[70vh] overflow-y-auto">
@@ -617,7 +697,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
               )}
               {config.configDocUrl && (
                 <button type="button"
-                  onClick={() => invokeTauri('open_external_url', { url: config.configDocUrl })}
+                  onClick={() => invokeTauri('open_external_url', { url: config.configDocUrl }).catch(onBrowserOpenError)}
                   className={`text-[13px] mb-4 inline-block text-[#007AFF] dark:text-[#0A84FF] hover:underline`}
                 >
                   {config.configDocLabel || copy.configDocDefault} →
@@ -664,7 +744,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                     : 'text-slate-300 dark:text-slate-600'
                 }`}
               >
-                {fields.length > 0 ? copy.configConnect : copy.configInstall}
+                {copy.configConnect}
               </button>
             </div>
           </div>
@@ -718,7 +798,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           {/* biome-ignore lint/a11y/noStaticElementInteractions: click-propagation stop layer, non-interactive container */}
           <div
             data-testid="edit-display-dialog"
-            className={`w-[300px] rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]`}
+            className={`w-[300px] max-w-full rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]`}
             style={{ animation: 'tsAlertIn .2s ease-out' }}
             onClick={e => e.stopPropagation()}
           >
@@ -826,7 +906,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
       );
       return (
         <ModalBackdrop>
-          <div className={`w-[300px] rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]`} style={{ animation: 'tsAlertIn .2s ease-out' }}>
+          <div className={`w-[300px] max-w-full rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]`} style={{ animation: 'tsAlertIn .2s ease-out' }}>
             <div className="px-6 pt-6 pb-4 text-center">
               <div className="text-[34px] mb-2">📖</div>
               <div className={`text-[17px] font-semibold mb-2 text-slate-900 dark:text-white`}>{c.title}</div>
@@ -848,7 +928,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
       <ModalBackdrop onClose={onCancel}>
         {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-propagation stop layer; keyboard events need no bubbling here */}
         {/* biome-ignore lint/a11y/noStaticElementInteractions: click-propagation stop layer, non-interactive container */}
-        <div className="w-[300px] rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]" onClick={e => e.stopPropagation()}>
+        <div className="w-[300px] max-w-full rounded-[20px] overflow-hidden shadow-2xl bg-white/95 backdrop-blur-xl dark:bg-[#2C2C2E]" onClick={e => e.stopPropagation()}>
           <div className="px-6 pt-6 pb-5 text-center">
             <div className="text-[17px] font-semibold mb-1.5 text-slate-900 dark:text-white">{title}</div>
             <div className="text-[13px] leading-relaxed text-slate-500 dark:text-slate-400">{desc}</div>
@@ -869,6 +949,9 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
     const ToolStoreView = ({ t, onNewChat }) => {
       const storeCopy = t.uiToolStore;
       const detailCopy = t.uiToolDetails;
+      // Copy for the read-only builtin plugins page (docs/builtin-toolset-contract.md §3.1);
+      // BuiltinPluginCard falls back to the zh dictionary when copy is missing.
+      const builtinCopy = t.uiBuiltinPlugins;
       // 数据文件(tool-common.jsx)里技能/分类/精选的中文 label/title/subtitle/desc:
       // 按 localizeTool() 同款 overlay 模式,从 uiToolStore 词条做三语覆盖,数据文件本身不改。
       const storeData = storeCopy.storeData || {};
@@ -936,6 +1019,11 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
       // 回收站：用户上传的插件卸载后进入回收站，可恢复或彻底删除
       // （list 为只读命令，Web 端可看列表；恢复/删除挂 toolStoreMutations 能力门）。
       const [showRecycleBin, setShowRecycleBin] = useState(false);
+      // Dedicated builtin-plugins subpage (docs/builtin-toolset-contract.md §3.1):
+      // entered from the toolbar "Builtin Plugins" button, rendered fully read-only;
+      // it reuses builtinPluginCards (list_marketplace_tools is already fetched when
+      // the main list loads — no extra request needed).
+      const [showBuiltinPlugins, setShowBuiltinPlugins] = useState(false);
       const [recycledPlugins, setRecycledPlugins] = useState([]);
       // 加载态：进入子页到首包返回之间不得闪「回收站是空的」空态；recycledLoaded
       // 标记首次加载完成（成功或失败都算，失败由 alert 提示），加载中渲染 spinner。
@@ -1209,16 +1297,16 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
 
       // 订阅跨视图 store：把 store 状态镜像进本组件渲染，并在完成/失败时做组件级收尾
       // (alert dialog, connection-state refresh). The real listeners/stopwatch live in the module-level conn singleton, surviving view switches.
-      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: feishuConn, ensureListeners: ensureFeishuListeners, setFlow: setFeishuFlow, storeCopy, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: storeCopy.connectedTool(storeCopy.toolNames.feishu), toolId: 'feishu' });
+      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: feishuConn, ensureListeners: ensureFeishuListeners, setFlow: setFeishuFlow, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: storeCopy.connectedTool(storeCopy.toolNames.feishu), toolId: 'feishu' });
 
       // 订阅企业微信 store(镜像飞书):镜像进渲染 + 完成/失败收尾
-      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: wecomConn, ensureListeners: ensureWecomListeners, setFlow: setWecomFlow, storeCopy, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: storeCopy.connectedTool(storeCopy.toolNames.wecom), toolId: 'wecom' });
+      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: wecomConn, ensureListeners: ensureWecomListeners, setFlow: setWecomFlow, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: storeCopy.connectedTool(storeCopy.toolNames.wecom), toolId: 'wecom' });
 
       // 订阅钉钉 store(镜像企微):镜像进渲染 + 完成/失败收尾
-      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: dingtalkConn, ensureListeners: ensureDingtalkListeners, setFlow: setDingtalkFlow, storeCopy, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: storeCopy.connectedTool(storeCopy.toolNames.dingtalk), toolId: 'dingtalk' });
+      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: dingtalkConn, ensureListeners: ensureDingtalkListeners, setFlow: setDingtalkFlow, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: storeCopy.connectedTool(storeCopy.toolNames.dingtalk), toolId: 'dingtalk' });
 
       // Subscribe to the tmeet store (mirrors the dingtalk one): mirror into rendering + done/failure finalization (done toast uses a dedicated phrase)
-      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: tmeetConn, ensureListeners: ensureTmeetListeners, setFlow: setTmeetFlow, storeCopy, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: detailCopy.actions.connectedTmeet, toolId: 'tmeet' });
+      useConnectorFlowSubscription({ enabled: externalAuthAvailable, conn: tmeetConn, ensureListeners: ensureTmeetListeners, setFlow: setTmeetFlow, detailCopy, setBusyId, loadBackendState, setAlert, doneTitle: detailCopy.actions.connectedTmeet, toolId: 'tmeet' });
 
       // 合并后端安装状态到 mock 数据(飞书/企微/钉钉的 installed = 已连接)
       // 业务分类直接取条目数据 category(tool-common.jsx 已落业务类 id),不再按 id 硬编码映射。
@@ -1273,7 +1361,11 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
       // preset（市场预置/手写自定义 MCP 迁移登记）卸载保留目录、不进回收站；
       // source 缺失（旧后端）取 false——宁可少提示「移入回收站」，不说谎。
       const customMcpTools = toolBackend
-        .filter(x => tsToolsData.every(t => t.backendId !== x.id))
+        // Builtin plugins (docs/builtin-toolset-contract.md §3.1, via the shared
+        // isBuiltinPlugin judgement) stay out of the regular store card flow —
+        // builtinPluginCards below renders them as a separate read-only section
+        // (visibility: system semantics).
+        .filter(x => !isBuiltinPlugin(x) && tsToolsData.every(t => t.backendId !== x.id))
         .map(x => {
           const bs = bundleStates[x.id] || null;
           // 卡面标题/说明优先取 readiness bundle 的生效值（后端已应用 extra
@@ -1281,7 +1373,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           const bf = (bs && bs.bundle) || null;
           const base = {
             id: 'mcp-' + x.id, backendId: x.id, title: (bf && bf.name) || x.name || x.id, subtitle: '',
-            category: 'other', type: 'MCP Server', mcpServer: true,
+            category: 'other', type: (storeCopy.typeLabels || {}).mcp || 'MCP Server', mcpServer: true,
             version: x.version ? `v${String(x.version).replace(/^v/i, '')}` : '—',
             latency: storeCopy.localLatency, desc: (bf && bf.description) || x.description || '',
             icon: Server, color: 'bg-gradient-to-b from-slate-400 to-slate-600',
@@ -1293,6 +1385,44 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           return localizeTool(base, t);
         });
       const tools = [...builtinTools, ...customMcpTools];
+      // Builtin plugins section data (docs/builtin-toolset-contract.md §3.1 read-only
+      // audit window): entries matching the shared isBuiltinPlugin judgement form a
+      // separate section, excluded from the regular card flow / search / category
+      // filters (visibility: system semantics). The displayed facts (mcp_tools tool
+      // list, security level, data access scopes, bundle version) all come from
+      // list_marketplace_tools; name/description go through the existing
+      // localizeTool overlay.
+      const builtinMcpCards = toolBackend
+        .filter(isBuiltinPlugin)
+        .map(x => localizeTool({
+          id: 'builtin-' + x.id, backendId: x.id, builtin: true,
+          title: x.name || x.id, subtitle: '', desc: x.description || '',
+          icon: Package, color: 'bg-gradient-to-b from-slate-400 to-slate-600',
+          securityLevel: x.security_level || null,
+          dataAccess: Array.isArray(x.data_access) ? x.data_access : [],
+          mcpTools: Array.isArray(x.mcp_tools) ? x.mcp_tools : [],
+          bundleVersion: x.bundle_version ? String(x.bundle_version).replace(/^v/i, '') : null,
+        }, t));
+      // Builtin skills (visual design is the only builtin === true entry in
+      // tsSkillsData) also live on the builtin-plugins page: the store keeps its
+      // feature card (that is its entry point); this page is the transparency
+      // window. A skill is a pure prompt capability — no tool list / security
+      // level / data access — so it declares facts with a kind row and a version
+      // row. Copy goes through the same overlay as the store skill cards
+      // (localizeSkill → uiToolStore.storeData.skills, keyed by the backendId
+      // 'visual-design'), so en/ja render the localized title/subtitle/desc/
+      // version.
+      const builtinSkillCards = tsSkillsData
+        .filter(x => x.builtin === true)
+        .map(x => {
+          const s = localizeSkill(x);
+          return {
+            ...s, id: 'builtin-skill-' + x.id,
+            kindLabel: (storeCopy.typeGroups || {})[String(s.type).toLowerCase()] || s.type,
+            versionText: s.version || null,
+          };
+        });
+      const builtinPluginCards = [...builtinMcpCards, ...builtinSkillCards];
       // 按 backendId 取已 localize 的工具卡;兜底分支也走 localizeTool,避免 en/ja 下漏出中文原文。
       const findLocalizedTool = (backendId) =>
         tools.find(x => x.backendId === backendId) || localizeTool(tsToolsData.find(x => x.backendId === backendId), t);
@@ -1349,7 +1479,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
             // (getToolTypeGroup 据此归 Skill 组),业务维度由 getToolBusinessGroup
             // 落「其他」(初步设计,见 tool-common 注释)。
             category: mcpEntry ? (mcpEntry.category || 'skill') : 'skill',
-            type: mcpId ? ((storeCopy.typeGroups || {}).bundle || 'Bundle') : 'Skill',
+            type: mcpId ? ((storeCopy.typeLabels || {}).bundle || 'Bundle') : ((storeCopy.typeLabels || {}).skill || 'Skill'),
             companionBundle: !!mcpId,
             exportable: ownerExportable,
             version: '—', latency: storeCopy.localLatency, desc: x.description || '',
@@ -1363,7 +1493,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
       const uploadedSkills = skillBackend.filter(x => x.user_uploaded).map(x => ({
         id: 'up-' + x.id, backendId: x.id, title: x.title, subtitle: x.subtitle || storeCopy.uploadedSkill,
         // 用户上传技能无业务归属元数据,业务分组落「其他」;类型分组仍按 userUploaded 归 Skill。
-        category: 'other', type: 'Skill', version: '—', latency: storeCopy.localLatency, desc: x.description || '',
+        category: 'other', type: (storeCopy.typeLabels || {}).skill || 'Skill', version: '—', latency: storeCopy.localLatency, desc: x.description || '',
         icon: Package, color: 'bg-gradient-to-b from-slate-400 to-slate-600', installed: true, userUploaded: true,
         actions: actionsOf(bundleStates[x.id]),
       }));
@@ -1633,6 +1763,11 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         } catch (e) {
           if (t?.oauthMcp && !isCurrentOAuthRequest(backendId, oauthRequestId)) return;
           console.error('install failed:', e);
+          // A post-landing consent failure returns after the pack committed:
+          // refresh so the card shows the real (installed) state instead of
+          // staying stale until the next mount or pinvou:tools-changed.
+          await loadBackendState();
+          if (t?.oauthMcp && !isCurrentOAuthRequest(backendId, oauthRequestId)) return;
           setAlert({ visible: true, loading: false, title: detailCopy.actions.operationFailed, subtitle: String(e && e.message ? e.message : e).slice(0, 240), isInstall: false, isError: true });
         } finally {
           if (t?.oauthMcp) {
@@ -1795,6 +1930,10 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           }
         } catch (e) {
           console.error('import skill failed:', e);
+          // Post-landing consent failures return after the pack committed:
+          // refresh so the new card shows instead of staying stale until the
+          // next mount or pinvou:tools-changed.
+          loadBackendState();
           setAlert({ visible: true, loading: false, title: storeCopy.importFailedWith(String(e)), isInstall: false, isError: true });
         } finally {
           setBusyId((current) => releaseBusy(current, '__upload__'));
@@ -1830,8 +1969,32 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           }
           notifyComposerToolsChanged();
         } catch (e) {
-          console.error('ima connect failed:', e);
-          setAlert({ visible: true, loading: false, title: detailCopy.actions.imaFailed, subtitle: detailCopy.actions.operationFailed, isInstall: false, isError: true });
+          reportConnectorFailure('ima', e, 'connect');
+          // Round-25 minor 5 + round-30 m9 (review #455), merged with #615's
+          // reportConnectorFailure routing. Since the deny-first consent gate
+          // (PR #517) the connect flow registers consent BEFORE credentials or
+          // skill content, so today no ima_connect error carries the consent
+          // marker — a refused connect lands nothing and the generic
+          // operationFailed copy is the honest state. The localized template
+          // branch stays defensive: if a post-landing consent leg ever emits
+          // the marker again, its "turn them off in the tools list" guidance
+          // must surface through it instead of the generic copy. The matcher
+          // keys on the backend marker pinned by
+          // skill_gate::skill_gate_consent_failure_message_keeps_the_frontend_marker
+          // and cross-compared against the Rust constant by
+          // consent_marker_frontend.test.mjs.
+          const msg = String(e && e.message ? e.message : e);
+          const consentFailure = msg.includes(CONSENT_SYNC_FAILURE_MARKER);
+          setAlert({
+            visible: true, loading: false,
+            title: detailCopy.actions.imaFailed,
+            subtitle: consentFailure
+              ? detailCopy.actions.imaSkillsFailed(
+                detailCopy.showRawErrors ? msg.slice(0, 220) : detailCopy.actions.operationFailed,
+              )
+              : detailCopy.actions.operationFailed,
+            isInstall: false, isError: true,
+          });
         } finally {
           setBusyId((current) => releaseBusy(current, 'ima'));
         }
@@ -1850,7 +2013,17 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           notifyComposerToolsChanged();
         } catch (e) {
           console.error('ima logout failed:', e);
-          setAlert({ visible: true, loading: false, title: detailCopy.actions.operationFailed, subtitle: detailCopy.actions.operationFailed, isError: true });
+          // 与上方 ima connect 的 catch 同一口径：原始错误详情只在
+          // showRawErrors 开启时展示（en/ja 文案表声明 false），否则回落
+          // operationFailed 通用文案。
+          setAlert({
+            visible: true, loading: false,
+            title: detailCopy.actions.operationFailed,
+            subtitle: detailCopy.showRawErrors
+              ? String(e && e.message ? e.message : e).slice(0, 240)
+              : detailCopy.actions.operationFailed,
+            isInstall: false, isError: true,
+          });
         } finally {
           setBusyId((current) => releaseBusy(current, 'ima'));
         }
@@ -1968,7 +2141,10 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
           notifyComposerToolsChanged();
         } catch (e) {
           console.error('uninstall failed:', e);
-          setAlert({ visible: true, loading: false, title: detailCopy.actions.operationFailed, isInstall: false, isError: true });
+          // Surface the refusal detail (companion-teardown abort, recycle
+          // preflight, scope-lock refusal) — the sibling install path does;
+          // a bare title hides actionable guidance.
+          setAlert({ visible: true, loading: false, title: detailCopy.actions.operationFailed, subtitle: String(e && e.message ? e.message : e).slice(0, 240), isInstall: false, isError: true });
         } finally {
           setBusyId((current) => releaseBusy(current, backendId));
         }
@@ -1980,6 +2156,30 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         return () => { document.body.style.overflow = 'unset'; };
       }, [selectedTool]);
 
+      // 详情弹窗的动作按钮必须吃实时状态：弹窗持有的是点开时的卡对象快照，
+      // 连接/断开/更新完成后 loadBackendState 只刷新列表数据源（bundleStates 等），
+      // 快照停留旧值——按钮滞留「连接」，而横幅按实时连接态已显示「已连接」，
+      // 要重开弹窗才恢复（用户实机报告）。按钮驱动且会随操作流变化的字段从列表
+      // 实时卡覆盖（与列表卡同源同值）：installed/actions，以及 updateAvailable
+      // ——ima/组合卡的「更新」入口由它注入（后端 actions 不含 update），不覆盖则
+      // 弹窗内更新成功后「更新」幻影滞留，再点会对同版本重复走覆盖式更新。其余
+      // 展示字段维持快照（生效名/说明的显式补拉见 doEditDisplaySave）。查找要求
+      // backendId 非空：即将上线占位卡没有 backendId，按 undefined 匹配会撞上
+      // 第一张占位卡（今日各占位卡按钮字段恒等、渲染无差，仍不应依赖该巧合）。
+      // 卡已不在列表（卸载后消失的自定义包/上传技能/随包解散的组合卡）时回退
+      // 快照，渲染与修复前逐字节一致——卸载路径会 patch 快照 installed
+      // （handleAction/handleSkillAction），旧分支据其渲染；OAuth selectedToolPatch
+      // 与卸载 patch 在实时卡命中的主路径同样承重（authStatus 驱动「重新授权」
+      // 文案），并非仅供回退的死代码，勿当冗余清理。
+      const selectedLiveTool = selectedTool && selectedTool.backendId
+        ? (tools.find(x => x.backendId === selectedTool.backendId)
+          || skillCards.find(x => x.backendId === selectedTool.backendId))
+        : null;
+      const detailTool = selectedTool
+        ? (selectedLiveTool
+          ? { ...selectedTool, installed: selectedLiveTool.installed, actions: selectedLiveTool.actions, updateAvailable: selectedLiveTool.updateAvailable }
+          : selectedTool)
+        : null;
       // Detail page "Connected" banner (five connectors, one shared visual shell): CLI connectors need the connection
       // state ready and the flow card collapsed; ima has no flow card, connection state only. Mutually exclusive, at most one shows.
       const connectedBanners = [
@@ -2003,10 +2203,14 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
             </div>
           )}
           {createPortal(<TsConfigDialog
+            // 配置对象在不同工具之间复用同一弹窗组件；用工具 id 作为 key，
+            // 关闭或切换工具时重建本地字段状态，避免把上一工具的 Key 带入安装请求。
+            key={(externalAuthAvailable && configDialog?.backendId) || 'closed'}
             config={externalAuthAvailable ? configDialog : null}
             copy={storeCopy}
             onCancel={() => setConfigDialog(null)}
             onConfirm={(values) => { const bid = configDialog.backendId; setConfigDialog(null); if (bid === 'ima') connectIma(values); else doInstall(bid, values); }}
+            onBrowserOpenError={browserOpenFailed}
           />, document.body)}
           {createPortal(<TsObsidianGuide
             guide={obsidianGuide}
@@ -2123,7 +2327,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                           <div className="flex-1 min-w-0">
                             <h3 className="text-[15px] font-semibold text-slate-900 dark:text-white truncate">{name}</h3>
                             <div className="flex items-center gap-2 mt-1">
-                              <span className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded uppercase tracking-wide">{(storeCopy.typeGroups || {})[item.kind] || item.kind}</span>
+                              <span className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded uppercase tracking-wide">{(storeCopy.typeLabels || {})[item.kind] || item.kind}</span>
                               {recycledAt && <span className="text-[12px] text-slate-400 dark:text-slate-500">{storeCopy.recycledAt(recycledAt)}</span>}
                             </div>
                           </div>
@@ -2156,7 +2360,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                   <EmptyState
                     testId="recycle-bin-loading"
                     className="py-24 flex flex-col items-center"
-                    icon={<Spinner size={24} tone="brand" className="mb-4" />}
+                    icon={<Spinner size={24} className="mb-4" />}
                     title={storeCopy.recycleBinLoading}
                     titleClassName="text-slate-500 dark:text-slate-400"
                   />
@@ -2184,7 +2388,43 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
             </main>
           </div>
           )}
-          {!showRecycleBin && (
+          {/* Builtin plugins subpage (docs/builtin-toolset-contract.md §3.1
+              transparency/audit window): fully read-only; shows the tool list,
+              security level, version (upgraded with the app) and data access
+              scopes; no uninstall, no toggles. Same structure as the recycle-bin
+              subpage: the back button returns to the main list. */}
+          {showBuiltinPlugins && (
+          <div className="flex-1 flex flex-col bg-white dark:bg-[#131314] text-slate-900 dark:text-white transition-colors duration-300 font-sans overflow-y-auto custom-scrollbar p-4 sm:p-6 lg:p-10">
+
+            <header className="z-30 bg-white/80 dark:bg-[#131314]/80 backdrop-blur-2xl transition-colors">
+              <div className="max-w-[1400px] mx-auto border-b border-slate-200/50 pb-6 dark:border-white/10">
+                <div className="flex items-center gap-3">
+                  <button type="button" data-testid="builtin-plugins-back" onClick={() => setShowBuiltinPlugins(false)} title={storeCopy.back} aria-label={storeCopy.back}
+                    className="w-9 h-9 rounded-full bg-slate-100 dark:bg-white/10 hover:bg-slate-200 dark:hover:bg-white/20 flex items-center justify-center text-slate-600 dark:text-slate-300 transition-colors shrink-0">
+                    <ChevronLeft size={20} />
+                  </button>
+                  <h1 className="shrink-0 text-[26px] font-normal tracking-tight">{(builtinCopy || {}).sectionTitle}</h1>
+                </div>
+                {(builtinCopy || {}).pageIntro && (
+                  <p className="mt-3 text-[13px] text-slate-500 dark:text-slate-400 leading-relaxed">{builtinCopy.pageIntro}</p>
+                )}
+              </div>
+            </header>
+
+            <main className="flex-1">
+              <div className="max-w-[1400px] mx-auto pt-5 pb-8">
+                <ul data-testid="builtin-plugin-list" className="flex flex-col">
+                  {builtinPluginCards.map((tool) => (
+                    <li key={tool.id}>
+                      <BuiltinPluginCard tool={tool} copy={builtinCopy} />
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </main>
+          </div>
+          )}
+          {!showRecycleBin && !showBuiltinPlugins && (
           <div className="flex-1 flex flex-col bg-white dark:bg-[#131314] text-slate-900 dark:text-white transition-colors duration-300 font-sans overflow-y-auto custom-scrollbar p-4 sm:p-6 lg:p-10">
 
             {/* Header */}
@@ -2304,10 +2544,19 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                             <Trash2 size={14} className="mr-1.5 opacity-70" />
                             <span>{storeCopy.recycleBin}</span>
                           </button>
-                          <span className="shrink-0 hidden sm:flex items-center gap-1.5 text-[12px] text-slate-400 dark:text-slate-500 pl-1">
-                            {storeCopy.guide.dragHintShort}
+                          {/* Builtin plugins entry (docs/builtin-toolset-contract.md §3.1):
+                              a dedicated read-only subpage, kept out of the regular card flow */}
+                          {builtinPluginCards.length > 0 && (
+                            <button type="button" data-testid="tool-store-builtin-plugins" onClick={() => setShowBuiltinPlugins(true)} title={(builtinCopy || {}).sectionTitle}
+                              className="h-9 whitespace-nowrap shrink-0 inline-flex items-center rounded-full px-3.5 text-[13px] font-semibold transition-colors bg-[#F2F2F7] text-[#000] hover:bg-slate-200 dark:bg-[#2C2C2E] dark:text-[#fff] dark:hover:bg-[#3A3A3C]">
+                              <Package size={14} className="mr-1.5 opacity-70" />
+                              <span>{(builtinCopy || {}).sectionTitle}</span>
+                            </button>
+                          )}
+                          <span className="hidden xl:flex min-w-0 items-center gap-1.5 text-[12px] text-slate-400 dark:text-slate-500 pl-1">
+                            <span className="truncate">{storeCopy.guide.dragHintShort}</span>
                             <button type="button" onClick={() => setShowGuide(true)} aria-label={storeCopy.guide.title} title={storeCopy.guide.title}
-                              className="w-[18px] h-[18px] rounded-full bg-slate-200 dark:bg-white/10 text-slate-500 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-white/20 flex items-center justify-center text-[11px] font-bold leading-none">?</button>
+                              className="shrink-0 w-[18px] h-[18px] rounded-full bg-slate-200 dark:bg-white/10 text-slate-500 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-white/20 flex items-center justify-center text-[11px] font-bold leading-none">?</button>
                           </span>
                         </div>
                       </div>
@@ -2337,7 +2586,7 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                                   <h3 className="text-[17px] font-semibold text-slate-900 dark:text-white truncate tracking-tight">{tool.title}</h3>
                                   <p className="text-[13px] text-slate-500 dark:text-slate-400 truncate mt-0.5 font-medium">{tool.subtitle}</p>
                                   <div className="flex items-center gap-2 mt-1.5">
-                                    <span className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded uppercase tracking-wide">{tool.type}</span>
+                                    <span className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded uppercase tracking-wide">{(storeCopy.catalogTypes || {})[tool.type] || tool.type}</span>
                                     {tool.authRequired && (
                                       <span className="text-[10px] text-amber-500/80 dark:text-amber-400/80 flex items-center gap-0.5">
                                         <Zap size={10} /> {storeCopy.keyRequired}
@@ -2358,10 +2607,20 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                                         // biome-ignore lint/a11y/noStaticElementInteractions: click-propagation stop layer, non-interactive container
                                         <div className="flex flex-col items-start gap-1" onClick={(e) => e.stopPropagation()}>
                                           {[{ key: 'plain', label: storeCopy.modePlain }, { key: 'code', label: storeCopy.modeCode }].map((m) => {
-                                            // 无 backendId 的卡（占位卡/内置 s5）不参与可见性配置：禁用勾选；
-                                            // 可见性读取未成功（visibilityLoaded=false）时同样禁用——handler 虽有
-                                            // 早退，但可点而无反馈的勾选框会误导用户以为配置已生效（四轮评审）。
-                                            const checkDisabled = !tool.backendId || !visibilityLoaded;
+                                            // Placeholder cards (no backendId) and builtin skill cards (the
+                                            // builtin flag, e.g. visual-design) take no part in visibility
+                                            // configuration: their checkboxes stay disabled. backendId alone is
+                                            // not enough — round-5 M3 gave the builtin skill a backendId, and
+                                            // its hide write carries no MCP catalog id, passes the backend
+                                            // guard, and would silently drop the builtin skill from that
+                                            // mode's composer/model while the composer's builtin row ignores
+                                            // `hidden` and keeps presenting it as always-on (UI/model
+                                            // divergence, §3.1 gap — round-6 M2). A failed visibility read
+                                            // (visibilityLoaded=false) disables the checkboxes too: the
+                                            // handler exits early, but a clickable checkbox with no feedback
+                                            // misleads the user into thinking the change took effect
+                                            // (review round 4).
+                                            const checkDisabled = !tool.backendId || tool.builtin || !visibilityLoaded;
                                             // 读回比对与写入同口径：后端 hidden 集按包 id 返回，companion 卡先经
                                             // skillToMcp 映射为所属包 id；同时回退比对原始技能 id，兼容历史版本
                                             // 按独立技能 id 落库的条目（未装→装边界）（五轮评审）。
@@ -2499,43 +2758,43 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
                       <h2 className="text-2xl sm:text-3xl font-extrabold text-slate-900 dark:text-white mb-2 tracking-tight">{selectedTool.title}</h2>
                       <p className="text-[17px] text-slate-500 dark:text-slate-400 mb-5 font-medium">{selectedTool.subtitle}</p>
                       <div className="flex flex-col items-end gap-1.5">
-                        <PlatformToolAction tool={selectedTool} busy={busyId === selectedTool.backendId} onAction={handleAction} onUpdate={handleSkillUpdate} onEditDisplay={handleEditDisplay} onExport={handleExportInstalled} size="lg" copy={storeCopy} t={t} />
-                        {((selectedTool.feishuCli && !feishuConnected) || (selectedTool.wecomCli && !wecomConnected) || (selectedTool.dingtalkCli && !dingtalkConnected) || (selectedTool.tmeetCli && !tmeetConnected)) && <span className="text-[11px] text-slate-400">{storeCopy.firstUseOnlineInstall}</span>}
+                        <PlatformToolAction tool={detailTool} busy={busyId === selectedTool.backendId} onAction={handleAction} onUpdate={handleSkillUpdate} onEditDisplay={handleEditDisplay} onExport={handleExportInstalled} size="lg" copy={storeCopy} t={t} />
+                        {((selectedTool.feishuCli && !feishuConnected) || (selectedTool.wecomCli && !wecomConnected) || (selectedTool.dingtalkCli && !dingtalkConnected) || (selectedTool.tmeetCli && !tmeetConnected)) && <span className="text-[11px] text-slate-500 dark:text-slate-400">{storeCopy.firstUseOnlineInstall}</span>}
                       </div>
                     </div>
                   </div>
 
                   <div className="flex items-center justify-between py-5 mb-8 border-y border-slate-100 dark:border-white/5 overflow-x-auto no-scrollbar gap-8">
                     <div className="flex flex-col flex-shrink-0">
-                      <span className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider mb-1">{storeCopy.detailInterfaceType}</span>
-                      <span className="text-xl font-bold text-slate-800 dark:text-slate-200">{selectedTool.type}</span>
-                      <span className="text-[12px] text-slate-400 mt-1 flex items-center gap-1"><Server size={12}/> {storeCopy.detailOfficialSupport}</span>
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wider mb-1">{storeCopy.detailInterfaceType}</span>
+                      <span className="text-xl font-bold text-slate-800 dark:text-slate-200">{(storeCopy.catalogTypes || {})[selectedTool.type] || selectedTool.type}</span>
+                      <span className="text-[12px] text-slate-500 dark:text-slate-400 mt-1 flex items-center gap-1"><Server size={12}/> {storeCopy.detailOfficialSupport}</span>
                     </div>
                     <div className="w-px h-12 bg-slate-200 dark:bg-slate-800 flex-shrink-0" />
                     <div className="flex flex-col flex-shrink-0">
-                      <span className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider mb-1">{storeCopy.detailVersion}</span>
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wider mb-1">{storeCopy.detailVersion}</span>
                       <span className="text-xl font-bold text-slate-800 dark:text-slate-200">{selectedTool.version}</span>
-                      <span className="text-[12px] text-slate-400 mt-1">{storeCopy.detailStableRelease}</span>
+                      <span className="text-[12px] text-slate-500 dark:text-slate-400 mt-1">{storeCopy.detailStableRelease}</span>
                     </div>
                     <div className="w-px h-12 bg-slate-200 dark:bg-slate-800 flex-shrink-0" />
                     <div className="flex flex-col flex-shrink-0 pr-4">
-                      <span className="text-[11px] text-slate-500 font-semibold uppercase tracking-wider mb-1">{storeCopy.detailLatency}</span>
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wider mb-1">{storeCopy.detailLatency}</span>
                       <span className="text-xl font-bold text-slate-800 dark:text-slate-200">{selectedTool.latency}</span>
-                      <span className="text-[12px] text-slate-400 mt-1 flex items-center gap-1"><Globe size={12}/> {storeCopy.detailGlobalAccel}</span>
+                      <span className="text-[12px] text-slate-500 dark:text-slate-400 mt-1 flex items-center gap-1"><Globe size={12}/> {storeCopy.detailGlobalAccel}</span>
                     </div>
                   </div>
 
                   {externalAuthAvailable && selectedTool.feishuCli && feishuFlow && (
-                    <FeishuFlowCard flow={feishuFlow} steps={storeCopy.feishuSteps} name={storeCopy.toolNames.feishu} copy={detailCopy.flow} onRetry={() => connectConnector('feishu')} onCancel={() => resetConnectorFlow('feishu')} onBrowserOpenError={browserOpenFailed} />
+                    <FeishuFlowCard flow={feishuFlow} steps={storeCopy.feishuSteps} name={storeCopy.toolNames.feishu} copy={detailCopy.flow} errors={storeCopy.connectorErrors} onRetry={() => connectConnector('feishu')} onCancel={() => resetConnectorFlow('feishu')} onBrowserOpenError={browserOpenFailed} />
                   )}
                   {externalAuthAvailable && selectedTool.wecomCli && wecomFlow && (
-                    <FeishuFlowCard flow={wecomFlow} steps={storeCopy.wecomSteps} name={storeCopy.toolNames.wecom} copy={detailCopy.flow} twoStep={false} onRetry={() => connectConnector('wecom')} onCancel={() => resetConnectorFlow('wecom')} onBrowserOpenError={browserOpenFailed} />
+                    <FeishuFlowCard flow={wecomFlow} steps={storeCopy.wecomSteps} name={storeCopy.toolNames.wecom} copy={detailCopy.flow} errors={storeCopy.connectorErrors} twoStep={false} onRetry={() => connectConnector('wecom')} onCancel={() => resetConnectorFlow('wecom')} onBrowserOpenError={browserOpenFailed} />
                   )}
                   {externalAuthAvailable && selectedTool.dingtalkCli && dingtalkFlow && (
-                    <FeishuFlowCard flow={dingtalkFlow} steps={storeCopy.dingtalkSteps} name={storeCopy.toolNames.dingtalk} copy={detailCopy.flow} twoStep={false} onRetry={() => connectConnector('dingtalk')} onCancel={() => resetConnectorFlow('dingtalk')} onBrowserOpenError={browserOpenFailed} />
+                    <FeishuFlowCard flow={dingtalkFlow} steps={storeCopy.dingtalkSteps} name={storeCopy.toolNames.dingtalk} copy={detailCopy.flow} errors={storeCopy.connectorErrors} twoStep={false} onRetry={() => connectConnector('dingtalk')} onCancel={() => resetConnectorFlow('dingtalk')} onBrowserOpenError={browserOpenFailed} />
                   )}
                   {externalAuthAvailable && selectedTool.tmeetCli && tmeetFlow && (
-                    <FeishuFlowCard flow={tmeetFlow.phase === 'error' && !detailCopy.showRawErrors ? { ...tmeetFlow, err: detailCopy.actions.operationFailed } : tmeetFlow} steps={detailCopy.tmeetSteps} name={detailCopy.tools.tmeet.title} copy={detailCopy.flow} twoStep={false} browserAuth={!!tmeetFlow.browserAuth} onRetry={() => connectConnector('tmeet')} onCancel={() => resetConnectorFlow('tmeet')} onBrowserOpenError={browserOpenFailed} />
+                    <FeishuFlowCard flow={tmeetFlow} steps={detailCopy.tmeetSteps} name={detailCopy.tools.tmeet.title} copy={detailCopy.flow} errors={storeCopy.connectorErrors} twoStep={false} browserAuth={!!tmeetFlow.browserAuth} onRetry={() => connectConnector('tmeet')} onCancel={() => resetConnectorFlow('tmeet')} onBrowserOpenError={browserOpenFailed} />
                   )}
                   {connectedBanners.filter(b => b.show).map((banner, i) => (
                     <div key={`connected-banner-${i}`} className="mb-8 flex items-center gap-3 p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/30">
@@ -2557,10 +2816,6 @@ const withUiTimeout = (promise, timeoutMs, fallbackResult) => {
         </div>
       );
     };
-
-    // ==========================================
-    // Shared Components
-    // ==========================================
 
 export { ToolStoreView };
 /* eslint-enable sonarjs/cognitive-complexity -- tool store main view;legacy view */

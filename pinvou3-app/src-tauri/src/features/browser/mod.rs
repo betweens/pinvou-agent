@@ -32,6 +32,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::platform::filesystem::{MovePlainFileOutcome, PrivateFileDirectory};
 use crate::platform::paths;
+use platform::HOST_BLANK_MARKER_TAB_PREFIX;
 use platform::state::{
     NativeRequestCancel, NativeRequestClaim, NativeTabLease, RetainedAgentOperation,
 };
@@ -553,6 +554,9 @@ impl BrowserManager {
     }
 
     fn next_watch_retry_delay(&self) -> Duration {
+        // Rust 1.99 deprecated fetch_update (renamed to try_update); the MSRV
+        // (1.89) predates the new name, so keep the old call.
+        #[allow(deprecated)]
         let current = self
             .watch_retry_delay_ms
             .fetch_update(
@@ -1288,14 +1292,12 @@ impl BrowserManager {
                     .as_deref()
                     .ok_or_else(|| "create-tab request is missing tab_token".to_string())?;
                 let requested_url = request.url.as_deref().unwrap_or("about:blank");
-                if !is_allowed_url(requested_url) {
-                    return Err("only http, https, and about:blank URLs are supported".to_string());
-                }
+                ensure_allowed_url(requested_url)?;
                 let authorization = native_mutation_lease_from_request(request)?;
                 // First create a WebView2 target with a unique marker. After the host
                 // discovers and binds it, navigate the hidden surface to requested_url,
                 // then publish through lease CAS to avoid popups and wrong-tab navigation.
-                let marker = format!("about:blank#pinvou-tab-{tab_token}");
+                let marker = format!("{HOST_BLANK_MARKER_TAB_PREFIX}{tab_token}");
                 ensure_hosted_caller_live(request)?;
                 let created = self.native_surface.lock().create_tab_for_agent(
                     app,
@@ -1313,15 +1315,15 @@ impl BrowserManager {
                     );
                 }
                 if let Err(error) = ensure_hosted_caller_live(request) {
-                    return match self.rollback_staged_agent_tab(
-                        app,
-                        &request.session_id,
-                        tab_token,
-                        &request.request_id,
-                    ) {
-                        Ok(()) => Err(error),
-                        Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                    };
+                    return Err(join_rollback_error(
+                        self.rollback_staged_agent_tab(
+                            app,
+                            &request.session_id,
+                            tab_token,
+                            &request.request_id,
+                        ),
+                        error,
+                    ));
                 }
                 let target_id = match self
                     .bind_staged_native_target(app, &request.session_id, tab_token)
@@ -1329,27 +1331,27 @@ impl BrowserManager {
                 {
                     Ok(target_id) => target_id,
                     Err(error) => {
-                        return match self.rollback_staged_agent_tab(
+                        return Err(join_rollback_error(
+                            self.rollback_staged_agent_tab(
+                                app,
+                                &request.session_id,
+                                tab_token,
+                                &request.request_id,
+                            ),
+                            error,
+                        ));
+                    }
+                };
+                if let Err(error) = ensure_hosted_caller_live(request) {
+                    return Err(join_rollback_error(
+                        self.rollback_staged_agent_tab(
                             app,
                             &request.session_id,
                             tab_token,
                             &request.request_id,
-                        ) {
-                            Ok(()) => Err(error),
-                            Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                        };
-                    }
-                };
-                if let Err(error) = ensure_hosted_caller_live(request) {
-                    return match self.rollback_staged_agent_tab(
-                        app,
-                        &request.session_id,
-                        tab_token,
-                        &request.request_id,
-                    ) {
-                        Ok(()) => Err(error),
-                        Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                    };
+                        ),
+                        error,
+                    ));
                 }
                 if !self.native_surface.lock().commit_created_tab_for_agent(
                     app,
@@ -1639,9 +1641,7 @@ impl BrowserManager {
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "browser/missing-argument: url".to_string())?;
-            if !is_allowed_url(requested_url) {
-                return Err("browser/url-not-allowed".to_string());
-            }
+            ensure_allowed_url(requested_url)?;
             let background = arguments
                 .get("background")
                 .and_then(Value::as_bool)
@@ -1750,15 +1750,15 @@ impl BrowserManager {
                     &request.request_id,
                 )?;
                 if let Err(error) = ensure_hosted_caller_live(request) {
-                    return match self.rollback_staged_agent_tab(
-                        app,
-                        &request.session_id,
-                        &tab_token,
-                        &request.request_id,
-                    ) {
-                        Ok(()) => Err(error),
-                        Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                    };
+                    return Err(join_rollback_error(
+                        self.rollback_staged_agent_tab(
+                            app,
+                            &request.session_id,
+                            &tab_token,
+                            &request.request_id,
+                        ),
+                        error,
+                    ));
                 }
                 let target_id = match self
                     .bind_staged_native_target(app, &request.session_id, &tab_token)
@@ -1766,27 +1766,27 @@ impl BrowserManager {
                 {
                     Ok(target_id) => target_id,
                     Err(error) => {
-                        return match self.rollback_staged_agent_tab(
+                        return Err(join_rollback_error(
+                            self.rollback_staged_agent_tab(
+                                app,
+                                &request.session_id,
+                                &tab_token,
+                                &request.request_id,
+                            ),
+                            error,
+                        ));
+                    }
+                };
+                if let Err(error) = ensure_hosted_caller_live(request) {
+                    return Err(join_rollback_error(
+                        self.rollback_staged_agent_tab(
                             app,
                             &request.session_id,
                             &tab_token,
                             &request.request_id,
-                        ) {
-                            Ok(()) => Err(error),
-                            Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                        };
-                    }
-                };
-                if let Err(error) = ensure_hosted_caller_live(request) {
-                    return match self.rollback_staged_agent_tab(
-                        app,
-                        &request.session_id,
-                        &tab_token,
-                        &request.request_id,
-                    ) {
-                        Ok(()) => Err(error),
-                        Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                    };
+                        ),
+                        error,
+                    ));
                 }
                 if !self.native_surface.lock().commit_created_tab_for_agent(
                     app,
@@ -1853,6 +1853,7 @@ impl BrowserManager {
                 "browser:tabs-changed",
                 json!({ "sessionId": request.session_id, "tab": tab_token }),
             );
+            self.persist_native_restore_best_effort(&request.session_id);
             return Ok(HostedBrowserOutcome::new(core::tool_text(
                 "Selected page".to_string(),
                 None,
@@ -1948,9 +1949,7 @@ impl BrowserManager {
                             .get("url")
                             .and_then(Value::as_str)
                             .ok_or_else(|| "browser/missing-argument: url".to_string())?;
-                        if !is_allowed_url(url) {
-                            return Err("browser/url-not-allowed".to_string());
-                        }
+                        ensure_allowed_url(url)?;
                         ensure_hosted_caller_live(request)?;
                         self.native_surface
                             .lock()
@@ -2316,7 +2315,7 @@ impl BrowserManager {
                     self.rollback_new_native_workspace(app, session_id, had_session);
                     return Err("WebView2 was created but CDP did not become ready".to_string().into());
                 }
-                if let Err(error) = write_port_file(port, "app", None) {
+                if let Err(error) = write_port_file(port) {
                     self.rollback_new_native_workspace(app, session_id, had_session);
                     return Err(error.into());
                 }
@@ -2950,8 +2949,8 @@ impl BrowserManager {
         start_guard: tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<RestoreWorkspaceOutcome, String> {
         // When the product gate is closed, do not even read the restore manifest or
-        // create hidden WebViews from it. Preserve it unchanged for a future enabled
-        // or preview acceptance build.
+        // create hidden WebViews from it. Preserve it unchanged for a future
+        // enabled build.
         if !crate::platform::capabilities::browser_product_enabled() {
             return Ok(RestoreWorkspaceOutcome::Missing);
         }
@@ -3069,7 +3068,7 @@ impl BrowserManager {
                             "WebView2 was restored but CDP did not become ready".to_string()
                         );
                     }
-                    write_port_file(port, "app", None)?;
+                    write_port_file(port)?;
                 }
                 for (tab_token, url) in tab_tokens.iter().zip(&restore.urls) {
                     let target_id = discover_native_target(port, tab_token).await?;
@@ -4493,9 +4492,7 @@ impl BrowserManager {
         if let Some(retained) = authorization {
             let result = async {
                 self.ensure_accepting_browser_work()?;
-                if !is_allowed_url(&url) {
-                    return Err("Only http, https, and about:blank URLs are supported".to_string());
-                }
+                ensure_allowed_url(&url)?;
                 let app = self
                     .app
                     .lock()
@@ -4514,9 +4511,7 @@ impl BrowserManager {
             return result;
         }
         self.ensure_accepting_browser_work()?;
-        if !is_allowed_url(&url) {
-            return Err("Only http, https, and about:blank URLs are supported".to_string());
-        }
+        ensure_allowed_url(&url)?;
         let app = self
             .app
             .lock()
@@ -4558,7 +4553,7 @@ impl BrowserManager {
             rand::random::<u64>(),
             rand::random::<u64>()
         );
-        let marker = format!("about:blank#pinvou-tab-{tab_token}");
+        let marker = format!("{HOST_BLANK_MARKER_TAB_PREFIX}{tab_token}");
         let created = self.native_surface.lock().create_tab_for_agent(
             app,
             browser_session_id,
@@ -4581,32 +4576,20 @@ impl BrowserManager {
             caller_epoch.caller_pid(),
             caller_epoch.wrapper_instance_nonce(),
         ) {
-            return match self.rollback_staged_agent_tab(
-                app,
-                browser_session_id,
-                &tab_token,
-                &creation_id,
-            ) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-            };
+            return Err(join_rollback_error(
+                self.rollback_staged_agent_tab(app, browser_session_id, &tab_token, &creation_id),
+                error,
+            ));
         }
         if !self
             .native_surface
             .lock()
             .authorize_popup_agent_operation(retained)
         {
-            return match self.rollback_staged_agent_tab(
-                app,
-                browser_session_id,
-                &tab_token,
-                &creation_id,
-            ) {
-                Ok(()) => Err("Popup Agent operation holder expired".to_string()),
-                Err(rollback_error) => Err(format!(
-                    "Popup Agent operation holder expired; {rollback_error}"
-                )),
-            };
+            return Err(join_rollback_error(
+                self.rollback_staged_agent_tab(app, browser_session_id, &tab_token, &creation_id),
+                "Popup Agent operation holder expired".to_string(),
+            ));
         }
 
         let target_id = match self
@@ -4615,15 +4598,15 @@ impl BrowserManager {
         {
             Ok(target_id) => target_id,
             Err(error) => {
-                return match self.rollback_staged_agent_tab(
-                    app,
-                    browser_session_id,
-                    &tab_token,
-                    &creation_id,
-                ) {
-                    Ok(()) => Err(error),
-                    Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-                };
+                return Err(join_rollback_error(
+                    self.rollback_staged_agent_tab(
+                        app,
+                        browser_session_id,
+                        &tab_token,
+                        &creation_id,
+                    ),
+                    error,
+                ));
             }
         };
         // The retained operation keeps lease provenance across the async bind,
@@ -4636,32 +4619,20 @@ impl BrowserManager {
             caller_epoch.caller_pid(),
             caller_epoch.wrapper_instance_nonce(),
         ) {
-            return match self.rollback_staged_agent_tab(
-                app,
-                browser_session_id,
-                &tab_token,
-                &creation_id,
-            ) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-            };
+            return Err(join_rollback_error(
+                self.rollback_staged_agent_tab(app, browser_session_id, &tab_token, &creation_id),
+                error,
+            ));
         }
         if !self
             .native_surface
             .lock()
             .authorize_popup_agent_operation(retained)
         {
-            return match self.rollback_staged_agent_tab(
-                app,
-                browser_session_id,
-                &tab_token,
-                &creation_id,
-            ) {
-                Ok(()) => Err("Popup Agent operation holder expired".to_string()),
-                Err(rollback_error) => Err(format!(
-                    "Popup Agent operation holder expired; {rollback_error}"
-                )),
-            };
+            return Err(join_rollback_error(
+                self.rollback_staged_agent_tab(app, browser_session_id, &tab_token, &creation_id),
+                "Popup Agent operation holder expired".to_string(),
+            ));
         }
         if !self.native_surface.lock().commit_created_tab_for_agent(
             app,
@@ -4704,7 +4675,7 @@ impl BrowserManager {
         // remote page before target binding would make the strict v2 host
         // mapping disappear and break every Agent tool after the user clicks
         // the toolbar "+" button.
-        let marker = format!("about:blank#pinvou-tab-{tab_token}");
+        let marker = format!("{HOST_BLANK_MARKER_TAB_PREFIX}{tab_token}");
         let created = {
             let mut surface = self.native_surface.lock();
             surface.create_tab(app, browser_session_id, &tab_token, &marker, background)?
@@ -4738,10 +4709,10 @@ impl BrowserManager {
         }
         .await;
         if let Err(error) = binding {
-            return match self.rollback_staged_user_tab(app, browser_session_id, &tab_token) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(format!("{error}; {rollback_error}")),
-            };
+            return Err(join_rollback_error(
+                self.rollback_staged_user_tab(app, browser_session_id, &tab_token),
+                error,
+            ));
         }
         let _ = app.emit(
             "browser:tabs-changed",
@@ -4767,9 +4738,7 @@ impl BrowserManager {
         self.ensure_accepting_browser_work()?;
         // Use the same scheme allowlist as navigate to prevent injection of local
         // or script schemes such as file:// and javascript:.
-        if !is_allowed_url(&url) {
-            return Err("Only http, https, and about:blank URLs are supported".to_string());
-        }
+        ensure_allowed_url(&url)?;
         let app = self
             .app
             .lock()
@@ -4845,9 +4814,7 @@ impl BrowserManager {
         url: String,
         request_id: &str,
     ) -> Result<(), String> {
-        if !is_allowed_url(&url) {
-            return Err("Only http, https, and about:blank URLs are supported".to_string());
-        }
+        ensure_allowed_url(&url)?;
         let app = self.app.lock().clone();
         if self.native_surface.lock().navigate(
             app.as_ref(),
@@ -5309,6 +5276,16 @@ fn is_allowed_url(url: &str) -> bool {
     }
 }
 
+/// Single guard over `is_allowed_url` for every navigation and new-tab entry
+/// point, so hosted and core paths return one canonical user-facing message.
+fn ensure_allowed_url(url: &str) -> Result<(), String> {
+    if is_allowed_url(url) {
+        Ok(())
+    } else {
+        Err("Only http, https, and about:blank URLs are supported".to_string())
+    }
+}
+
 /// Attach a page target and reuse its cached flattened session. CDP creates an
 /// independent session for every attach to the same target and does not release
 /// it automatically. Without caching, high-frequency enumeration on every
@@ -5599,10 +5576,6 @@ pub(crate) fn is_fixed_len_lowercase_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn valid_host_token(value: &str) -> bool {
-    value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 fn valid_host_request_id(value: &str) -> bool {
     (1..=160).contains(&value.len())
         && value
@@ -5645,7 +5618,10 @@ fn validate_hosted_identity(
         return Err("Browser host protocol version is unsupported".to_string());
     }
     if !valid_browser_session_id(session_id)
-        || !valid_host_token(session_token)
+        // Same lowercase-strict 16-hex shape as the wrapper TAB_TOKEN_PATTERN
+        // and the prepare quarantine token; `browser_session_token` only ever
+        // produces lowercase hex.
+        || !is_fixed_len_lowercase_hex(session_token, 16)
         || paths::browser_session_token(session_id) != session_token
     {
         return Err("Browser host request session identity validation failed".to_string());
@@ -7046,6 +7022,16 @@ async fn wait_for_hosted_cancellation(path: &Path) {
     }
 }
 
+/// Combine a staged-tab rollback outcome with the original failure: a clean
+/// rollback keeps the original error, a failed rollback appends its error
+/// after a `; ` separator so neither cause is lost.
+fn join_rollback_error(result: Result<(), String>, error: String) -> String {
+    match result {
+        Ok(()) => error,
+        Err(rollback_error) => format!("{error}; {rollback_error}"),
+    }
+}
+
 /// Parse port-file contents with explicit valid-range checks. A corrupt or
 /// foreign value such as 65536+k would silently wrap through `as u16`, probing an
 /// unrelated endpoint and delaying stale cleanup by roughly 10 seconds.
@@ -7071,21 +7057,18 @@ fn parse_host_owned_port_json(raw: &str) -> Option<u16> {
     parse_port_json(raw)
 }
 
-fn write_port_file(port: u16, owner: &str, browser_pid: Option<u32>) -> Result<(), String> {
+fn write_port_file(port: u16) -> Result<(), String> {
     let path = paths::browser_cdp_port_json();
     let parent = path
         .parent()
         .ok_or_else(|| "Browser CDP port path has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let mut data = json!({
+    let data = json!({
         "port": port,
         "pid": std::process::id(),
-        "owner": owner,
+        "owner": "app",
         "started_at": chrono::Utc::now().timestamp_millis(),
     });
-    if let Some(browser_pid) = browser_pid {
-        data["browser_pid"] = json!(browser_pid);
-    }
     let encoded = serde_json::to_vec_pretty(&data).map_err(|e| e.to_string())?;
     // CDP has no authentication. Restrict the temp file to 0600 on creation and
     // replace old files through the cross-platform state machine. Ordinary Windows
@@ -7694,7 +7677,7 @@ mod tests {
 
         // Restore A publishes P and releases start_mtx while binding. Restore B
         // then adopts P and stages its workspace before A's bind fails.
-        write_port_file(shared_port, "app", None).unwrap();
+        write_port_file(shared_port).unwrap();
         remove_failed_restore_port_if_unshared(shared_port, true).unwrap();
 
         let still_published = std::fs::read_to_string(paths::browser_cdp_port_json()).unwrap();
@@ -7710,7 +7693,7 @@ mod tests {
         remove_failed_restore_port_if_unshared(shared_port, false).unwrap();
         assert!(!paths::browser_cdp_port_json().exists());
 
-        write_port_file(shared_port + 1, "app", None).unwrap();
+        write_port_file(shared_port + 1).unwrap();
         remove_failed_restore_port_if_unshared(shared_port, false).unwrap();
         let replacement = std::fs::read_to_string(paths::browser_cdp_port_json()).unwrap();
         assert_eq!(

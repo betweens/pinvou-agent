@@ -54,7 +54,7 @@ const BUILTIN_CLI_BUNDLES: &[(&str, &str, &str, &[&str], &str)] = &[
         "企业微信",
         "wecom-cli",
         &WECOM_SKILL_DIRS,
-        "接入企业微信官方 CLI（@wecom/cli，MIT）+ 官方域技能：让 AI 以你本人身份收发消息、读写文档与智能表格、创建/查询会议与日程、管理待办、查询通讯录。点「连接」用企业微信 App 扫码授权，全程不填 key。数据经企业微信云（可选联网功能，opt-in）。",
+        "接入企业微信官方 CLI（@wecom/cli，MIT）+ 官方域技能：让 AI 以你本人身份收发消息、收发邮件、读写文档/智能表格/在线表格/智能文档、管理微盘文件、制作演示文稿、创建/查询会议与日程、管理待办、查询通讯录。点「连接」用企业微信 App 扫码授权，全程不填 key。数据经企业微信云（可选联网功能，opt-in）。",
     ),
     (
         "dingtalk",
@@ -86,6 +86,60 @@ pub fn cli_bundle_skill_dirs(id: &str) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
+/// Whether a CLI connector's companion skill dirs are FULLY materialized on
+/// disk (`bundles/<id>/skills/<dir>/`, the same layout and all-dirs-present
+/// bar as the startup visibility cache). The DenyAll consent gate's
+/// known-bundle decision uses this as ONE HALF of the CLI-connector evidence:
+/// the files can only have been written by an earlier gated show (or carried
+/// over from a pre-locking version, where a connected connector's visible
+/// skills were the recorded status quo), and the gate additionally requires
+/// the surviving sync-ledger trace — the ledger entry is
+/// written by that gate run and cleared only by a consent-strip teardown or a
+/// fail-closed store recovery (whose re-registration is the accepted
+/// over-denial), so
+/// a stripped consent state (whose teardown also withdraws these dirs)
+/// can never keep vouching through them, not even when a
+/// gated show materializing in flight across the teardown re-lands the
+/// dirs. A partially materialized state (an interrupted show) errs toward
+/// "not known" — registration is over-denial, not exposure. Non-CLI ids are
+/// always false.
+///
+/// Case caveat: on case-insensitive filesystems the
+/// EXACT-name check makes a case-variant planted dir count as partial, so
+/// the gate registers (over-denial, fail-closed). A poisoned pre-upgrade
+/// state converges once the variant package is uninstalled — the next gated
+/// show re-extracts under the canonical names.
+///
+/// Exact-name bar: every expected dir must exist UNDER ITS EXACT NAME
+/// (read_dir, not path resolution) with a SKILL.md file inside. Path
+/// resolution would let a case-variant directory planted on a
+/// case-insensitive filesystem (macOS/Windows) vouch for consent it never
+/// received; exact names cannot. The dirs are derived from the id via
+/// [`cli_bundle_skill_dirs`], and the startup visibility cache
+/// (`cached_connector_skills_visible`) calls this same fn, so the two bars
+/// cannot diverge.
+pub(crate) fn cli_connector_skills_materialized(id: &str) -> bool {
+    let dirs = cli_bundle_skill_dirs(id);
+    if dirs.is_empty() {
+        return false;
+    }
+    let skills_dir = crate::platform::paths::bundles_root()
+        .join(id)
+        .join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return false;
+    };
+    let present: std::collections::HashSet<std::ffi::OsString> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|entry| entry.file_name())
+        .collect();
+    dirs.iter().all(|dir| {
+        present.contains(std::ffi::OsStr::new(*dir))
+            && skills_dir.join(dir).join("SKILL.md").is_file()
+    })
+}
+
 /// CLI 连接器的二进制名（execpolicy 硬拦截按它构造 deny 规则）。
 pub fn cli_bundle_bin(id: &str) -> Option<&'static str> {
     BUILTIN_CLI_BUNDLES
@@ -95,45 +149,157 @@ pub fn cli_bundle_bin(id: &str) -> Option<&'static str> {
 }
 
 /// 技能目录名 → CLI 连接器 id（内置清单反查；非 CLI companion 返回 None）。
+///
+/// Case-folded like the exact-name bar of every other CLI identity claim: on
+/// case-insensitive filesystems (default macOS/Windows) a case-variant
+/// on-disk directory resolves to the connector's dir regardless of declared
+/// casing, so the reverse claim must fold the same way or
+/// the vocabulary guards and the consent gate would disagree about what
+/// counts as the connector's companion. On Linux this can only over-deny a
+/// hypothetical distinct package whose skill dir differs solely by case —
+/// the import pipeline rejects such names, so the fold converges.
 pub(crate) fn cli_bundle_of_skill(skill_dir: &str) -> Option<&'static str> {
     BUILTIN_CLI_BUNDLES
         .iter()
-        .find(|(.., dirs, _)| dirs.contains(&skill_dir))
+        .find(|(.., dirs, _)| dirs.iter().any(|d| d.eq_ignore_ascii_case(skill_dir)))
         .map(|(id, ..)| *id)
 }
-
-/// 技能目录名 → 所属包 id（物理布局归属，§4「一个包 = 一个目录 = 一个属主」）。
+/// Skill dir name → owner pack id (manifest-claim semantics; the lens for
+/// import collision checks and UI display).
 ///
-/// **条件认领**（与 list_bundles 的 V5 决策一致）：ima 认领 ima-skills（同
-/// list_bundles 的 skill_claimed 预置）→ CLI 内置清单 → MCP manifest
-/// companion_skills（仅当所属 MCP 包当前已装才归 MCP；未装时技能保留独立
-/// 纯技能包形态，owner = 技能名自身）→ 独立成包。迁移层
-/// （`skill_marketplace::legacy_companion_owners`）按同一条件口径推导，
-/// 两侧不得分叉（四轮评审 M-7）。
+/// **Conditional claim** (matching list_bundles' V5 decision): ima claims
+/// ima-skills (same as list_bundles' skill_claimed preset) → the CLI builtin
+/// manifests → MCP manifest companion_skills (attributed to the MCP pack only
+/// while that MCP pack is currently installed; uninstalled, the skill keeps
+/// its standalone pure-skill-pack form, owner = the skill name itself) →
+/// otherwise its own pack. The migration layer
+/// (`skill_marketplace::legacy_companion_owners`) derives owners under the
+/// same conditional lens; the two sides must not diverge (four review rounds,
+/// M-7).
+///
+/// The gating/materialization side resolves ownership via
+/// [`skill_gating_owner`] (physical-layout fallback included): import
+/// collision checks must stay on manifest-claim semantics — import staging
+/// dirs (`<id>.tmp`) and an existing install's physical nesting would both
+/// make the physical lens misread a self-collision as a cross-pack conflict
+/// (the pitfall the first R17-MAJOR1 fix cut itself on).
 pub(crate) fn skill_owner_package(skill_name: &str) -> String {
+    skill_owner_package_with(&MarketplaceManager::new().available_tools(), skill_name)
+}
+
+/// [`skill_owner_package`] over a pre-walked tool snapshot — the hoisted form
+/// resolution passes use so one `available_tools()` walk (every manifest under
+/// `bundles_root` parsed once) serves the whole id list instead of one walk
+/// per id (review #455 round-23 MINOR 3). Semantics identical to the wrapper.
+pub(crate) fn skill_owner_package_with(tools: &[super::ToolManifest], skill_name: &str) -> String {
     if skill_name == "ima-skills" {
         return "ima".to_string();
     }
     if let Some(cli) = cli_bundle_of_skill(skill_name) {
         return cli.to_string();
     }
-    for tool in MarketplaceManager::new().available_tools() {
-        if tool.companion_skills.iter().any(|s| s == skill_name) {
+    for tool in tools {
+        // Case-folded like the builtin guards: on case-insensitive filesystems
+        // an on-disk `Session-Reader` directory resolves to the companion
+        // skill regardless of declared casing (review round-5 minor 4).
+        if tool
+            .companion_skills
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(skill_name))
+        {
             // V5「随包」认领：包本体已装才把技能归属到包（与 list_bundles 的认领
             // 条件一致）；未装时技能保留独立纯技能包形态（owner = 技能名自身）。
             // 保证 save 归一与物化排除跟 UI 展示的包形态对齐（二轮评审：scope
             // save 归一与 V5 条件认领冲突）。
             if bundle_installed(&tool.id) {
-                return tool.id;
+                return tool.id.clone();
             }
             break;
         }
     }
     skill_name.to_string()
 }
+/// Skill dir name → the gating/materialization owner: [`skill_owner_package`]'s
+/// conditional claim plus a **physical-layout fallback** (R17-MAJOR1). A skill
+/// dir physically nested under `bundles/<pkg>/skills/<name>/` belongs to
+/// `<pkg>` whether or not the manifest declares it — session materialization
+/// scans directories and sees only physical layout; if the gate attributed an
+/// undeclared skill to the skill name itself, it would enter every scope with
+/// zero consent and no composer row to turn it off (the record-driven lists
+/// have no such row). The fallback shares materialization's lens: purely
+/// physical (no install-record lookups, staging dirs excluded (round-27 m4) —
+/// the gating side does not distinguish "currently importing" dirs; import
+/// collision checks never route through this function). First match in sorted
+/// order keeps the outcome deterministic when several packs nest the same
+/// name; no hit → the skill is its own pack.
+pub(crate) fn skill_gating_owner(skill_name: &str) -> String {
+    skill_gating_owner_with(&MarketplaceManager::new().available_tools(), skill_name)
+}
+
+/// [`skill_gating_owner`] over a pre-walked tool snapshot (round-23 MINOR 3
+/// hoist; see [`skill_owner_package_with`]).
+pub(crate) fn skill_gating_owner_with(tools: &[super::ToolManifest], skill_name: &str) -> String {
+    let claimed = skill_owner_package_with(tools, skill_name);
+    if claimed != skill_name {
+        return claimed;
+    }
+    // Round-33 minor 4 (review #455): both swallow points below are
+    // consent-load-bearing (a degraded scan silently fails open to the
+    // standalone shape); they are logged loudly, and the full propagation
+    // refactor (a degraded flag mirroring `installed_skill_ids_strict`) is
+    // registered for the next wave — the signature change ripples through
+    // the materialization hot path and does not belong in a merge wave.
+    let rd = match std::fs::read_dir(crate::platform::paths::bundles_root()) {
+        Ok(rd) => rd,
+        Err(e) => {
+            log::warn!(
+                "[bundle] gating-owner fallback cannot read bundles_root; failing open to the standalone owner for '{skill_name}' (consent-critical, refactor registered): {e}"
+            );
+            return skill_name.to_string();
+        }
+    };
+    let mut owners: Vec<String> = rd
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                log::warn!(
+                    "[bundle] gating-owner fallback skipped an unreadable bundles_root entry (consent-critical, refactor registered): {e}"
+                );
+                None
+            }
+        })
+        // Skip import staging (`<id>.tmp`) and
+        // landing backup (`<id>.old`) dirs — the same exclusion the two
+        // lenses this fallback shares with (materialization's
+        // `skill_source_dirs`, the expansion disk leg) already apply; a
+        // crash-residue staging dir could otherwise win the sorted-first
+        // race and render its skills ungated under the suffix owner id.
+        .filter(|pkg| {
+            let name = pkg.file_name().to_string_lossy().into_owned();
+            !name.ends_with(".tmp") && !name.ends_with(".old")
+        })
+        .filter(|pkg| pkg.path().join("skills").join(skill_name).is_dir())
+        .filter_map(|pkg| pkg.file_name().into_string().ok())
+        .collect();
+    owners.sort();
+    if let Some(pkg) = owners.first() {
+        return pkg.clone();
+    }
+    skill_name.to_string()
+}
 
 /// 包是否已安装：BundleStore 记录优先；store 不可读时回退 installed.json——
 /// 与 `list_bundles` 的 V5 认领判定同口径（Phase 2 过渡期 installed.json 仍权威）。
+///
+/// Disclosed residual: the fallback consults the
+/// legacy `installed.json`, which is kept as read-only history after the
+/// one-shot legacy import — a stale id there keeps the V5 owner-claim alive
+/// while the store is unreadable. The claim additionally requires the
+/// owner's manifest to be physically present (the `available_tools` walk),
+/// and every manifest-on-disk state except a user enable also carries the
+/// owner's consent rows, so no exploitable fail-open chain is known; the
+/// direction is still fail-open-leaning compared with every other gate
+/// input. Do not extend this fallback to new callers.
 pub(crate) fn bundle_installed(id: &str) -> bool {
     match super::store::BundleStore::new().records() {
         Ok(records) => records.iter().any(|r| r.id == id && r.installed),
@@ -203,9 +369,9 @@ pub enum BundleKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidBundle;
 
-/// 就绪态（派生态，不进存储）。UI 消费 (installed, ready)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Ready state (derived state; never stored and not part of serde serialization).
+/// The UI consumes (installed, ready).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
     Ready,
     /// 未就绪；reason 给前端提示（如缺凭据的 key 列表）
@@ -581,18 +747,22 @@ fn tool_config_fields(tool: &super::ToolManifest) -> Vec<ConfigFieldSpec> {
 /// repeatedly across sources (dual use: UI field + placeholder parsing), deduplicated once by `(key, target)`,
 /// first declaration wins. The `secret` flag follows config_fields' explicit declaration (not overridden by the
 /// implicit true of secret_env/secret_headers); the latter two are sensitive declarations themselves, so secret is always true.
+///
+/// Legacy sensitive `manifest.env` keys are deliberately NOT projected here.
+/// On the remote channel they follow an existential "any one resolving key
+/// serves the entry" doctrine (the builder wires only the first), which
+/// cannot map onto this per-key required filter without false
+/// missing_credentials signals — a two-key manifest with one key stored
+/// works fine. A reconcile-disabled legacy-env entry therefore shows no
+/// Configure fix on its card; the startup reconcile note carries the why
+/// and the fix instead.
 fn dedup_credential_declarations<T>(
     tool: &super::ToolManifest,
     build: impl Fn(String, CredentialTarget, bool, bool) -> T,
 ) -> Vec<T> {
     let mut out: Vec<T> = Vec::new();
     let mut seen: Vec<(String, CredentialTarget)> = Vec::new();
-    let push = |seen: &mut Vec<(String, CredentialTarget)>,
-                out: &mut Vec<T>,
-                key: String,
-                target: CredentialTarget,
-                required: bool,
-                secret: bool| {
+    let mut push = |key: String, target: CredentialTarget, required: bool, secret: bool| {
         if seen.iter().any(|(k, t)| *k == key && *t == target) {
             return;
         }
@@ -601,8 +771,6 @@ fn dedup_credential_declarations<T>(
     };
     for f in &tool.config_fields {
         push(
-            &mut seen,
-            &mut out,
             f.key.clone(),
             parse_credential_target(&f.target),
             f.required,
@@ -610,19 +778,10 @@ fn dedup_credential_declarations<T>(
         );
     }
     for s in &tool.secret_env {
-        push(
-            &mut seen,
-            &mut out,
-            s.key.clone(),
-            CredentialTarget::Env,
-            s.required,
-            true,
-        );
+        push(s.key.clone(), CredentialTarget::Env, s.required, true);
     }
     for s in &tool.secret_headers {
         push(
-            &mut seen,
-            &mut out,
             s.source_key.clone(),
             CredentialTarget::Bearer,
             s.required,
@@ -632,19 +791,87 @@ fn dedup_credential_declarations<T>(
     out
 }
 
+/// The reason copy written into a record's `degraded` field when its
+/// authorization is disconnected. Both writers (the desktop
+/// `features::connectors::connector_cli::bundle_store_on_disconnected` and the
+/// headless `pinvou-cli` mirror in connectors.rs) import THIS constant; the
+/// connectors → marketplace dependency direction matches the standing module
+/// boundary. Publishing the judgment and the copy in the same module shrinks
+/// the drift surface from "two literals drifting independently" to "edit this
+/// one constant".
+///
+/// The judgment matches by prefix, not full equality (see this module's
+/// `degraded_by_disconnect`): the copy is human-facing hint text whose tail
+/// may be reworded at any time, and a full-equality match would let a pure
+/// copy edit silently reclassify "disconnected" back into
+/// "assets mismatch" -- exactly the misdiagnosis this judgment prevents.
+///
+/// Written as a two-half `concat!` split exactly at the classifier prefix:
+/// the first half is byte-for-byte `CLI_DISCONNECTED_DEGRADED_PREFIX`, so
+/// the prefix relationship is structural in the source (the two literals sit
+/// a few lines apart) instead of being policed by a hand-rolled const-fn
+/// byte matcher.
+pub const CLI_DISCONNECTED_DEGRADED_REASON: &str =
+    concat!("已断开授权", "：配套技能已随断开移除，重新连接即可恢复");
+
+/// [`CLI_DISCONNECTED_DEGRADED_REASON`] 的稳定前缀：分类器只认前缀（尾巴的
+/// 提示文案可随时改写），两个写入方都以它开头——重新措辞 const 时分类器
+/// 自动跟随，不会再留一份手抄字面量悄悄漂移。（上方 const 的 `concat!` 第一
+/// 段就是这段字节；改前缀时两处须同改。）
+const CLI_DISCONNECTED_DEGRADED_PREFIX: &str = "已断开授权";
+
+/// `degraded` 原因是否来自「断开授权」而不是资产校验失败。
+fn degraded_by_disconnect(reason: &str) -> bool {
+    reason.starts_with(CLI_DISCONNECTED_DEGRADED_PREFIX)
+}
+
 /// 就绪态判定（派生态，现算不进存储）。
-/// - CLI 包：授权存在与否——由命令层经 `bundle_readiness` 分派到各 status 查询注入
-///   （注册表不直连 CLI 运行时，注入闭包保持依赖方向 app → features）
+/// - CLI 包：桌面端由命令层经 `bundle_readiness` 分派到各 status 查询注入授权态
+///   （注册表不直连 CLI 运行时，注入闭包保持依赖方向 app → features）；headless
+///   调用方（pinvou-cli `plugins readiness`）没有命令层，落到下方按 installed
+///   + degraded 的保守回退
 /// - 凭据型：credentials 必填项在系统凭据存储中齐不齐（现算）
 /// - 本地免凭据：恒 Ready
+///
+/// degraded（`store::BundleRecord::installed` 注释的存储二态异常侧：「登记在、
+/// 资源缺」）只在 CLI 臂参与判定，且按来源分两码（见该臂注释）。非 CLI 臂**不**
+/// 读 degraded：那会改变桌面 `bundle_readiness` 的 `_` 臂结论（就绪卡翻成未就绪），
+/// 是一处没有 GUI 侧需求的可见变更；需要这个信号的是 headless 的
+/// `plugins readiness`，它自己按行上的 `degraded` 派生 `assets_missing`
+/// （见 pinvou-cli `plugins.rs`），不必让桌面端跟着改判。
 pub fn readiness_for(bundle: &BundleInfo, credential_has: impl Fn(&str) -> bool) -> Readiness {
     match bundle.kind {
-        // CLI authorization state is injected by the command layer: its
-        // `bundle_readiness` `BundleKind::Cli` arm fully dispatches to the
-        // `*_status` queries, so Cli bundles never reach this function
-        // (the invariant is pinned explicitly below).
+        // The desktop command layer overrides this arm with its `*_status`
+        // dispatch; headless callers (pinvou-cli has no command layer) get
+        // the conservative installed-based verdict instead of a panic. That
+        // fallback is strictly weaker than the desktop's live probe: it sees
+        // registry facts only, never the connection state. The headless
+        // surface must disclose that gap itself rather than let a registry
+        // `Ready` pass for a probed one —— see pinvou-cli `plugins.rs`
+        // readiness (`probe: "unavailable_in_cli"`).
         BundleKind::Cli => {
-            unreachable!("CLI bundle readiness is dispatched by the command layer")
+            if !bundle.installed {
+                Readiness::NotReady("cli_not_installed")
+            } else if let Some(reason) = bundle.degraded.as_deref() {
+                // CLI 包的 degraded 有两个来源，修复动作正好相反，必须分码：
+                // 1) 断开授权 —— `connector_cli::bundle_store_on_disconnected`
+                //    在**每一次**断开（桌面断开 / `connectors logout`）时置位，
+                //    是常态路径；修复动作 = 重新授权连接（重解包 companion 技能）。
+                // 2) 存量二进制对照 lock 表校验 SHA-256 不匹配 / 无法校验
+                //    （`store::legacy_cli_records` 的 `CliAssetState::Mismatch`），
+                //    只在首启导入时一次性置位；修复动作 = 重新下载二进制。
+                // 一律报 (2) 会把「刚登出」这个最常见的 degraded 诊断成资产损坏，
+                // 把运维引去重下二进制而不是重新授权——与分码的初衷相反。
+                // 两者都不是桌面端实时探测得出的 `not_connected`：那个码只由
+                // 命令层的 status 探测下发，此处不冒名。
+                if degraded_by_disconnect(reason) {
+                    Readiness::NotReady("cli_disconnected")
+                } else {
+                    Readiness::NotReady("cli_assets_mismatch")
+                }
+            } else {
+                Readiness::Ready
+            }
         }
         BundleKind::Mcp | BundleKind::Bundle | BundleKind::Skill => {
             // Local credential-free (no required credentials) is always Ready; with required credentials, check the system credential store.
@@ -656,6 +883,8 @@ pub fn readiness_for(bundle: &BundleInfo, credential_has: impl Fn(&str) -> bool)
                 .filter(|c| c.required && !credential_has(&c.key))
                 .map(|c| c.key.as_str())
                 .collect();
+            // degraded 不在此臂参与判定（理由见函数文档）：这是桌面就绪卡直接
+            // 消费的结论，改判它是 GUI 可见变更，而提出诉求的只有 headless 侧。
             if missing.is_empty() {
                 Readiness::Ready
             } else {
@@ -794,8 +1023,70 @@ mod tests {
             required: false,
         }];
         assert_eq!(
-            readiness_for(&b(BundleKind::Skill, opt), |_| false),
+            readiness_for(&b(BundleKind::Skill, opt.clone()), |_| false),
             Readiness::Ready
+        );
+        // Headless fallback (pinvou-cli has no command layer to inject the
+        // `*_status` verdict): an installed CLI bundle is Ready, an
+        // uninstalled one reports cli_not_installed instead of panicking.
+        assert_eq!(
+            readiness_for(&b(BundleKind::Cli, vec![]), |_| false),
+            Readiness::Ready
+        );
+        let mut uninstalled_cli = b(BundleKind::Cli, vec![]);
+        uninstalled_cli.installed = false;
+        assert_eq!(
+            readiness_for(&uninstalled_cli, |_| false),
+            Readiness::NotReady("cli_not_installed")
+        );
+        // CLI 记录的 degraded 分两码，因为修复动作相反：断开授权 → 重新连接，
+        // 资产校验失败 → 重下二进制。断开是每次登出都会走的常态路径，一律报
+        // 资产损坏会把运维引错方向（那正是分码前的缺陷）。
+        let mut disconnected_cli = b(BundleKind::Cli, vec![]);
+        disconnected_cli.degraded = Some(CLI_DISCONNECTED_DEGRADED_REASON.into());
+        assert_eq!(
+            readiness_for(&disconnected_cli, |_| false),
+            Readiness::NotReady("cli_disconnected")
+        );
+        let mut degraded_cli = b(BundleKind::Cli, vec![]);
+        degraded_cli.degraded = Some("CLI 二进制 SHA-256 与 lock 表不符，待重新下载".into());
+        assert_eq!(
+            readiness_for(&degraded_cli, |_| false),
+            Readiness::NotReady("cli_assets_mismatch")
+        );
+        for cli in [&disconnected_cli, &degraded_cli] {
+            assert_ne!(
+                readiness_for(cli, |_| false),
+                Readiness::NotReady("not_connected"),
+                "headless 回退不得冒用 not_connected：那个码来自桌面端的实时 status 探测"
+            );
+        }
+        // 非 CLI 臂不读 degraded：这是桌面就绪卡直接消费的结论，改判它属于没有
+        // GUI 侧需求的可见变更。需要这个信号的 headless 侧（pinvou-cli
+        // `plugins readiness`）自行按行上的 degraded 派生 assets_missing，
+        // 对应契约测试 `readiness_derives_assets_missing_for_a_degraded_package`。
+        for kind in [BundleKind::Mcp, BundleKind::Bundle, BundleKind::Skill] {
+            let mut degraded = b(kind, opt.clone());
+            degraded.degraded = Some("resources missing".into());
+            assert_eq!(
+                readiness_for(&degraded, |_| true),
+                Readiness::Ready,
+                "{kind:?} 的 degraded 不得改变桌面就绪卡的结论"
+            );
+        }
+        // 缺必填凭据仍然判 NotReady，degraded 与否都不影响该结论。
+        let mut degraded_and_uncredentialed = b(
+            BundleKind::Mcp,
+            vec![CredentialSpec {
+                key: "AMAP_KEY".into(),
+                target: CredentialTarget::Env,
+                required: true,
+            }],
+        );
+        degraded_and_uncredentialed.degraded = Some("resources missing".into());
+        assert_eq!(
+            readiness_for(&degraded_and_uncredentialed, |_| false),
+            Readiness::NotReady("missing_credentials")
         );
     }
 
@@ -807,9 +1098,9 @@ mod tests {
     }
 
     /// 五轮评审必修 3：wecom 技能表与 `platform::connector_skills` 单一真相源
-    /// 一致（1.1.0 的 14 新名）；9 个新名反查命中 wecom 包（DenyAll 默认集 /
-    /// `skill_owner_package` 归属推导），0.1.9 退役名（msg/schedule）不进表、
-    /// 反查不命中。
+    /// 一致（1.1.0 引入 14 名，1.3.4 起新增 wecomcli-pptx 共 15 名）；新名
+    /// 反查命中 wecom 包（DenyAll 默认集 / `skill_owner_package` 归属推导），
+    /// 0.1.9 退役名（msg/schedule）不进表、反查不命中。
     #[test]
     fn wecom_skill_dirs_track_platform_truth() {
         let dirs = cli_bundle_skill_dirs("wecom");
@@ -818,9 +1109,14 @@ mod tests {
             crate::platform::connector_skills::WECOM_SKILL_DIRS.as_slice(),
             "marketplace 侧表必须引用 platform 单一真相源"
         );
-        assert_eq!(dirs.len(), 14);
+        assert_eq!(dirs.len(), 15);
         // 新名（0.1.9 旧表里没有的）反查命中
-        for name in ["wecomcli-calendar", "wecomcli-message", "wecomcli-disk"] {
+        for name in [
+            "wecomcli-calendar",
+            "wecomcli-message",
+            "wecomcli-disk",
+            "wecomcli-pptx",
+        ] {
             assert_eq!(
                 cli_bundle_of_skill(name),
                 Some("wecom"),
@@ -833,6 +1129,113 @@ mod tests {
             assert!(!dirs.contains(&legacy), "{legacy} 不应在现行表");
             assert_eq!(cli_bundle_of_skill(legacy), None, "{legacy} 反查应不命中");
         }
+    }
+
+    /// The CLI identity fold must hold for the REVERSE claim too — a
+    /// case-variant skill dir name resolves to the connector so the
+    /// vocabulary guards and the consent gate agree on what counts as its
+    /// companion. Reverting the `eq_ignore_ascii_case` fold in
+    /// `cli_bundle_of_skill` turns this red (the exact-name materialization
+    /// probe does not exercise this function). Empty manifests keep it
+    /// hermetic: the CLI branch precedes manifest claims in
+    /// `skill_owner_package_with`.
+    #[test]
+    fn cli_bundle_of_skill_folds_case_variant_dirs() {
+        for &dir in cli_bundle_skill_dirs("wecom") {
+            let variant = dir.to_ascii_uppercase();
+            if variant == dir {
+                continue;
+            }
+            assert_eq!(
+                cli_bundle_of_skill(&variant),
+                Some("wecom"),
+                "{variant} must fold onto the connector"
+            );
+            assert_eq!(
+                super::skill_owner_package_with(&[], &variant),
+                "wecom",
+                "{variant} owner claim must fold"
+            );
+        }
+    }
+
+    /// R17-MAJOR1 regression: a skill directory physically nested under
+    /// `bundles/<pkg>/skills/<name>/` belongs to `<pkg>` for GATING even when
+    /// **no manifest declares it** (under-declared `companion_skills`, author
+    /// omission, or a bare structural-detection pack). Session materialization
+    /// is directory-scan based and sees the skill; if gating attributed it to
+    /// the skill name itself, it would render into every scope with zero
+    /// consent and no composer row to turn it off. The manifest-claim
+    /// semantics (`skill_owner_package`, import collision checks and UI
+    /// display) deliberately stay claim-only: the import staging dir
+    /// (`<id>.tmp`) and an existing same-pack install would otherwise turn
+    /// self-collisions into false cross-package rejections. Also pins
+    /// determinism when the same name is nested in two packs (sorted first)
+    /// and the negative (no nesting → standalone).
+    #[test]
+    fn under_declared_nested_skill_claims_physical_owner() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let bundles = crate::platform::paths::bundles_root();
+            std::fs::create_dir_all(bundles.join("combo-pack").join("skills").join("stowaway"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("stowaway"),
+                "combo-pack",
+                "a nested-but-undeclared skill must attribute to its physical pack"
+            );
+            assert_eq!(
+                skill_owner_package("stowaway"),
+                "stowaway",
+                "manifest-claim semantics stay claim-only (import/UI lens)"
+            );
+            std::fs::create_dir_all(bundles.join("a-pack").join("skills").join("stowaway"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("stowaway"),
+                "a-pack",
+                "same-name nesting resolves deterministically (sorted first)"
+            );
+            assert_eq!(
+                skill_gating_owner("nowhere"),
+                "nowhere",
+                "a skill with no physical nesting stays standalone"
+            );
+        });
+    }
+
+    /// Round-29 m3 (review #455): the staging exclusion in the physical
+    /// fallback (round-27 m4) is consent-load-bearing — pin it. A
+    /// crash-residue `<id>.tmp`/`<id>.old` dir nesting the skill must never
+    /// win the sorted-first race nor attribute the skill to a suffix-owner
+    /// id; without a real pack the skill stays standalone.
+    #[test]
+    fn staging_residue_never_wins_the_physical_owner_fallback() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let bundles = crate::platform::paths::bundles_root();
+            std::fs::create_dir_all(bundles.join("ghost.tmp").join("skills").join("victim"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "victim",
+                "staging residue must not own the skill (standalone fallback)"
+            );
+            // `ghost.tmp` sorts before `real-pack`, so without the exclusion
+            // the sorted-first race would pick the residue dir.
+            std::fs::create_dir_all(bundles.join("real-pack").join("skills").join("victim"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "real-pack",
+                "the real pack owns the skill; the residue never wins the race"
+            );
+            std::fs::remove_dir_all(bundles.join("real-pack")).unwrap();
+            std::fs::rename(bundles.join("ghost.tmp"), bundles.join("ghost.old")).unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "victim",
+                "the landing-backup (.old) arm is excluded too"
+            );
+        });
     }
 
     #[test]
@@ -866,6 +1269,11 @@ mod tests {
             python_dependencies: None,
             servers: vec![],
             companion_skills: vec![],
+            builtin: false,
+            visibility: String::new(),
+            security_level: String::new(),
+            data_access: vec![],
+            tool_features: Default::default(),
         };
         let creds = tool_credentials(&tool);
         assert_eq!(creds.len(), 2);
@@ -931,6 +1339,11 @@ mod tests {
             python_dependencies: None,
             servers: vec![],
             companion_skills: vec![],
+            builtin: false,
+            visibility: String::new(),
+            security_level: String::new(),
+            data_access: vec![],
+            tool_features: Default::default(),
         };
         let fields = tool_config_fields(&tool);
         let creds = tool_credentials(&tool);
@@ -1025,7 +1438,7 @@ mod tests {
                 "ima-skills 不得独立成包"
             );
             // wecom 卡的配套技能表以 platform::connector_skills 单一真相源为准
-            //（`wecom_skill_dirs_track_platform_truth` 钉住 14 新名/退役名口径）。
+            //（`wecom_skill_dirs_track_platform_truth` 钉住 15 名/退役名口径）。
             // id 唯一（一个包 = 一个开关的前提）
             let mut ids: Vec<&str> = bundles.iter().map(|b| b.id.as_str()).collect();
             ids.sort_unstable();

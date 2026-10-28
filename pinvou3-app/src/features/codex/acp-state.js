@@ -1,18 +1,9 @@
 import {
-  commandExecutionDetails,
+  countsAsFailedOperation,
+  isOperationItemType,
   presentConversationItems,
 } from '../conversation/conversation-model.js';
-
-/// Unconditional redaction before ACP-lane error text (the red-text
-/// fallback) is displayed: an agent CLI's raw output may carry gateway
-/// custom bodies or credentials; errors the gate did not take over get no
-/// friendly card but must still never reach the screen with secrets.
-function redactDisplayError(error, language) {
-  if (!error) return error || null;
-  const helper = typeof globalThis !== 'undefined' && globalThis.PinvouModelServiceErrors;
-  if (!helper || typeof helper.redactTechnicalDetail !== 'function') return error;
-  return helper.redactTechnicalDetail(String(error), language);
-}
+import { timelineDisplayError } from '../conversation/deepseek-conversation.js';
 
 export function updateAcpAttachmentDraft(drafts, attachmentId, update) {
   for (const [owner, attachments] of Object.entries(drafts || {})) {
@@ -65,7 +56,6 @@ function emptyTurn(id) {
     tools: [],
     toolIndex: {},
     toolBlockIndex: {},
-    plan: null,
     planBlockIndex: null,
     permissions: [],
     permissionBlockIndex: {},
@@ -250,7 +240,6 @@ export function projectAcpTimeline(input, options = {}) {
         if (isTerminalToolStatus(tool.status)) block.completedAt = envelope.timestamp;
       }
     } else if (type === 'plan') {
-      turn.plan = update;
       if (turn.planBlockIndex == null) {
         turn.planBlockIndex = turn.blocks.length;
         turn.blocks.push({
@@ -342,7 +331,7 @@ export function projectAcpTimeline(input, options = {}) {
       // unconditionally before the red-text display (classification may
       // miss, credentials must not). Kept as-is when the helper (classic
       // script) is missing, degrading to existing behavior.
-      turn.error = redactDisplayError(data.error || null, language);
+      turn.error = timelineDisplayError(data.error || null, { language });
       turn.completedAt = envelope.timestamp;
     }
   }
@@ -352,25 +341,13 @@ export function projectAcpTimeline(input, options = {}) {
       && turn.elicitations.some(elicitation => !elicitation.resolved);
     turn.items = normalizeTurnItems(turn);
     turn.presentation = presentConversationItems(turn.items);
-    const operations = turn.items.filter(item => (
-      ['command_execution', 'file_change', 'tool'].includes(item.type)
-    ));
+    const operations = turn.items.filter(item => isOperationItemType(item.type));
     turn.operationCount = operations.length;
-    turn.failedOperationCount = operations.filter(item => {
-      if (String(item.status || '').toLowerCase() === 'failed') return true;
-      if (item.type !== 'command_execution') return false;
-      const exitCode = commandExecutionDetails(item.tool).exitCode;
-      return exitCode != null && exitCode !== 0;
-    }).length;
+    turn.failedOperationCount = operations.filter(countsAsFailedOperation).length;
   }
   return {
-    thread: {
-      id: events[0] && events[0].sessionId || null,
-      turns,
-    },
     turns,
     global,
-    events,
   };
 }
 
@@ -481,10 +458,43 @@ export function createAcpGapResyncScheduler(resync, {
   };
 }
 
+function canIndexSnapshotEnvelope(envelope) {
+  if (!envelope || typeof envelope !== 'object') return false;
+  // Serialized ACP envelopes have own data properties. Accessors, inherited
+  // keys and irregular sequences keep the existing replay/read semantics.
+  try {
+    const owner = Object.getOwnPropertyDescriptor(envelope, 'sessionId');
+    const sequence = Object.getOwnPropertyDescriptor(envelope, 'seq');
+    return typeof owner?.value === 'string'
+      && Number.isSafeInteger(sequence?.value) && sequence.value >= 0;
+  } catch {
+    return false;
+  }
+}
+
 export function mergeAcpTimelineSnapshot(snapshot, current, sessionId) {
-  return (current || [])
-    .filter(event => event?.sessionId === sessionId)
-    .reduce((merged, event) => appendAcpEvent(merged, event), snapshot || []);
+  const local = (current || []).filter(event => event?.sessionId === sessionId);
+  const initial = snapshot || [];
+  if (!local.length) return initial;
+  const replay = () => local.reduce((merged, event) => appendAcpEvent(merged, event), initial);
+  if (!Array.isArray(initial)) return replay();
+
+  const sequences = new Set();
+  for (const envelope of initial) {
+    if (!canIndexSnapshotEnvelope(envelope)) return replay();
+    if (envelope.sessionId === sessionId) sequences.add(envelope.seq);
+  }
+  const additions = [];
+  for (const envelope of local) {
+    if (!canIndexSnapshotEnvelope(envelope)) return replay();
+    if (sequences.has(envelope.seq)) continue;
+    sequences.add(envelope.seq);
+    additions.push(envelope);
+  }
+  // Snapshot entries win duplicate keys and are never deduplicated/replaced.
+  // A no-op must retain the snapshot's identity and even its existing order.
+  if (!additions.length) return initial;
+  return [...initial, ...additions].sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
 }
 
 export function resolveAcpSessionControls(info) {

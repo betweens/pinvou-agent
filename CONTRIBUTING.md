@@ -40,7 +40,7 @@ Every human-authored commit must include a valid `Signed-off-by`:
 git commit -s
 ```
 
-Use `--signoff` when amending or rebasing existing commits. See [DCO.md](DCO.md). CI rejects unsigned human commits; trusted Dependabot and GitHub Actions bot commits and merge commits (more than one parent) are exempt.
+Use `--signoff` when amending or rebasing existing commits. See [DCO.md](DCO.md). The `DCO` workflow enforces the `Signed-off-by` trailer on every human-authored pull-request commit; trusted Dependabot and GitHub Actions bot commits and merge commits (more than one parent) are exempt. It runs on pull requests only — direct pushes to `main` are not DCO-checked, so keep signing commits locally. The separate commit-message check (`scripts/validate-commit-msg.py`) only validates message format and does not inspect sign-offs.
 
 ## Where changes belong
 
@@ -105,13 +105,15 @@ Release-chain changes run lightweight contract tests only; full deb, dmg, and ns
 packages are built only after a
 `VERSION` change reaches `main`, or through an explicit `workflow_dispatch`.
 
-The Linux Rust job reserves at least 12 GiB of free disk after dependencies and
-caches are prepared. `scripts/ci-rust-disk.py` removes only the unused
-preinstalled SDK directories (Android, .NET, Haskell/ghcup, Julia by default;
-optionally the hostedtoolcache and browser bundles with `--aggressive`) on
-disposable GitHub-hosted Linux runners; it refuses self-hosted runners,
-redirected paths, and an undersized disk (`--min-free-gib`, default 12). The
-release build jobs run the same preparation with a 24 GiB floor. Hosted Linux
+The Linux Rust jobs prepare disk with `scripts/ci-rust-disk.py`, which removes
+only the unused preinstalled SDK directories (Android, .NET, Haskell/ghcup,
+Julia by default; optionally the hostedtoolcache and browser bundles with
+`--aggressive`) on disposable GitHub-hosted Linux runners; it refuses
+self-hosted runners, redirected paths, and an undersized disk
+(`--min-free-gib`, default 12). The pr-check rust-test job calls it before the
+swap file and caches land with a 24 GiB floor, again before the cache restore,
+and again after it (12 GiB floor); the release build jobs run the same
+preparation once with a 24 GiB floor. Hosted Linux
 runners use a single disk (`/` and `/mnt` share one ext4 filesystem), so the
 memory expansion step (`scripts/ci-memory-setup.sh`) provisions memory in
 layers: zram (on by default, sized to 2x RAM with a zstd compressor, pool
@@ -134,10 +136,17 @@ also run the full Linux behavior regression on the combined tree; Windows covera
 already ran on the ready PR and is not repeated. Frontend changes run browser smokes
 selected from the merge group's actual base/head diff; shared, unknown, or test-
 infrastructure paths fall back to the complete smoke set. Every retained `main` push
-runs cumulative Linux compile verification (full test execution stays on the
-merge-queue leg, which already validates the same combined tree) and native Windows
-checks, and continues to warm the shared caches. A red main regression is a stop
-signal for further queueing until it is fixed or reverted. During review, maintainers should inspect only required checks:
+runs cumulative Linux compile verification (full Linux behavior execution stays on the
+merge-queue leg, which already validates the same combined tree), native Windows
+checks, and — since 2026-10 — the native macOS legs folded into `macos-rust-check`
+(full lib tests on every push; the release-fast/bundle smokes only on pushes whose
+diff touches the Rust, knowledge, or packaging surfaces), and continues to warm the
+shared caches. The Windows required job runs its
+all-target metadata check and linked native regression as two parallel matrix legs;
+both legs use the same high-risk/main routing and both must pass. See
+[`docs/windows-rust-ci.md`](docs/windows-rust-ci.md) for coverage, cache, timing, and
+rollback details. A red main regression is a stop signal for further queueing until
+it is fixed or reverted. During review, maintainers should inspect only required checks:
 
 ```bash
 gh pr checks <number> --required

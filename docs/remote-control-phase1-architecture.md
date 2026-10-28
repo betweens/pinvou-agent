@@ -4,6 +4,9 @@
 > Remote 页面和协议，不提供兼容层。
 >
 > 相关概念与统一用语见[远程界面术语表](remote-control/glossary.md)。
+>
+> 范围说明：本文档描述的浏览器/手机 WebUI 依赖自建 Relay，社区版即可自行部署使用；
+> 桌面对桌面的远程控制在官方版（Official edition）中提供，不包含在社区版中。
 
 ## 1. 目标与边界
 
@@ -86,12 +89,11 @@ Web 构建以 `/pinvou3/remote/` 为默认 base path。Relay 对 HTML 禁止缓�
 前退出时，下次启动继续重放；只有收到 `desktop_endpoint_revoked`、明确的
 `endpoint_not_found` 或 endpoint 已被替换的终态后才清除记录。
 
-Relay 地址可在桌面「WebUI 访问」面板中自定义：填域名或 IP（无 TLS 的环境显式写
-`ws://` 前缀，不做静默降级），后端规范化为 WebSocket 地址 + 页面基址一对并保存在
-`~/.pinvou3/web-relay.json`。已启用时保存即触发凭据刷新——旧 endpoint 的撤销意图
-仍指向旧 relay，新凭据注册到新 relay。非默认 relay 的分享链接自动携带 `&relay=`
+Relay 地址没有应用内设置入口：变更只能通过 `PINVOU_REMOTE_RELAY_WS_URL` /
+`PINVOU_REMOTE_PUBLIC_URL` 环境变量，或手工编辑 `~/.pinvou3/web-relay.json`
+（与内置默认相同的 ws/http 地址对校验）。非默认 relay 的分享链接自动携带 `&relay=`
 参数，浏览器端优先使用该地址建连。生效优先级：运行时 env 覆盖 > `PINVOU_REMOTE_*`
-env > 用户设置 > 内置默认。
+env > `web-relay.json` > 内置默认。
 
 用户粘贴的链接形如：
 
@@ -248,4 +250,5 @@ npm --prefix pinvou3-app run test:webui
 
 该 smoke 构建真实共享 WebUI，启动真实本地 Relay，用 WebSocket 模拟桌面 endpoint，并验证
 1440×900 与 390×844 渲染、fragment 凭据隔离、单客户端接管、RPC 往返以及事件游标重连。
-缺少 Chromium/Edge 时按统一 runner 约定以 exit 2 跳过。
+缺少 Chromium/Edge 时按统一 runner 约定打印一行以 `SKIP:` 开头的说明并以退出码 2 结束；
+`scripts/run-user-journey-tests.sh` 只在这两者同时成立时才计为 skip。

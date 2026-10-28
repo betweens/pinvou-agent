@@ -12,31 +12,12 @@
   const flat = window.TauriBridge;
   if (!flat || !flat.available || typeof flat.getState !== "function") return;
 
-  const fields = {
-    platform: ["appVersion", "backendOnline", "platformCapabilities"],
-    sessions: ["sessions", "archivedSessions", "activeSessionId", "sessionBusy", "draftEpoch", "draftWorkspacePath"],
-    chat: ["activeSkill", "artifacts", "artifactChange", "attachments", "busy", "chatItems", "composerDraft", "composerPrefill", "messages", "modeState", "planSnapshot", "queued", "thinking", "tokens", "turnDirtyArtifacts", "turnPresentedArtifacts", "turnTimeline"],
-    voice: ["voiceInput", "voiceAsrSetup"],
-    knowledge: ["kbModelSetup", "mountedCollection", "mountedCollections", "mountedRemoteCollections", "mountedCollectionsRevision"],
-    scheduled: ["scheduledRunContext", "scheduledTaskAutoOpenId", "scheduledTaskBusyAction", "scheduledTaskCreationSessionId", "scheduledTaskDetail", "scheduledTaskError", "scheduledTaskErrorKind", "scheduledTaskLoading", "scheduledTaskPendingGuide", "scheduledTaskRecentRuns", "scheduledTaskRuns", "scheduledTasks", "scheduledTaskSelectionGeneration", "selectedScheduledTaskId"],
-    monitor: ["monitor", "monitorError"],
-    settings: ["settings", "selectedPet"],
-    models: ["activeModelId", "currentSessionModelId", "effectiveModelConfig", "savedModels"],
-    vllm: ["vllmBootstrapDone", "vllmBootstrapError", "vllmBootstrapping", "vllmSetup", "vllmSetupAttempt", "vllmSetupDismissed", "vllmSetupPhase"],
-    interaction: ["pinvouModal", "pinvouReviews", "pinvouSummoning", "superPermEnabled"],
-    computerUse: ["computerUse"],
-    personas: ["activePersona", "personaEvents", "personaPool"],
-    memory: ["memory"],
-    remoteControl: ["webAccess"],
-    // projects 域为桌面专属(整域不出现在 bridgeDomainContract 的 Web 域面),
-    // 但 APP_BRIDGE_STATE_DOMAINS 的订阅列表双端共享;Web 端补一个空桩
-    // (没有 bridge.projects 方法面,列表恒空),防止启动期 getMany 抛
-    // "Unknown Tauri bridge state slice: projects"(栈内 #448 的根因)。
-    projects: ["projectsList"],
-    updater: ["updateCancelling", "updateCheckError", "updateChecking", "updateDownloading", "updateError", "updateInfo", "updateProgress", "updateReady"],
-    dependencies: ["deps", "depsChecking", "depsInstallError", "depsInstallProgress", "depsInstalling"]
-  };
-
+  // FE14 wave 5：fields 注册表统一用 shared/bridge-shared-helpers.js 的
+  // STATE_SLICE_FIELDS（与桌面 lane 同一份常量）。projects 域为桌面专属
+  // (整域不出现在 bridgeDomainContract 的 Web 域面)，但 APP_BRIDGE_STATE_DOMAINS
+  // 的订阅列表双端共享；表内的 projects 空桩条目防止启动期 getMany 抛
+  // "Unknown Tauri bridge state slice: projects"(栈内 #448 的根因)。
+  const fields = window.PinvouBridgeShared.STATE_SLICE_FIELDS;
   function clone(value) {
     if (typeof structuredClone === "function") {
       try { return structuredClone(value); } catch { /* silently fall back to JSON */ } // safari14-ok: typeof-guarded with JSON fallback
@@ -52,26 +33,28 @@
     return result;
   }
 
-  // Subscriber callbacks pick a fresh outer object on every
-  // notification: any state change anywhere (e.g. a streaming token)
-  // hands every domain subscriber a new reference and a full re-render.
-  // Cache the last (full, slice) per subscriber: when full keeps its
-  // reference, reuse the last slice to keep identity stable. Note this
-  // is whole-snapshot granularity (the web transport only reuses the
-  // same full reference when nothing at all changed), weaker than the
-  // desktop bridge's per-domain revision cache: a change in any domain
-  // still swaps the outer object of unchanged domains' slices (inner
-  // field references remain shared with flat subscribers; the identity
-  // sharing contract lives in the web_bridge_domain_contract test and
-  // is unaffected). full is rebuilt by the notifier per change, so the
-  // same full reference implies this domain's field set cannot have
-  // changed.
-  function stablePick() {
-    let lastFull = null;
+  // The Web transport structurally shares unchanged subtrees between its
+  // immutable snapshots. Compare only this domain's registered fields so a
+  // chat publication does not hand settings/models subscribers a fresh outer
+  // object and force an unrelated React render. Callbacks still run for every
+  // transport publication, matching the desktop bridge contract; React can
+  // bail out through the stable snapshot identity.
+  function stablePick(domainName) {
+    const names = fields[domainName];
+    if (!names) throw new Error("Unknown Tauri bridge state slice: " + domainName);
     let lastSlice = null;
-    return function (full, domainName) {
-      if (full === lastFull) return lastSlice;
-      lastFull = full;
+    return function (full) {
+      if (lastSlice) {
+        let isUnchanged = true;
+        for (let fieldIndex = 0; fieldIndex < names.length; fieldIndex++) {
+          const name = names[fieldIndex];
+          if (!Object.is(full[name], lastSlice[name])) {
+            isUnchanged = false;
+            break;
+          }
+        }
+        if (isUnchanged) return lastSlice;
+      }
       lastSlice = Object.freeze(pick(full, domainName));
       return lastSlice;
     };
@@ -91,32 +74,32 @@
 
   function subscribe(domainName, callback) {
     get(domainName);
-    const stable = stablePick();
+    const stable = stablePick(domainName);
     return flat.subscribe(function (full) {
-      callback(stable(full, domainName));
+      callback(stable(full));
     });
   }
 
   function subscribeMany(domains, callback) {
     getMany(domains);
-    // One stable cache per domain: the stablePick closure memoizes a
-    // single (lastFull,lastSlice) slot; sharing one instance across
-    // domains would make them overwrite each other.
     const stables = {};
-    domains.forEach(function (domainName) { stables[domainName] = stablePick(); });
-    // The combined outer object is likewise memoized on the full
-    // reference in a single slot: a React setState subscriber can only
-    // bail out on whole-object identity, and rebuilding the combined
-    // object every round would make even no-change notifications trigger
-    // full re-renders, cancelling out the inner slices' identity
-    // stability (see useBridge.js's subscribeMany for the consumer).
-    let lastFull = null;
+    domains.forEach(function (domainName) { stables[domainName] = stablePick(domainName); });
+    const lastSlices = [];
     let lastResult = null;
     return flat.subscribe(function (full) {
-      if (full !== lastFull) {
+      let hasChanged = !lastResult;
+      domains.forEach(function (domainName, index) {
+        const slice = stables[domainName](full);
+        if (slice !== lastSlices[index]) {
+          lastSlices[index] = slice;
+          hasChanged = true;
+        }
+      });
+      if (hasChanged) {
         const result = {};
-        domains.forEach(function (domainName) { Object.assign(result, stables[domainName](full, domainName)); });
-        lastFull = full;
+        for (let sliceIndex = 0; sliceIndex < lastSlices.length; sliceIndex++) {
+          Object.assign(result, lastSlices[sliceIndex]);
+        }
         lastResult = Object.freeze(result);
       }
       callback(lastResult);
@@ -141,7 +124,7 @@
     return Promise.reject(new Error("computer use is not supported on the web client"));
   }
   const computerUseStubs = {};
-  ["getStatus", "refreshStatus", "grant", "revoke", "stop", "confirm", "deny", "setEnabled", "requestPermissions"]
+  ["refreshStatus", "grant", "revoke", "stop", "confirm", "deny", "setEnabled", "requestPermissions", "permissionStatus"]
     .forEach(function (name) { computerUseStubs[name] = computerUseUnsupported; });
 
   window.TauriBridge = {
@@ -149,13 +132,19 @@
     lifecycle: { init: flat.init },
     state: { get, getMany, subscribe, subscribeMany },
     platform: {},
-    chat: domain(["sendMessage", "sendMessageToSession", "getComposerDraft", "setComposerDraft", "retryFirstTurn", "prefillComposer", "removeQueued", "prioritizeQueued", "editQueued", "cancelGeneration", "cancelShellTask"]),
-    voice: domain(["startVoiceInput", "cancelVoiceAsrSetup", "closeVoiceAsrSetup", "cancelVoiceInput", "clearVoiceInput", "appendVoiceText"]),
+    chat: domain(["sendMessage", "sendMessageToSession", "getComposerDraft", "setComposerDraft", "retryFirstTurn", "prefillComposer", "restoreTaskDraft", "removeQueued", "prioritizeQueued", "editQueued", "cancelGeneration", "cancelShellTask"]),
+    auxChat: domain([], {
+      ensure: "auxChatEnsure",
+      send: "auxChatSend",
+      snapshot: "auxChatSnapshot",
+      reset: "auxChatReset",
+    }),
+    voice: domain(["startVoiceInput", "cancelVoiceAsrSetup", "closeVoiceAsrSetup", "cancelVoiceInput", "clearVoiceInput", "abandonVoiceResult", "getVoiceOperationId", "beginVoiceSubmission", "completeVoiceSubmission", "dismissVoiceInput", "hasVoiceSubmissionPending", "appendVoiceText"]),
     knowledge: domain(["mountCollection", "setCollectionEnabled", "removeCollection", "unmountCollection", "listCollections", "kbModelStatus"]),
     scheduled: domain(["loadScheduledTasks", "loadScheduledTaskRecentRuns", "selectScheduledTask", "refreshScheduledTaskData", "dismissScheduledTaskError", "createScheduledTask", "updateScheduledTask", "pauseScheduledTask", "resumeScheduledTask", "deleteScheduledTask", "runScheduledTaskNow", "startScheduledTaskChat", "openScheduledRunChat", "exitScheduledRunChat"]),
-    sessions: domain(["createNewSession", "switchToSession", "deleteSession", "renameSession", "toggleSessionPinned", "archiveSession", "restoreArchivedSession", "getSessionWorkspaceBinding"]),
+    sessions: domain(["createNewSession", "switchToSession", "deleteSession", "renameSession", "toggleSessionPinned", "archiveSession", "restoreArchivedSession", "onSessionDeleted", "getSessionWorkspaceBinding"]),
     monitor: domain(["startMonitorPolling", "stopMonitorPolling", "clearMonitorStats"]),
-    settings: domain(["setSelectedPet", "saveSettings", "saveSearchSettings"]),
+    settings: domain(["setSelectedPet", "saveSettings", "saveSearchSettings", "listBuiltinFeatures"]),
     feedback: domain(["submitFeedback"]),
     // Vendor-edition vLLM bootstrap is a desktop-only surface (same for appUpdate/webAccessAdmin):
     // the related commands are not in the web access-policy allowlist, the capability bit is always false, and the whole domain is an empty stub on the web.
@@ -168,7 +157,14 @@
     remoteControl: {},
     artifacts: domain(["artifactInfo", "readArtifactText", "writeArtifactText", "readArtifactImageB64", "readArtifactThumbnail", "renderArtifactVisual", "openContainingFolder", "revealSessionFolder", "openScheduledTaskFolder", "openArtifactExternal", "downloadArtifact", "listDeliverableIndex", "openUserExternalUrl"]),
     attachments: domain(["addAttachmentByPath", "addPasteImage", "removeAttachment", "pickAndAttach", "uploadDeviceFiles", "resolveConversationAttachment", "openConversationAttachment", "revealConversationAttachment"]),
-    files: domain(["pickFiles", "pickFolders", "pickRebindFolder", "pickFeedbackFiles"]),
+    files: domain([
+      "pickFiles",
+      "pickFolders",
+      "pickManageFolder",
+      "pickRebindFolder",
+      "pickWorkspaceFolder",
+      "pickFeedbackFiles",
+    ]),
     personas: domain(["loadPersonas", "getPersonas", "readPersonaBody", "equipPersona", "unequipPersona", "postCardCreatorIntro", "createPersona", "updatePersona", "deletePersona"]),
     memory: domain(["loadMemoryOverview", "saveMemoryProfilePatch", "updateMemoryItem", "deleteMemoryItem", "confirmMemoryCandidate", "ignoreMemoryCandidate", "neverMemoryCandidate", "organizeMemory", "loadOrganizeHistory"]),
     // In-app upgrade is a desktop-only surface (the check/download/install/restart commands are not in the web

@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 use super::relay_client::RelaySender;
@@ -25,6 +24,8 @@ pub(super) enum EventSource {
     Frontend,
 }
 
+/// Bridge-generation replay actions. Also returned by
+/// `prepare_bridge_generation`, which never needs the `None` variant.
 pub(super) enum RpcRequestAction {
     None,
     Respond(RelaySender, Value),
@@ -79,15 +80,10 @@ pub(super) fn prepare_new_rpc_admission(
     Ok(NewRpcAdmission::Durable(next_ledger))
 }
 
-pub(super) enum RpcReadyAction {
-    Respond(RelaySender, Value),
-    Dispatch(RpcDispatch),
-}
-
 pub(super) fn prepare_bridge_generation(
     inner: &mut Inner,
     generation: &str,
-) -> Vec<RpcReadyAction> {
+) -> Vec<RpcRequestAction> {
     let generation_changed = inner.bridge_generation.as_deref() != Some(generation);
     inner.bridge_generation = Some(generation.to_string());
 
@@ -114,7 +110,7 @@ pub(super) fn prepare_bridge_generation(
                 },
             );
             if let Some((endpoint_id, sender)) = &response_target {
-                actions.push(RpcReadyAction::Respond(
+                actions.push(RpcRequestAction::Respond(
                     sender.clone(),
                     rpc_response(endpoint_id, &lease_id, &request_id, &completion),
                 ));
@@ -133,7 +129,7 @@ pub(super) fn prepare_bridge_generation(
             continue;
         };
         pending.dispatched_generation = Some(generation.to_string());
-        actions.push(RpcReadyAction::Dispatch(RpcDispatch {
+        actions.push(RpcRequestAction::Dispatch(RpcDispatch {
             request_id,
             command,
             args,
@@ -292,8 +288,7 @@ pub(super) fn rpc_fingerprint(command: &str, args: &Value) -> Result<String, Str
     let canonical = canonicalize_json(args);
     let encoded = serde_json::to_vec(&(command, canonical))
         .map_err(|error| format!("serialize Web RPC fingerprint: {error}"))?;
-    let digest = Sha256::digest(encoded);
-    Ok(crate::platform::encoding::hex_lower(&digest))
+    Ok(crate::platform::hashing::sha256_hex(&encoded))
 }
 
 pub(super) fn canonicalize_json(value: &Value) -> Value {
@@ -407,14 +402,18 @@ pub(super) fn web_session_scope(command: &str) -> Option<WebSessionScope> {
         | "exit_plan_to_yolo"
         | "get_active_persona"
         | "get_mode_state"
+        | "get_or_create_aux_session"
+        | "reset_aux_session"
         | "get_session_model_id"
         | "get_session_persona_events"
         | "get_session_pinvou_reviews"
+        | "get_session_pinvou_scene_events"
         | "get_session_timeline"
         | "list_shell_tasks"
         | "list_workspace_files"
         | "save_session_persona_events"
         | "save_session_pinvou_reviews"
+        | "save_session_pinvou_scene_events"
         | "session_mount_collection"
         | "session_add_mounted_collection"
         | "session_mounted_collection"

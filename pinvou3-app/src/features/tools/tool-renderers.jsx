@@ -1,6 +1,9 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
+import { ViewErrorBoundary as ScheduledTaskLoadBoundary } from '../../shared/ViewErrorBoundary.jsx';
 import { ChevronDown, Wrench } from '../../components/icons.jsx';
 import { StatusDot } from '../../components/StatusDot.jsx';
+import { isShellExecutionTool } from '../../shared/shell-tools.mjs';
+import { cardBtnCls } from '../../shared/card-buttons.mjs';
 import { bridge, useBridgeState } from '../../hooks/useBridge.js';
 import { can } from '../../shared/platform.js';
 import { isAgentWaitCall, isExpertDelegationCall } from '../conversation/conversation-model.js';
@@ -13,18 +16,13 @@ import {
 } from '../../shared/user-input-shared.js';
 import { useShellTaskCancel } from '../chat/shell-task-cancel.js';
 import { extractComputerUseScreenshotPath } from '../computer-use/computer-use-logic.js';
-import { AcShieldCheck, AcSparkles, DiffView, GrepView, ListDirView, OutputError, OutputPre, ReceiptBlock, ShellTextView, ShellView, StockQuoteCard, TODO_TOOLS, TodoView, WeatherCard, isQuietTool, isReceipt, isStockQuoteTool, isWeatherTool, looksDiff, toolSummary, tryParseJson, tryTailJson, unwrapMcpTextEnvelope } from './tool-common.jsx';
+import {
+  SCHEDULED_TASK_CREATE_TOOL,
+  SCHEDULED_TASK_DELETE_TOOL,
+  SCHEDULED_TASK_UPDATE_TOOL,
+} from './scheduled-task-tool-logic.js';
 
-const isShellExecutionTool = name => [
-  'bash',
-  'exec_shell',
-  'exec_shell_wait',
-  'exec_wait',
-  'task_shell_start',
-  'task_shell_wait',
-  'shell',
-  'Bash',
-].includes(name);
+import { DiffView, GrepView, ListDirView, OutputError, OutputPre, ReceiptBlock, ShellTextView, ShellView, StockQuoteCard, TODO_TOOLS, TodoView, WeatherCard, isQuietTool, isReceipt, isStockQuoteTool, isWeatherTool, looksDiff, toolSummary, tryParseJson, tryTailJson, unwrapMcpTextEnvelope } from './tool-common.jsx';
 
 // P1-C：专家卡是桌面能力。Web 构建没有 multiAgent bridge（capability 关闭），
 // 强行渲染专家卡会吞掉原生 agent 工具的输出、点开只得空面板——capability
@@ -186,11 +184,54 @@ const ComputerUseScreenshotCard = ({ item, path, t }) => {
   );
 };
 
+/**
+ * app-automations result card (docs/builtin-toolset-contract.md §3.2
+ * execution visibility): the full draft of every L1 write (name/rrule/prompt
+ * excerpt) and the app-side outcome (created/updated/deleted/pending, or the
+ * recorded result of an idempotent replay) lands on the timeline; parse
+ * drift falls back to the default raw view.
+ */
+const SCHEDULED_TASK_TOOL_OPS = {
+  [SCHEDULED_TASK_CREATE_TOOL]: 'created',
+  [SCHEDULED_TASK_UPDATE_TOOL]: 'updated',
+  [SCHEDULED_TASK_DELETE_TOOL]: 'deleted',
+};
+// The result card and its parser live in the lazy scheduled-task chunk
+// (startup-budget policy in vite.config.mjs: new entry work is split or
+// lazy-loaded; the budget gate plus the dynamic-import route pin below are
+// what hold the split in place). The entry keeps only the op-name
+// dispatch.
+const ScheduledTaskToolResult = lazy(() =>
+  import('./scheduled-task-card.jsx').then(m => ({ default: m.ScheduledTaskToolResult })));
+
+// The shared boundary preserves raw output if this lazy slot fails.
+
 // eslint-disable-next-line sonarjs/cognitive-complexity -- per-tool output view routing; splitting by tool has low payoff;legacy view; tracked separately
 const ToolOutput = ({ item, t }) => {
       const computerUseEnabled = useComputerUseToolCardEnabled();
       const out = item.output;
       if (item.success === false) return <OutputError text={out} />;
+      // app-automations result card: take over only on a parse hit; any
+      // structural drift falls back to the default raw view. The card and
+      // the parser load from the lazy scheduled-task chunk (startup-budget
+      // policy); the unwrap-before-parse order (round-9 BLOCKER 1) lives in
+      // the card module's ScheduledTaskToolResult.
+      const scheduledTaskOp = SCHEDULED_TASK_TOOL_OPS[item.name];
+      if (scheduledTaskOp && item.state === 'done') {
+        return (
+          <ScheduledTaskLoadBoundary fallback={<OutputPre text={out} />}>
+            <Suspense fallback={null}>
+              <ScheduledTaskToolResult
+                op={scheduledTaskOp}
+                out={out}
+                args={item.args}
+                t={t}
+                fallback={<OutputPre text={out} />}
+              />
+            </Suspense>
+          </ScheduledTaskLoadBoundary>
+        );
+      }
       // computer_use: render the screenshot card when the output references
       // attachments/computer_use/*.png; with no screenshot or the feature off, fall back to
       // the default <OutputPre>.
@@ -249,9 +290,9 @@ const ToolOutput = ({ item, t }) => {
           return <div className="space-y-1 text-xs">
             {result.message ? <div>{String(result.message)}</div> : null}
             {files.map(path => <div key={path} className="font-mono break-all">{path}</div>)}
-            {(result.files_applied != null || result.hunks_applied != null) ? <div className="text-[#757575] dark:text-[#8E8E8E]">
+            {(result.files_applied == null && result.hunks_applied == null) ? null : <div className="text-[#757575] dark:text-[#8E8E8E]">
               files {result.files_applied ?? files.length} · hunks {result.hunks_applied ?? 0}
-            </div> : null}
+            </div>}
           </div>;
         }
       }
@@ -385,8 +426,13 @@ const ToolOutput = ({ item, t }) => {
             <div
               role="button"
               tabIndex={0}
+              aria-expanded={displayExpanded}
               onClick={toggleExpanded}
               onKeyDown={(event) => {
+                // The row hosts a real <button> (shell-task cancel): ignore
+                // keys bubbled from it, or preventDefault here would swallow
+                // the nested button's native Enter/Space activation.
+                if (event.target !== event.currentTarget) return;
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault();
                   toggleExpanded();
@@ -417,14 +463,21 @@ const ToolOutput = ({ item, t }) => {
       if (quiet) {
         const iconColor = isDone ? mutedColor : statusColor;
         return (
-          <div className={expanded ? `rounded-[12px] overflow-hidden border border-black/5 dark:border-white/5` : ''}>
+          <div className={displayExpanded ? `rounded-[12px] overflow-hidden border border-black/5 dark:border-white/5` : ''}>
             {/* biome-ignore lint/a11y/useSemanticElements: the tool card collapse header hosts a multi-child layout; a button would break existing styles */}
             <div
               role="button"
               tabIndex={0}
+              aria-expanded={displayExpanded}
               className={`flex items-center gap-2 px-2 py-1 rounded-[8px] cursor-pointer hover:bg-[#E8EDF2] dark:hover:bg-[#282A2C]`}
               onClick={() => setExpanded(!expanded)}
-              onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setExpanded(!expanded); } }}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  setExpanded(!expanded);
+                }
+              }}
             >
               <Wrench size={12} className={iconColor} />
               <span className={`text-[12px] ${mutedColor}`}>{item.name}</span>
@@ -434,7 +487,7 @@ const ToolOutput = ({ item, t }) => {
               {isRunning && <span className={`text-[11px] ${statusColor}`}>{t.toolRunning}</span>}
               {isFailed && <span className={`text-[11px] ${statusColor}`}>{t.toolFailed}</span>}
               {cancelButton}
-              <ChevronDown size={12} className={`transition-transform ${expanded ? 'rotate-180' : ''} ${mutedColor}`} />
+              <ChevronDown size={12} className={`transition-transform ${displayExpanded ? 'rotate-180' : ''} ${mutedColor}`} />
             </div>
             {detail}
           </div>
@@ -448,9 +501,16 @@ const ToolOutput = ({ item, t }) => {
           <div
             role="button"
             tabIndex={0}
+            aria-expanded={displayExpanded}
             className={`flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-[#E8EDF2] dark:hover:bg-[#282A2C]`}
             onClick={() => setExpanded(!expanded)}
-            onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setExpanded(!expanded); } }}
+            onKeyDown={(event) => {
+              if (event.target !== event.currentTarget) return;
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                setExpanded(!expanded);
+              }
+            }}
           >
             <Wrench size={14} className={statusColor} />
             <span className={`text-[13px] font-medium text-[#1F1F1F] dark:text-[#E3E3E3]`}>
@@ -461,7 +521,7 @@ const ToolOutput = ({ item, t }) => {
               : <span className="flex-1" />}
             <span className={`text-[12px] ${statusColor}`}>{statusText}</span>
             {cancelButton}
-            <ChevronDown size={14} className={`transition-transform ${expanded ? 'rotate-180' : ''} text-[#444746] dark:text-[#C4C7C5]`} />
+            <ChevronDown size={14} className={`transition-transform ${displayExpanded ? 'rotate-180' : ''} text-[#444746] dark:text-[#C4C7C5]`} />
           </div>
           {shellCancelError && (
             <div className={`px-4 pb-2 text-[11px] text-[#C5221F] dark:text-[#F28B82]`}>
@@ -497,217 +557,6 @@ const ToolOutput = ({ item, t }) => {
 
     const cardBoxCls = (accent) =>
       `rounded-[16px] border p-4 my-1 bg-[#F0F4F9] border-black/5 dark:bg-[#1E1F20] dark:border-white/10 ${accent || ''}`;
-    const cardBtnCls = (variant) => {
-      const base = 'px-3 py-1.5 rounded-full text-[13px] font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
-      if (variant === 'primary') return `${base} bg-[#0B57D0] text-white hover:bg-[#0A4BB8] dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]`;
-      // 危险确认（如首切 YOLO）：红底白字，深浅色同配色（红色在两种主题下对比度都够）。
-      if (variant === 'danger') return `${base} bg-[#C5221F] text-white hover:bg-[#A50E0E]`;
-      return `${base} bg-white text-[#1F1F1F] hover:bg-[#E1E5EA] border border-black/10 dark:border-transparent dark:bg-[#333537] dark:text-[#E3E3E3] dark:hover:bg-[#444746]`;
-    };
-
-    // 品悟角色配色（与产物卡一致）：品=盾·橙 #FF9500/#FF9F0A，悟=闪光·紫 #5E5CE6。
-    // 返回 { name, accentHex(inline-style 原色,品需 isDark), text(类), softBg(类), Icon }。
-    const pvRole = (isWu, isDark) => isWu
-      ? { name: '悟', accentHex: '#5E5CE6', text: 'text-[#5E5CE6]',
-          softBg: 'bg-[#5E5CE6]/[0.10] dark:bg-[#5E5CE6]/15', Icon: AcSparkles }
-      : { name: '品', accentHex: isDark ? '#FF9F0A' : '#FF9500', text: 'text-[#FF9500] dark:text-[#FF9F0A]',
-          softBg: 'bg-[#FF9500]/[0.10] dark:bg-[#FF9F0A]/15', Icon: AcShieldCheck };
-
-    // ==========================================
-    // PinvouSummonCard — 🧭 召唤式检阅（Boss 主动呼叫 Pinvou）
-    // 自报家门人格(单主+alternates,§3.3) + trace + issues(severity 分色)。
-    // ==========================================
-    // 逐条裁决行(§2 + kind 分流):每条按本质给对应动作,不再一刀切判断题——
-    //   recommendation(决策点/缺信息,Boss 才能定)→ 采纳建议 / 让 AI 问我;
-    //   issue.needs_verify(外部事实,AI 无知识)→ 让 AI 核实 / 我确认没问题;
-    //   issue 其他(产物缺陷,AI 改得动)→ 让 AI 改 / 接受现状(high 默认勾)。
-    // 「交给 AI 处理」按各条动作组装定向指令走 B1。单独子组件:useState 放这避 hooks 错位。
-    const PinvouRows = ({ review, t, role }) => {
-      const roleLabel = role || pvRole(false, false);
-      const body = 'text-[#000] dark:text-[#fff]';
-      const muted = 'text-[#3C3C43]/60 dark:text-[#EBEBF5]/60';
-      // iOS 语义色：high 红 / medium 橙 / low 灰
-      const sevDot = (s) => s === 'high' ? '#FF3B30' : s === 'medium' ? '#FF9500' : '#C7C7CC';
-      const rows = [
-        ...(review.recommendations || []).map((x, i) => ({
-          k: 'r' + i, raw: x, kind: 'rec', dot: '#FF9500',
-          head: (x.topic ? x.topic + '：' : '') + t.pvSuggest + x.pick, sub: x.why,
-        })),
-        ...(review.issues || []).map((x, i) => ({
-          k: 'i' + i, raw: x, kind: x.kind === 'needs_verify' ? 'verify' : 'fix',
-          dot: sevDot(x.severity), sev: x.severity, nv: x.kind === 'needs_verify',
-          head: x.text, sub: x.suggestion,
-        })),
-        ...(review.coverage || []).map((x, i) => ({
-          k: 'c' + i, raw: x, kind: 'gap', dot: '#5E5CE6',
-          sev: x.severity, head: x.dimension + (x.text ? '：' + x.text : ''), sub: x.suggestion,
-        })),
-      ];
-      // 每类二选一 [值,文案]:第一个=「要 AI 做」(高亮),第二个=Boss 自己消化(灰)。
-      const ACT = {
-        rec: [['adopt', t.pvActAdopt], ['ask', t.pvActAsk]],
-        verify: [['verify', t.pvActVerify], ['confirmed', t.pvActConfirmed]],
-        fix: [['modify', t.pvActModify], ['accept', t.pvActAccept]],
-        gap: [['fill', t.pvActFill], ['skip', t.pvActSkip]],
-      };
-      const ACTIVE = { adopt: 1, ask: 1, verify: 1, modify: 1, fill: 1 }; // 需转交给 AI 的动作
-      const [res, setRes] = useState(() => {
-        const m = {};
-        rows.forEach(it => {
-          let def = null;
-          if (it.sev === 'high') def = it.kind === 'fix' ? 'modify' : it.kind === 'gap' ? 'fill' : null;
-          m[it.k] = it.raw.resolution || def;
-        });
-        return m;
-      });
-      const setOne = (k, v) => setRes(p => ({ ...p, [k]: p[k] === v ? null : v }));
-      const activeCount = rows.filter(it => ACTIVE[res[it.k]]).length;
-      // iOS 分段按钮风：选中且需转交 AI=填充角色色(背景走 style)；选中但自行消化=灰填充；未选=描边。
-      const chip = (on, active) => `text-[12px] px-2.5 py-1 rounded-full font-medium transition-all active:scale-[0.96] ${on
-        ? (active ? 'text-white border border-transparent'
-                  : 'bg-black/[0.08] text-[#000] border border-transparent dark:bg-white/15 dark:text-[#fff]')
-        : 'border border-black/[0.12] text-[#3C3C43]/80 hover:bg-black/5 dark:border-white/15 dark:text-[#EBEBF5]/70 dark:hover:bg-white/5'}`;
-      const onResolve = () => {
-        if (!bridge.available) return;
-        // 弹窗里 review 是 notify 深拷贝,写它的 resolution 落不到原 state;把裁决按下标传给 bridge,
-        // 由 bridge 在 state.pinvouModal.review(原 state)上写、再落盘(根治 resolution 不持久化)。
-        const resolutions = {
-          recs: (review.recommendations || []).map((_, i) => res['r' + i] || 'pending'),
-          issues: (review.issues || []).map((_, i) => res['i' + i] || 'pending'),
-          coverage: (review.coverage || []).map((_, i) => res['c' + i] || 'pending'),
-        };
-        const actions = [];
-        rows.forEach(it => {
-          const a = res[it.k];
-          if (a === 'modify') actions.push({ t: 'fix', text: it.head + (it.sub ? '（' + it.sub + '）' : '') });
-          else if (a === 'verify') actions.push({ t: 'verify', text: it.head + (it.sub ? '（' + it.sub + '）' : '') });
-          else if (a === 'adopt') actions.push({ t: 'adopt', topic: it.raw.topic || '', pick: it.raw.pick || '' });
-          else if (a === 'ask') actions.push({ t: 'ask', topic: it.raw.topic || it.head });
-          else if (a === 'fill') actions.push({ t: 'fill', dimension: it.raw.dimension || '', suggestion: it.raw.suggestion || '' });
-        });
-        bridge.interaction.resolvePinvouReview(resolutions, actions);
-      };
-      return (
-        <div>
-          <div className="space-y-2">
-            {rows.map(it => {
-              const decided = res[it.k];
-              const passive = ['accept', 'confirmed', 'skip'].includes(decided);
-              return (
-                <div key={it.k} className={`rounded-[12px] px-3 py-2.5 transition-opacity ${passive ? 'opacity-40' : ''} bg-[#F2F2F7] dark:bg-white/[0.06]`}>
-                  <div className="flex gap-2.5">
-                    <span className="mt-[7px] w-[7px] h-[7px] rounded-full shrink-0" style={{ background: it.dot }} />
-                    <div className="flex-1 min-w-0">
-                      <div className={`text-[14px] leading-relaxed ${body}`}>
-                        {it.nv && <span className={`text-[10.5px] font-medium mr-1.5 px-1.5 py-px rounded-full align-[1px] bg-[#FFF8E1] text-[#B25000] dark:bg-[#FFD60A]/20 dark:text-[#FFD60A]`}>{t.pvNeedsVerify}</span>}
-                        {it.head}
-                      </div>
-                      {it.sub && <div className={`text-[13px] mt-0.5 ${muted}`}>{it.sub}</div>}
-                      <div className="flex gap-2 mt-2">
-                        {ACT[it.kind].map(([v, label]) => (
-                          <button type="button" key={v} onClick={() => setOne(it.k, v)} className={chip(decided === v, !!ACTIVE[v])}
-                            style={decided === v && ACTIVE[v] ? { background: roleLabel.accentHex } : undefined}>{label}</button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <div className="flex items-center gap-2 mt-4 pt-1">
-            {activeCount > 0 && (
-              <button type="button" onClick={onResolve}
-                className="px-4 py-2 rounded-full text-[14px] font-semibold text-white active:scale-[0.97] transition-transform"
-                style={{ background: roleLabel.accentHex }}>
-                {t.pvHandToAi(activeCount)}
-              </button>
-            )}
-            <button type="button" onClick={() => bridge.available && bridge.interaction.dismissPinvouReview()} title={t.pvSkipTitle}
-              className={`px-4 py-2 rounded-full text-[14px] font-medium transition-colors text-[#3C3C43]/70 hover:bg-black/5 dark:text-[#EBEBF5]/70 dark:hover:bg-white/5`}>
-              {t.pvSkip}
-            </button>
-          </div>
-        </div>
-      );
-    };
-
-    // 检阅 loading:本地模型 5-30s / 在线模型通常更快,iOS 旋转菊花 spinner + 计时 + 安抚文字,别让 Boss 干等焦虑。
-    const PinvouLoading = ({ isWu, isDark, t, isLocal }) => {
-      const [secs, setSecs] = useState(0);
-      useEffect(() => {
-        const b = setInterval(() => setSecs(s => s + 1), 1000);
-        return () => clearInterval(b);
-      }, []);
-      const role = pvRole(isWu, isDark);
-      // isDark 保留——SVG circle stroke 与 pvRole 品·accentHex(inline-style 原色)仍需它。
-      const muted = 'text-[#3C3C43]/60 dark:text-[#EBEBF5]/60';
-      return (
-        <div className="py-8 flex flex-col items-center text-center">
-          {/* iOS activity spinner：底环 + 角色色弧，匀速旋转 */}
-          <svg aria-hidden="true" className="w-9 h-9" viewBox="0 0 24 24" fill="none" style={{ animation: 'tsSpinner 0.8s linear infinite' }}>
-            <circle cx="12" cy="12" r="9" stroke={isDark ? 'rgba(255,255,255,.12)' : 'rgba(0,0,0,.08)'} strokeWidth="3" />
-            <path d="M12 3a9 9 0 0 1 9 9" stroke={role.accentHex} strokeWidth="3" strokeLinecap="round" />
-          </svg>
-          <div className={`flex items-center gap-1.5 mt-4 text-[15px] font-semibold ${role.text}`}>
-            <role.Icon className="w-[18px] h-[18px]" />
-            <span>{isWu ? t.pvLoadingWu : t.pvLoadingPin}</span>
-          </div>
-          <div className={`text-[13px] mt-1.5 ${muted}`}>
-            {isWu ? t.pvLoadingWuSub : t.pvLoadingPinSub}
-            {secs > 0 && <span className="ml-1.5 tabular-nums opacity-70">{secs}s</span>}
-          </div>
-          <div className={`text-[12px] mt-1 ${muted}`} style={{ opacity: 0.6 }}>{t.pvLoadingHint(isLocal)}</div>
-        </div>
-      );
-    };
-
-    // 检阅结果卡（在底部 sheet 内渲染，无外层卡框；品=橙 / 悟=紫，与产物卡一致）。
-    const PinvouSummonCard = ({ item, theme, t, isLocal }) => {
-      const isDark = theme === 'dark';
-      const isWu = !!item.coverage; // 悟=发散(coverage)；品=查错
-      const role = pvRole(isWu, isDark);
-      const muted = 'text-[#3C3C43]/60 dark:text-[#EBEBF5]/60';
-      const body = 'text-[#000] dark:text-[#fff]';
-      // isDark 保留——pvRole 品·accentHex 与 PinvouLoading SVG stroke 仍需它。
-      if (item.loading) return <PinvouLoading isWu={isWu} isDark={isDark} t={t} isLocal={isLocal} />;
-      if (item.error) return (
-        <div className="py-2">
-          <div className={`flex items-center gap-1.5 text-[15px] font-semibold ${role.text}`}><role.Icon className="w-[18px] h-[18px]" /><span>Pinvou {role.name}</span></div>
-          <div className={`text-[14px] mt-2 text-[#FF3B30] dark:text-[#FF453A]`}>{t.pvFail}{item.error}</div>
-        </div>
-      );
-      const r = item.review || {};
-      if (r.dismissed) return (
-        <div className={`py-2 flex items-center gap-1.5 text-[14px] ${muted}`}><role.Icon className="w-4 h-4" /><span>{'Pinvou · ' + role.name + ' · ' + t.pvSkipped}</span></div>
-      );
-      const personas = r.personas || [];
-      const primary = personas.find(p => p && p.primary) || personas[0] || {};
-      const alts = r.alternates || [];
-      const hasRows = (r.recommendations || []).length > 0 || (r.issues || []).length > 0 || (r.coverage || []).length > 0;
-      return (
-        <div>
-          <div className="flex items-center flex-wrap gap-x-2 gap-y-1 mb-2.5">
-            <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full ${role.softBg}`}>
-              <role.Icon className={`w-[17px] h-[17px] ${role.text}`} />
-            </span>
-            <span className={`text-[16px] font-semibold ${body}`}>
-              {'Pinvou · ' + role.name}
-              {primary.label && <span className={`text-[14px] font-normal ${muted}`}> · {primary.label + t.pvPerspective}</span>}
-            </span>
-            {r.verdict === 'pass' && <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full bg-[#34C759]/15 text-[#248A3D] dark:bg-[#30D158]/20 dark:text-[#30D158]`}>{t.pvVerdictPass}</span>}
-          </div>
-          {alts.length > 0 && <div className={`text-[12px] -mt-1 mb-2 ${muted}`}>{t.pvAlsoInvolves} {alts.join(' / ')}</div>}
-          {r.trace && <div className={`text-[14px] leading-relaxed mb-3 ${body}`}>{r.trace}</div>}
-          {(r.framework || []).length > 0 && (
-            <div className={`text-[12px] mb-3 px-3 py-2 rounded-[12px] leading-relaxed ${role.softBg} ${role.text}`}>
-              <span className="opacity-70">{t.pvFramework} · {(r.framework || []).length}{t.pvDims}: </span>{(r.framework || []).join(' · ')}
-            </div>
-          )}
-          {hasRows && <PinvouRows review={r} t={t} role={role} />}
-        </div>
-      );
-    };
 
     // ==========================================
     // PlanCard — ✨ 方案准备好
@@ -718,12 +567,12 @@ const ToolOutput = ({ item, t }) => {
       return (
         <div className={cardBoxCls('border-[#0B57D0]/20 dark:border-[#A8C7FA]/30')}>
           <div className={`text-[14px] font-semibold mb-3 text-[#1F1F1F] dark:text-[#E3E3E3]`}>{t.planReady}</div>
-          {(!item.plan && !item.todos)
-            ? <div className={`text-[13px] text-[#444746] dark:text-[#C4C7C5]`}>{t.planEmpty}</div>
-            : <>
+          {(item.plan || item.todos)
+            ? <>
                 <PlanLayer label={t.planLabel} explanation={item.plan && item.plan.explanation} items={item.plan && item.plan.items} field="step" />
                 <PlanLayer label={t.planTodos} items={item.todos && item.todos.items} field="content" />
-              </>}
+              </>
+            : <div className={`text-[13px] text-[#444746] dark:text-[#C4C7C5]`}>{t.planEmpty}</div>}
           <div className={`h-px my-3 bg-black/10 dark:bg-white/10`}></div>
           {active ? (
             <div className="flex items-center gap-2 flex-wrap">
@@ -853,11 +702,11 @@ const ToolOutput = ({ item, t }) => {
           otherAnswerLabel={t.uiToolRender.other}
           inputPlaceholder={t.uiConversation.inputPlaceholder}
           onSubmit={submit}
-          onCancel={!item.resolved && !webReadOnly
-            ? () => bridge.interaction.cancelUserInput(item.id, item.toolCallId)
-            : undefined}
+          onCancel={item.resolved || webReadOnly
+            ? undefined
+            : () => bridge.interaction.cancelUserInput(item.id, item.toolCallId)}
         />
       );
     };
 
-export { ToolOutput, ToolCard, PlanLayer, cardBoxCls, cardBtnCls, PinvouSummonCard, PlanCard, PlanStuckCard, CarefulBlockedCard, UserInputCard };
+export { ToolOutput, ToolCard, PlanLayer, cardBoxCls, PlanCard, PlanStuckCard, CarefulBlockedCard, UserInputCard };

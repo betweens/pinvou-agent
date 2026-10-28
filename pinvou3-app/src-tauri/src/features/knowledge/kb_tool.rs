@@ -36,6 +36,24 @@ const KB_REMOTE_SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
 /// 余量取 120s。
 const KB_MODEL_RELOAD_TIMEOUT_SECS: u64 = 120;
 
+/// kb_search 语义降级的模型可见披露：四条触发路径（重载失败 / 重载超时 / 模型
+/// 未就绪（未安装或平台不支持）/ 查询向量计算失败）共用同一句式，差异只在括号内
+/// 的原因。单独成函数便于测试钉住文案（缺披露时模型会把关键词结果当全量作答）。
+fn semantic_degraded_warning(reason: &str) -> String {
+    format!("语义检索暂不可用（{reason}），本次为关键词检索，结果可能不全")
+}
+
+/// 「模型未就绪且重载被跳过」的降级原因按能力位区分：本地嵌入不支持的平台
+/// （loongarch64）模型永远无法安装，说「未安装」会诱导模型建议用户下载——
+/// 而下载命令在能力闸处必然被拒；受支持平台保持既有「未安装」文案不变。
+fn semantic_not_ready_reason(local_embed_supported: bool) -> &'static str {
+    if local_embed_supported {
+        "嵌入模型未安装"
+    } else {
+        "本平台不支持本地嵌入模型"
+    }
+}
+
 fn source_ref(document_id: i64, ord: i64) -> String {
     format!("kbdoc:{document_id}:chunk:{}", ord.max(0))
 }
@@ -132,22 +150,43 @@ fn build_unified_context_block(hits: &[UnifiedHit], warnings: &[String]) -> Stri
     out
 }
 
+/// 本地与远程两臂共用的 chunk 窗口收尾：把窗口内 chunk 拼成
+/// `## chunk <ord>` 文本，块间分隔由 `block_gap` 决定（本地臂沿用
+/// 空一行，远程臂沿用无分隔），并按最后一块的下一序号算出
+/// 续读游标与截断标记。返回 `(content, next_start_chunk, truncated)`；
+/// 外壳 JSON 字段两臂各自保留（本地 `kb_source` / 远程 `kb_remote_source`
+/// 的身份与来源字段不同）。
+fn finalize_source_window<'a>(
+    chunks: impl IntoIterator<Item = (i64, &'a str)>,
+    total_chunks: i64,
+    block_gap: &str,
+) -> (String, Option<i64>, bool) {
+    let mut content = String::new();
+    let mut last_ord: Option<i64> = None;
+    for (ord, text) in chunks {
+        if !content.is_empty() {
+            content.push_str(block_gap);
+        }
+        content.push_str(&format!("## chunk {ord}\n{}\n", text.trim()));
+        last_ord = Some(ord);
+    }
+    let next_start_chunk = last_ord
+        .map(|ord| ord + 1)
+        .filter(|next| *next < total_chunks);
+    let truncated = next_start_chunk.is_some();
+    (content, next_start_chunk, truncated)
+}
+
 fn render_source_window(
     source_ref_value: &str,
     document: &Document,
     chunks: &[(i64, String)],
 ) -> Value {
-    let mut content = String::new();
-    for (ord, text) in chunks {
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(&format!("## chunk {ord}\n{}\n", text.trim()));
-    }
-    let next_start_chunk = chunks
-        .last()
-        .map(|(ord, _)| ord + 1)
-        .filter(|next| *next < document.n_chunks);
+    let (content, next_start_chunk, truncated) = finalize_source_window(
+        chunks.iter().map(|(ord, text)| (*ord, text.as_str())),
+        document.n_chunks,
+        "\n",
+    );
     json!({
         "type": "kb_source",
         "source_ref": source_ref_value,
@@ -160,7 +199,7 @@ fn render_source_window(
         "shown_chunks": chunks.len(),
         "total_chunks": document.n_chunks,
         "next_start_chunk": next_start_chunk,
-        "truncated": next_start_chunk.is_some(),
+        "truncated": truncated,
         "content": content,
     })
 }
@@ -270,29 +309,49 @@ impl ToolSpec for KbSearchTool {
                 // 统一协调）：并发 kb_search 等待先行加载后短路，不重复读
                 // ~570MB，也不与模型下载的目录替换竞态。外层限时兜底，超时/
                 // 失败均降级纯全文，不阻断本次检索。
-                if !kb.semantic_ready() && super::model_download::model_installed() {
+                // 本地嵌入不支持的平台（loongarch64）即使残留模型目录（peer
+                // 安装/恢复的旧状态）也不必尝试重载：stub embedder 在触盘前
+                // 就返回显式错误，跳过可省去每次检索的完整性探测 + 租约 +
+                // spawn_blocking + 错误日志这条纯开销路径。
+                if !kb.semantic_ready()
+                    && crate::platform::capabilities::current().local_embed_supported
+                    && super::model_download::model_installed()
+                {
                     let reload =
                         super::model_download::reload_installed_embedder_leased(kb.inner());
                     match timeout(Duration::from_secs(KB_MODEL_RELOAD_TIMEOUT_SECS), reload).await {
-                        Ok(Ok(_)) => {}
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => {
+                            // 外层 installed 检查通过、租约内复查却发现目录缺失/
+                            // 不完整（TOCTOU）：与「未安装」同因同果，同一口径披露。
+                            eprintln!("[knowledge] kb_search 前复查发现嵌入模型缺失（降级纯全文）");
+                            warnings.push(semantic_degraded_warning("嵌入模型未安装"));
+                        }
                         Ok(Err(error)) => {
                             eprintln!(
                                 "[knowledge] kb_search 前重载模型失败（降级纯全文）: {error}"
                             );
+                            warnings.push(semantic_degraded_warning("嵌入模型加载失败"));
                         }
                         Err(_) => {
                             eprintln!(
                                 "[knowledge] kb_search 前重载模型超时（{}s，降级纯全文；后台加载继续，下次检索恢复语义）",
                                 KB_MODEL_RELOAD_TIMEOUT_SECS
                             );
+                            warnings.push(semantic_degraded_warning("嵌入模型加载超时"));
                         }
                     }
+                } else if !kb.semantic_ready() {
+                    warnings.push(semantic_degraded_warning(semantic_not_ready_reason(
+                        crate::platform::capabilities::current().local_embed_supported,
+                    )));
                 }
                 let l1 = kb.l1().clone();
                 let q = query.clone();
                 let local_ids = collection_ids.clone();
                 match tauri::async_runtime::spawn_blocking(move || {
-                    let hits = l1.retrieve_for_chat_multi(&local_ids, &q, KB_INJECT_TOP_K)?;
+                    let outcome =
+                        l1.retrieve_for_chat_multi_outcome(&local_ids, &q, KB_INJECT_TOP_K)?;
                     let collections: Vec<(i64, String)> = local_ids
                         .into_iter()
                         .map(|collection_id| {
@@ -304,11 +363,20 @@ impl ToolSpec for KbSearchTool {
                             (collection_id, name)
                         })
                         .collect();
-                    Ok::<_, rusqlite::Error>((hits, collections))
+                    Ok::<_, rusqlite::Error>((
+                        outcome.hits,
+                        collections,
+                        outcome.embed_query_failed,
+                    ))
                 })
                 .await
                 {
-                    Ok(Ok((hits, collections))) => {
+                    Ok(Ok((hits, collections, embed_query_failed))) => {
+                        if embed_query_failed {
+                            // 模型挂载着但本次查询向量算不出来（l1 侧已 eprintln）：
+                            // 本次静默降级纯 FTS，与其它降级路径同一口径披露。
+                            warnings.push(semantic_degraded_warning("嵌入调用失败"));
+                        }
                         for (rank, scoped) in hits.into_iter().enumerate() {
                             let hit = scoped.hit;
                             let name = scoped
@@ -575,15 +643,14 @@ impl ToolSpec for KbOpenSourceTool {
                 .map_err(|error| {
                     ToolError::execution_failed(format!("kb_open_source remote failed: {error}"))
                 })?;
-            let mut content = String::new();
-            for chunk in &window.chunks {
-                content.push_str(&format!("## chunk {}\n{}\n", chunk.ord, chunk.text.trim()));
-            }
-            let next_start_chunk = window
-                .chunks
-                .last()
-                .map(|chunk| chunk.ord + 1)
-                .filter(|next| *next < window.document.n_chunks);
+            let (content, next_start_chunk, truncated) = finalize_source_window(
+                window
+                    .chunks
+                    .iter()
+                    .map(|chunk| (chunk.ord, chunk.text.as_str())),
+                window.document.n_chunks,
+                "",
+            );
             let rendered = json!({
                 "type": "kb_remote_source",
                 "source_ref": source_ref_value,
@@ -594,7 +661,7 @@ impl ToolSpec for KbOpenSourceTool {
                 "shown_chunks": window.chunks.len(),
                 "total_chunks": window.document.n_chunks,
                 "next_start_chunk": next_start_chunk,
-                "truncated": next_start_chunk.is_some(),
+                "truncated": truncated,
                 "content": content,
             });
             return ToolResult::json(&rendered).map_err(|error| {
@@ -670,6 +737,39 @@ mod tests {
             Some(("cube/server:1".to_string(), 7, 42, 3))
         );
         assert!(parse_remote_source_ref("kbremote:bad:7:42:chunk:-1").is_none());
+    }
+
+    /// 语义降级披露文案钉死：四条触发路径（重载失败/超时、模型未安装、查询向量
+    /// 计算失败）共用同一句式，只差括号内原因。去掉披露时模型会把纯 FTS 的
+    /// 部分结果当全量作答，空结果脚本又会教它断言「未找到」——双重误导。
+    #[test]
+    fn semantic_degraded_warning_pins_disclosure_copy() {
+        assert_eq!(
+            semantic_degraded_warning("嵌入模型未安装"),
+            "语义检索暂不可用（嵌入模型未安装），本次为关键词检索，结果可能不全"
+        );
+        for reason in ["嵌入模型加载失败", "嵌入模型加载超时", "嵌入调用失败"]
+        {
+            let warning = semantic_degraded_warning(reason);
+            assert!(
+                warning.starts_with("语义检索暂不可用（")
+                    && warning.contains("），本次为关键词检索，结果可能不全"),
+                "降级披露句式漂移: {warning}"
+            );
+        }
+    }
+
+    /// 「模型未就绪且重载被跳过」的降级原因按能力位双向钉死：受支持平台保持
+    /// 既有「未安装」文案；不支持平台（loongarch64）必须如实表达平台限制——
+    /// 模型永远无法安装，「未安装」会诱导模型建议一次必然被下载能力闸拒绝的
+    /// 下载。两个方向都保留 FTS 降级披露句式。
+    #[test]
+    fn semantic_not_ready_reason_is_capability_aware() {
+        assert_eq!(semantic_not_ready_reason(true), "嵌入模型未安装");
+        assert_eq!(
+            semantic_degraded_warning(semantic_not_ready_reason(false)),
+            "语义检索暂不可用（本平台不支持本地嵌入模型），本次为关键词检索，结果可能不全"
+        );
     }
 
     /// The kb_search (production unified search) result header must also carry

@@ -5,6 +5,8 @@
  * 文件管理、本地知识库与远程知识库三个 subtab，以及本地知识库的导入和索引流程。
  * 重点抓运行时 ReferenceError。
  * 用法: node pinvou3-app/tests/kb_smoke.js  (全 PASS→0 / FAIL→1 / 缺依赖→2)
+ * 缺依赖分支必须在 exit 2 之前打印一行以 SKIP: 开头的说明(必须在行首),
+ * 否则 scripts/run-user-journey-tests.sh 会把这次跳过判为失败。
  */
 const fs = require('fs'), path = require('path'), os = require('os');
 const { startUiTestServer } = require('./ui_test_server');
@@ -62,6 +64,9 @@ function injectSource() {
       if (window.__KB_FAIL_IMPORT_CMD__ === cmd) return Promise.reject(new Error('mock import failure'));
       switch(cmd){
         case 'get_settings': return Promise.resolve({theme:'liquid-light',language:'zh-Hans'});
+        // 桌面快照缺省（fail-closed 假 closed）：所有能力位显式给 true，
+        // 除非某个用例经 __KB_CAPABILITIES_OVERRIDE__ 注入负值。
+        case 'get_platform_capabilities': return Promise.resolve(window.__KB_CAPABILITIES_OVERRIDE__ || {codexAcpSupported:true,browserNativeDisplay:true,localModelSetup:true,localEmbedSupported:true,dependencyInstall:true});
         case 'get_effective_model_config': return Promise.resolve({model:'qwen36_35b_256k',base_url:'http://127.0.0.1:8000/v1',api_key_set:false});
         case 'list_sessions': return Promise.resolve([]);
         case 'get_super_permission_status': return Promise.resolve(false);
@@ -73,7 +78,10 @@ function injectSource() {
         case 'list_marketplace_tools': return Promise.resolve([]);
         case 'get_mode_state': return Promise.resolve({mode:'yolo',plan_phase:'none'});
         case 'get_active_persona': return Promise.resolve(null);
-        case 'list_deliverable_index': return Promise.resolve(OUTPUTS);
+        // The command returns DeliverableIndex { rows, skipped }: the panel
+        // renders rows and must surface skipped as a partial-result notice.
+        case 'list_deliverable_index_v2':
+        case 'list_deliverable_index': return Promise.resolve({rows: OUTPUTS, skipped: []});
         // ---- kb_* ----
         case 'kb_scan_status': return Promise.resolve({running:false,phase:'done',scanned:1248});
         case 'kb_stats': return Promise.resolve({totalFiles:1248,totalBytes:9e9});
@@ -113,6 +121,14 @@ function injectSource() {
           return Promise.resolve(null);
         }
         case 'kb_embed_info': return Promise.resolve({enabled:true,baseUrl:'local(fastembed)',model:'bge-m3'});
+        case 'kb_model_status': return Promise.resolve(window.__KB_MODEL_STATUS__ || null);
+        case 'kb_model_download': {
+          // 安装中断恢复链路：立即加载走 complete-dir 快路径，返回就绪状态。
+          const base = window.__KB_MODEL_STATUS__ || {installed:true};
+          const readyStatus = {...base, ready:true, loading:false, deferredNoUsage:false, error:null};
+          window.__KB_MODEL_STATUS__ = readyStatus;
+          return Promise.resolve(readyStatus);
+        }
         case 'remote_kb_connections': {
           const snapshot = window.__REMOTE_KB_CONNECTIONS__.map(connection=>({
             ...connection,scope:window.__REMOTE_KB_SCOPE__,online:true,ready:true,error:null
@@ -124,7 +140,7 @@ function injectSource() {
           return Promise.resolve(snapshot);
         }
         case 'remote_kb_pending_joins': return Promise.resolve(window.__REMOTE_PENDING_JOINS__ || []);
-        case 'shared_kb_host_status': return Promise.resolve(window.__REMOTE_HOST_STATUS__ || {supported:true,installed:true,running:true,endpoint:'https://127.0.0.1:3210',serviceVersion:'0.8.0',appVersion:'0.8.0',upgradeAvailable:false,clientOutdated:false});
+        case 'shared_kb_host_status': return Promise.resolve(window.__REMOTE_HOST_STATUS__ || {supported:true,installed:true,endpoint:'https://127.0.0.1:3210',serviceVersion:'0.8.0',appVersion:'0.8.0',upgradeAvailable:false,clientOutdated:false});
         case 'shared_kb_host_lan_endpoints': return Promise.resolve(['https://192.168.1.20:3210']);
         case 'shared_kb_discover_nearby': {
           const discovered=[{
@@ -183,7 +199,7 @@ function injectSource() {
           }]);
         }
         case 'remote_kb_model_status': return Promise.resolve({ready:true,downloading:false,error:null});
-        case 'shared_kb_host_backup': return Promise.resolve({manifest:{format:1},recoveryCode:'AGE-SECRET-KEY-1MOCK'});
+        case 'shared_kb_host_backup': return Promise.resolve({recoveryCode:'AGE-SECRET-KEY-1MOCK'});
         case 'shared_kb_host_restore': return Promise.resolve({serverId:args?.serverId,name:'PINVOU Knowledge',endpoint:'https://127.0.0.1:3210',scope:'owner',deviceId:'local-owner'});
         case 'remote_kb_request_join': {
           if (window.__REMOTE_JOIN_PENDING_MODE__) {
@@ -673,7 +689,7 @@ async function chooseRemoteUploadSource(page, testId) {
   await page.waitForFunction(() => !document.querySelector('[data-testid="remote-refresh-connections"]')?.disabled);
   await page.evaluate(() => {
     window.__REMOTE_HOST_STATUS__ = {
-      supported:true,installed:true,running:true,endpoint:'https://127.0.0.1:3210',
+      supported:true,installed:true,endpoint:'https://127.0.0.1:3210',
       serviceVersion:'0.10.0',appVersion:'0.9.9',upgradeAvailable:true,clientOutdated:true
     };
     document.querySelector('[data-testid="remote-refresh-connections"]')?.click();
@@ -1201,6 +1217,7 @@ async function chooseRemoteUploadSource(page, testId) {
   await page.focus('[data-testid="remote-owner-people-tab"]');
   await page.keyboard.press('ArrowRight');
   await page.waitForSelector('#remote-owner-host-panel');
+  await page.waitForFunction(() => document.activeElement?.getAttribute('data-testid') === 'remote-owner-host-tab');
   const keyboardHostTab = await page.evaluate(() => ({
     selected: document.querySelector('[data-testid="remote-owner-host-tab"]')?.getAttribute('aria-selected'),
     focused: document.activeElement?.getAttribute('data-testid'),
@@ -1620,6 +1637,96 @@ async function chooseRemoteUploadSource(page, testId) {
   rec('⑩b 本地移除失败重新读取权威状态且不覆盖并发新增文档',
     failedDeleteRefresh.rows === 2 && failedDeleteRefresh.text.includes('并发新增.md'),
     JSON.stringify({ rows: failedDeleteRefresh.rows, hasConcurrent: failedDeleteRefresh.text.includes('并发新增.md') }));
+
+  // ⑩c 安装中断恢复：模型已装但未加载（deferred——崩溃中断安装后重启的典型状态）
+  // 时，知识库页必须给出「立即加载」入口，而不是只留一枚「语义检索未配置」徽标。
+  await page.evaluate(() => {
+    window.__KB_MODEL_STATUS__ = {
+      installed: true, ready: false, loading: false, failed: false,
+      deferredNoUsage: true, error: null, downloading: false,
+      sizeBytes: 585565019, installedBytes: 585565019, version: 'bge-m3',
+    };
+  });
+  await page.evaluate(() => [...document.querySelectorAll('button')]
+    .find(b => (b.textContent || '').trim() === '本地文件管理')?.click());
+  await sleep(300);
+  await page.evaluate(() => [...document.querySelectorAll('button')]
+    .find(b => (b.textContent || '').trim() === '本地知识库')?.click());
+  await sleep(900);
+  const deferredBanner = await page.evaluate(() => ({
+    banner: document.body.innerText.includes('模型已安装 · 尚未加载'),
+    loadBtn: [...document.querySelectorAll('button')].some(b => (b.textContent || '').trim() === '立即加载'),
+  }));
+  const downloadCallsBefore = (await page.evaluate(() =>
+    (window.__KB_CALLS__ || []).filter(c => c.cmd === 'kb_model_download').length));
+  await page.evaluate(() => [...document.querySelectorAll('button')]
+    .find(b => (b.textContent || '').trim() === '立即加载')?.click());
+  await sleep(700);
+  const loadNow = await page.evaluate((before) => ({
+    called: (window.__KB_CALLS__ || []).filter(c => c.cmd === 'kb_model_download').length === before + 1,
+    bannerGone: !document.body.innerText.includes('模型已安装 · 尚未加载'),
+  }), downloadCallsBefore);
+  rec('⑩c 安装中断(deferred)状态给出立即加载入口且点击后热加载恢复',
+    deferredBanner.banner && deferredBanner.loadBtn && loadNow.called && loadNow.bannerGone,
+    JSON.stringify({ deferredBanner, loadNow }));
+
+  // ⑩c-2 fail-closed 负例（PR #715 回归钉），localEmbedSupported=false 的两
+  // 个姿态都要成立：
+  //  a) deferred（已装未加载）：「模型已安装 · 尚未加载」横幅与「立即加载」
+  //     入口必须消失（能力位 belt-and-braces 门）；
+  //  b) 加载失败态：下载/修复入口整体被「当前平台暂不支持本地向量嵌入模型」
+  //     取代（ui_smoke ③a-3 遍历的状态，快照缺省 fail-closed 不能漏入口）。
+  await page.evaluateOnNewDocument((value) => {
+    window.__KB_CAPABILITIES_OVERRIDE__ = value;
+  }, { codexAcpSupported: true, browserNativeDisplay: true, localModelSetup: true, localEmbedSupported: false, dependencyInstall: true });
+  const deferredModelStatus = {
+    installed: true, ready: false, loading: false, failed: false,
+    deferredNoUsage: true, error: null, downloading: false,
+    sizeBytes: 585565019, installedBytes: 585565019, version: 'bge-m3',
+  };
+  // 重载后应用回到草稿页且侧边栏收起：与启动序列一致，先展开侧边栏再进入
+  // 知识库（用 clickContains 的兜底匹配，避免 optional-click 静默 no-op）。
+  const gotoKbSubtab = async () => {
+    // 稳定选择器进知识库视图（ui_smoke ③a-3 同款）；懒加载 chunk 就绪前
+    // subtab 行不存在，轮询到「本地知识库」出现再点击。
+    await page.evaluate(() => document.querySelector('[data-nav="knowledge"]')?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll('button')]
+      .some(b => (b.textContent || '').trim() === '本地知识库'), { timeout: 8000 }).catch(() => {});
+    await page.evaluate(() => [...document.querySelectorAll('button')]
+      .find(b => (b.textContent || '').trim() === '本地知识库')?.click());
+    await sleep(900);
+  };
+  // 状态必须在文档启动时就在位：应用 boot 时读取 kb_model_status；进入知识库
+  // 视图虽会重读，但视图层的 effectiveKbModel 优先采用 boot 快照（status 非空
+  // 时压过重读结果）——所以启动值能决定首屏门控，evaluateOnNewDocument 按
+  // 注册顺序覆盖，最后一次注册的值生效。
+  await page.evaluateOnNewDocument((status) => { window.__KB_MODEL_STATUS__ = status; }, deferredModelStatus);
+  await page.reload({ waitUntil: 'networkidle0' });
+  await gotoKbSubtab();
+  const deferredGate = await page.evaluate(() => ({
+    bannerGone: !document.body.innerText.includes('模型已安装 · 尚未加载'),
+    loadBtnGone: ![...document.querySelectorAll('button')].some(b => (b.textContent || '').trim() === '立即加载'),
+  }));
+  await page.evaluateOnNewDocument((status) => {
+    window.__KB_MODEL_STATUS__ = { ...status, failed: true, deferredNoUsage: false, error: 'mock load failure' };
+  }, deferredModelStatus);
+  await page.reload({ waitUntil: 'networkidle0' });
+  await gotoKbSubtab();
+  // 重载后能力快照与 kb 状态需重新到位：轮询直到不支持文案出现（状态尚未
+  // 落地时的主界面缺省会被误判）。
+  await page.waitForFunction(
+    () => document.body.innerText.includes('当前平台暂不支持本地向量嵌入模型'),
+    { timeout: 8000 },
+  ).catch(() => {});
+  const failedGate = await page.evaluate(() => ({
+    unsupportedCopy: document.body.innerText.includes('当前平台暂不支持本地向量嵌入模型'),
+    failedTitleGone: !document.body.innerText.includes('Embedding 模型加载失败'),
+    repairGone: ![...document.querySelectorAll('button')].some(b => (b.textContent || '').includes('重新下载并修复')),
+  }));
+  rec('⑩c-2 localEmbedSupported=false 时 fail-closed 隐藏加载/下载入口并显示不支持文案',
+    deferredGate.bannerGone && deferredGate.loadBtnGone
+      && failedGate.unsupportedCopy && failedGate.failedTitleGone && failedGate.repairGone,
+    JSON.stringify({ deferredGate, failedGate }));
 
   rec('⑪ 全程无运行时报错(ReferenceError 等)', errs.length === 0, errs.length ? errs.slice(0,3).join(' | ') : '');
 

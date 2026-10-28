@@ -16,6 +16,7 @@ const webTurnTerminalSource = read('src', 'platform', 'web', 'bridge', 'turn-ter
 const chatViewSource = read('src', 'features', 'chat', 'ChatView.jsx');
 const modelServiceErrorsSource = read('src', 'shared', 'model-service-errors.js');
 const bridgeMessagesSource = read('src', 'shared', 'bridge-messages.js');
+const bridgeSharedSource = read('src', 'shared', 'bridge-shared-helpers.js');
 const { conversationItemsForMode } = await import(
   '../src/features/conversation/deepseek-conversation.js'
 );
@@ -871,6 +872,14 @@ assert.equal('errorCode' in uncodedState.chatItems[0].userError, false, 'no code
 const terminalSandbox = { window: {}, Date };
 vm.runInNewContext(modelServiceErrorsSource, terminalSandbox, { filename: 'model-service-errors.js' });
 vm.runInNewContext(bridgeMessagesSource, terminalSandbox, { filename: 'bridge-messages.js' });
+// F-FE13-2 moved the assistant_done builder into the shared base
+// (window.PinvouBridgeShared.buildAssistantDoneTimelineRecord); load it the
+// same way index.html does before turn-terminal.js.
+vm.runInNewContext(
+  read('src', 'shared', 'bridge-shared-helpers.js'),
+  terminalSandbox,
+  { filename: 'bridge-shared-helpers.js' },
+);
 vm.runInNewContext(webTurnTerminalSource, terminalSandbox, { filename: 'turn-terminal.js' });
 const timelineState = {
   activeTurnTimelineId: 'turn-1',
@@ -1014,8 +1023,10 @@ assert.match(
 );
 assert.match(chatEventsSource, /turnErrorNotice && item\.text === notice/);
 assert.match(chatEventsSource, /addSystemItem\(notice, \{ turnErrorNotice: true \}\)/);
+// Wave 5 moved the hydration live-card filter into the shared base
+// (liveChatItemKeptForHydration); pin the shared body instead of the lane call site.
 assert.match(
-  desktopBridgeSource,
+  bridgeSharedSource,
   /if \(item\.turnErrorNotice && !item\.legacyConversationOnly\) return false/,
 );
 // Swarm rework: the projection input first goes through the spawn aggregation
@@ -1058,7 +1069,7 @@ assert.match(chatEventsSource, /sweepUnpairedToolMeta\(\);/);
 
 assert.match(webBridgeSource, /turnErrorNotice && item\.text === notice/);
 assert.match(
-  webBridgeSource,
+  bridgeSharedSource,
   /if \(item\.turnErrorNotice && !item\.legacyConversationOnly\) return false/,
 );
 assert.match(
@@ -1184,5 +1195,37 @@ assert.equal(
   true,
   '短暂滞后的权威快照不得把已完成回合覆盖回执行中',
 );
+
+// Native code sessions own their model through their session controls; the
+// chat workspace's bridge state describes a different session. Error
+// notices must attribute the provider from the native session's own model.
+{
+  const { nativeModelServiceContext } = await import('../src/features/codex/code-native-lane.js');
+  const catalog = [
+    { id: 'chat-model', vendor: 'deepseek' },
+    { id: 'native-model', vendor: 'kimi' },
+  ];
+  const chatState = { currentSessionModelId: 'chat-model', activeModelId: 'chat-model', savedModels: catalog };
+  const chatLabel = modelErrors.providerLabelFromState(chatState, 'en');
+  const context = nativeModelServiceContext('native', 'native', 'native-model', chatState.savedModels);
+  assert.deepEqual(Object.keys(context).sort((a, b) => a.localeCompare(b)), ['currentSessionModelId', 'savedModels'],
+    'the native context must not carry the chat workspace active/effective model or provider');
+  const nativeLabel = modelErrors.providerLabelFromState(context, 'en');
+  assert.ok(nativeLabel && chatLabel && nativeLabel !== chatLabel,
+    'the native session provider label must come from its own model, not the chat model');
+  assert.equal(nativeModelServiceContext('next-native', 'previous-native', 'native-model', catalog), null,
+    'a controls snapshot owned by another session must not attribute the model');
+  assert.equal(nativeModelServiceContext('native', 'native', null, catalog), null,
+    'unloaded controls yield no model attribution');
+  assert.equal(nativeModelServiceContext(null, null, 'native-model', catalog), null);
+  const codexView = read('src', 'features', 'codex', 'CodexAcpView.jsx');
+  assert.match(codexView,
+    /nativeModelServiceContext\(activeId, nativeControlsOwner, nativeControls\.modelId, nativeSavedModels\)/);
+  assert.doesNotMatch(codexView, /modelServiceState: bs,/,
+    'native event handling must not pass the whole chat bridge state as model context');
+  assert.match(codexView,
+    /modelServiceState: sessionId === activeIdRef\.current \? eventContext\.modelServiceState : null/,
+    'background native sessions must not inherit the foreground session model context');
+}
 
 console.log('chat turn error isolation: ok');

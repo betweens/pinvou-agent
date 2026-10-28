@@ -426,8 +426,10 @@ export function adaptBrowserCatalog(value) {
       // the user. Keep screenshots hidden until the visual-result pipeline is
       // connected, avoiding wasted context and false claims of visual review.
       // catalog-shim is captured before browser startup and does not include
-      // the runtime experimental-page-id-routing flag. Mirror the upstream
-      // 1.7.0 schema transformation so the Agent sees the explicit pageId.
+      // the runtime page-id routing flag. Upstream 1.11.0+ (1.12.0 vendored) enables pageId
+      // routing by default and already carries pageId in its tool schemas;
+      // the shim stays idempotent so the Agent always sees the explicit
+      // pageId contract either way.
       tools: tools
         .filter((tool) => !isDisabledBrowserToolName(tool?.name))
         .map(exposePageIdRouting),
@@ -482,7 +484,10 @@ export function effectiveNavigateType(args = {}) {
 export function assertAllowedHostedNavigation(args = {}) {
   const effectiveType = effectiveNavigateType(args);
   if (effectiveType === 'url' && !isAllowedBrowserUrl(args?.url)) {
-    throw new Error('The in-app browser only supports http, https, and about:blank URLs');
+    throw new Error(
+      'The in-app browser only supports http, https, and about:blank URLs;'
+      + ' the app UI origins are excluded (tauri.localhost and the localhost:1420 dev origin)',
+    );
   }
   return effectiveType;
 }

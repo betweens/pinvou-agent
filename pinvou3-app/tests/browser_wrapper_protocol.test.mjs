@@ -1530,7 +1530,7 @@ test('leased dispatch always closes the host operation window after failure or c
   });
 });
 
-test('page-scoped tools in experimental page-id-routing are recognized', () => {
+test('page-scoped tools in page-id-routing are recognized', () => {
   const names = pageScopedToolNames({
     tools: [
       {
@@ -1853,6 +1853,16 @@ test('navigate_page with url and omitted type still uses the strict URL allowlis
   assert.throws(
     () => assertAllowedHostedNavigation({ url: 'javascript:alert(1)' }),
     /only supports http, https, and about:blank URLs/,
+  );
+  // The denial must name the reserved origins the gate actually rejects, or a
+  // model told "http is supported" retries a tauri.localhost/dev-origin URL.
+  assert.throws(
+    () => assertAllowedHostedNavigation({ url: 'http://tauri.localhost/index.html' }),
+    /tauri\.localhost/,
+  );
+  assert.throws(
+    () => assertAllowedHostedNavigation({ url: 'http://localhost:1420/' }),
+    /localhost:1420/,
   );
   // An explicit reload ignores an extra url argument; explicit type wins.
   assert.equal(

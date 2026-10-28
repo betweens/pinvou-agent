@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, Code, Cpu, Database, Globe, MessageSquare, Plus, RefreshCw, Search, Sparkles, Users, Wrench, X } from '../../components/icons.jsx';
 import { Toggle } from '../../components/Toggle.jsx';
 import PetSettingsSection from '../pet/PetSettingsSection.jsx';
 import { DEFAULT_PET_ID } from '../pet/pet-registry.js';
 import { bridge, isLocalModel, useBridgeState } from '../../hooks/useBridge.js';
 import { can, isWeb } from '../../shared/platform.js';
+import { copyClipboardText } from '../../shared/clipboard.js';
+import { pathBasename } from '../../shared/path-utils.js';
 import qwenIcon from '../../brand-icons/qwen.svg';
 import {
   MODEL_PRESET_DEFS, PROVIDER_KIND_CODING_PLAN, PROVIDER_KIND_OFFICIAL_API, PROVIDER_KIND_CUSTOM,
@@ -30,6 +32,14 @@ import {
   voicePostprocessEnabled,
   voiceShortcutEnabled,
 } from '../chat/voice-shortcut-settings.mjs';
+import {
+  GLOBAL_SHORTCUT_DEFAULT_ACCELERATOR,
+  foldGlobalShortcutDraft,
+  formatGlobalShortcutForDisplay,
+  globalShortcutDraftToRust,
+  isPlausibleGlobalShortcutAccelerator,
+  normalizeGlobalShortcutDraft,
+} from './globalShortcutSettings.mjs';
 import { VoiceShortcutIntroModal } from '../voice-composer/VoiceShortcutIntroModal.jsx';
 import { ReasoningTierPicker, useModelReasoningTierState } from './local-server-tiers.jsx';
 import { StatusChip } from './StatusChip.jsx';
@@ -144,14 +154,14 @@ function hasStoredCredential(record) {
           );
         }
         return (
-          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/18 dark:text-[#64B5F6]`}>
+          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/[0.18] dark:text-[#64B5F6]`}>
             <Code size={compact ? 17 : 19} strokeWidth={2.2} />
           </span>
         );
       }
       if (preset === 'local_vllm') {
         return (
-          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/18 dark:text-[#64B5F6]`}>
+          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/[0.18] dark:text-[#64B5F6]`}>
             <Cpu size={compact ? 18 : 20} strokeWidth={2.2} />
           </span>
         );
@@ -267,15 +277,15 @@ function hasStoredCredential(record) {
             )}
             {webAccess.last_error && <div className="mt-3 text-[12px] text-[#EA4335] break-all">{webAccess.last_error}</div>}
             <div className="mt-4 flex items-center justify-end gap-2">
-              <button type="button" onClick={() => navigator.clipboard && navigator.clipboard.writeText(webAccess.url || '')}
+              <button type="button" onClick={() => { if (webAccess.url) copyClipboardText(webAccess.url); }}
                 disabled={!webAccess.url}
                 className={`px-3.5 py-2 rounded-full text-[13px] bg-black/5 hover:bg-black/10 disabled:opacity-40 dark:bg-white/10 dark:hover:bg-white/15 dark:disabled:opacity-40`}>{remoteCopy.copy}</button>
               {webAccessActive && !hostWorkspaceAuthorized && <button type="button" disabled={actionBusy} onClick={handleRetryWebAccess}
-                className="px-3.5 py-2 rounded-full text-[13px] bg-[#0B57D0] text-white hover:bg-[#0842A0] disabled:opacity-50">{remoteCopy.allowWorkspace}</button>}
+                className="px-3.5 py-2 rounded-full text-[13px] bg-[#0B57D0] text-white hover:bg-[#0A4BB8] disabled:opacity-50 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]">{remoteCopy.allowWorkspace}</button>}
               {webAccessActive ? <button type="button" disabled={actionBusy} onClick={() => setRefreshConfirmOpen(true)}
                 className={`px-3.5 py-2 rounded-full text-[13px] disabled:opacity-50 bg-black/5 hover:bg-black/10 dark:bg-white/10 dark:hover:bg-white/15`}>{remoteCopy.refresh}</button>
                 : <button type="button" disabled={actionBusy} onClick={handleRetryWebAccess}
-                  className="px-3.5 py-2 rounded-full text-[13px] bg-[#0B57D0] text-white hover:bg-[#0842A0] disabled:opacity-50">{remoteCopy.enable}</button>}
+                  className="px-3.5 py-2 rounded-full text-[13px] bg-[#0B57D0] text-white hover:bg-[#0A4BB8] disabled:opacity-50 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]">{remoteCopy.enable}</button>}
             </div>
             {refreshConfirmOpen && (
               // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the in-modal cancel button
@@ -288,7 +298,7 @@ function hasStoredCredential(record) {
                   <div className={`text-[13px] leading-relaxed mt-2 text-[#5F6368] dark:text-[#B7BBC0]`}>{remoteCopy.refreshDesc}</div>
                   <div className="mt-5 flex justify-end gap-2">
                     <button type="button" disabled={actionBusy} onClick={() => setRefreshConfirmOpen(false)} className={`px-4 py-2 rounded-lg text-[13px] bg-black/5 hover:bg-black/10 dark:bg-white/5 dark:hover:bg-white/10`}>{t.cancel}</button>
-                    <button type="button" disabled={actionBusy} onClick={handleRotateWebAccess} className="px-4 py-2 rounded-lg text-[13px] font-medium bg-white text-[#202124] hover:bg-[#F1F3F4] disabled:opacity-60">{actionBusy ? remoteCopy.refreshing : remoteCopy.refresh}</button>
+                    <button type="button" disabled={actionBusy} onClick={handleRotateWebAccess} className="px-4 py-2 rounded-lg text-[13px] font-medium bg-[#0B57D0] text-white hover:bg-[#0A4BB8] disabled:opacity-60 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]">{actionBusy ? remoteCopy.refreshing : remoteCopy.refresh}</button>
                   </div>
                 </div>
               </div>
@@ -323,9 +333,11 @@ function hasStoredCredential(record) {
       const [baseUrl, setBaseUrl] = useState(initial.base_url || '');
       const [contextWindow, setContextWindow] = useState(initial.context_window_tokens ? String(initial.context_window_tokens) : '');
       const [maxOutput, setMaxOutput] = useState(initial.max_output_tokens ? String(initial.max_output_tokens) : '');
-      // 思考深度档位：初始取已保存值（先归一——存量可能是底座归一前的旧值，
-      // 如 deepseek 的 medium），无则按模型默认（vllm→off，其余→high；
-      // 底座不支持的模型无默认，保持 null = 未显式设置，避免保存时污染 SavedModel）。
+      // Thinking effort: initialize from the stored value (normalize first —
+      // legacy records may carry pre-normalization values such as deepseek's
+      // medium), otherwise fall back to the model default (vllm→low (lowest
+      // thinking tier), others→high; models without tiers have no default and
+      // stay null = not explicitly set, so saving does not pollute SavedModel).
       const [reasoningEffort, setReasoningEffort] = useState(
         normalizeStoredReasoningEffort(initial, initial.reasoning_effort)
       );
@@ -409,7 +421,6 @@ function hasStoredCredential(record) {
         debounceMs: 400,
         trimInputs: true,
       });
-      // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
       function normalizeConnectionTestResult(value, isCodingPlanProvider) {
         if (value && typeof value === 'object' && !Array.isArray(value)) {
           const code = String(value.code || (value.ok ? 'ok' : 'unknown'));
@@ -425,28 +436,9 @@ function hasStoredCredential(record) {
             detail: value.detail ? String(value.detail) : '',
           };
         }
-        const raw = String(value || '');
-        const httpMatch = raw.match(/HTTP\s+(\d{3})/i);
-        if (httpMatch) {
-          const status = Number(httpMatch[1]);
-          const legacy = {
-            ok: status >= 200 && status < 300,
-            code: status === 401 ? 'auth_invalid' : status === 402 ? 'billing' : status === 403 ? 'auth_forbidden' : status === 429 ? 'rate_limited' : 'http_error',
-            message: status === 401 ? settingsCopy.connectionMessages.auth_invalid
-              : status === 402 ? settingsCopy.connectionMessages.billing
-                : status === 403 ? settingsCopy.connectionMessages.auth_forbidden
-                  : status === 429 ? settingsCopy.connectionMessages.rate_limited
-                    : (status >= 200 && status < 300 ? settingsCopy.connectionMessages.ok : settingsCopy.connectionMessages.http_error),
-            detail: `HTTP ${status}`,
-          };
-          if (isCodingPlanProvider && (status === 404 || status === 405)) {
-            legacy.code = status === 404 ? 'endpoint_not_found' : 'method_not_allowed';
-            legacy.message = settingsCopy.codingPlanTestUnavailable;
-          }
-          return legacy;
-        }
-        if (raw === 'ok') return { ok: true, code: 'ok', message: settingsCopy.connectionMessages.ok, detail: '' };
-        return { ok: false, code: 'unknown', message: settingsCopy.connectionMessages.unknown, detail: '' };
+        // test_model_connection always resolves a serialized object; this
+        // fallback only covers the reject path (a thrown error string).
+        return { ok: false, code: 'unknown', message: settingsCopy.connectionMessages.unknown, detail: String(value || '') };
       }
       function applyCatalogItem(group, item) {
         const p = group.preset;
@@ -455,20 +447,22 @@ function hasStoredCredential(record) {
         const nextModel = item.custom ? '' : (item.model || defs.model);
         const nextBaseUrl = normalizedProviderBaseUrl(group) || defs.baseUrl;
         setProviderKey(group.key || '');
-        setProviderKind(group.providerKind || (p === 'openai_compatible' ? PROVIDER_KIND_CUSTOM : PROVIDER_KIND_OFFICIAL_API));
+        setProviderKind(group.providerKind || ((p === 'openai_compatible' || p === 'openai_responses') ? PROVIDER_KIND_CUSTOM : PROVIDER_KIND_OFFICIAL_API));
         setVendor(group.vendor || '');
         setEndpointMode(group.endpointMode || '');
         setBaseUrl(nextBaseUrl);
         setModel(nextModel);
         // 目录项切换是显式换模型:未手动改过档位时按新条目的视觉能力标注预填。
         if (!imageCapabilityTouched) setImageCapability(imageCapabilityForCatalogModel(nextModel));
-        if (!nameTouched) setName(p === 'local_vllm' ? settingsCopy.localModelName(nextModel) : (item.custom ? group.title : item.title));
+        if (!nameTouched) setName(p === 'local_vllm' ? settingsCopy.localModelName(nextModel) : (item.custom ? group.title : (item.title || presetProviderLabel(p, t))));
         setContextWindow(p === 'local_vllm' ? '262144' : '');
         // The output cap is no longer prefilled with 24K: left empty like
         // cloud/custom, declared uniformly by the runtime window tiers.
         setMaxOutput('');
-        // 换目录项时重置思考深度到该模型的默认档位（vllm→off，其余→high；
-        // 无档位模型置 null = 未显式设置）。带上 nextBaseUrl 以按新 route 判定档位。
+        // Reset the thinking effort to the new entry's default tier when the
+        // catalog item changes (vllm→low (lowest thinking tier), others→high;
+        // models without tiers get null = not explicitly set). Pass nextBaseUrl
+        // so the tier is decided by the new route.
         setReasoningEffort(reasoningEffortForModelSwitch({ preset: p, model: nextModel, vendor: group.vendor || vendor, base_url: nextBaseUrl }));
         setApiKey('');
         setKeyAction(initial.__new ? 'replace' : 'keep_existing');
@@ -540,7 +534,8 @@ function hasStoredCredential(record) {
       const isLocalPreset = preset === 'local_vllm';
       const showProviderModelField = !isLocalPreset && !!activeProvider && Array.isArray(activeProvider.items) && activeProvider.items.length > 0;
       const showModelIdField = isLocalPreset || customModel || showProviderModelField;
-      const showBaseUrlField = isLocalPreset || (customModel && preset === 'openai_compatible' && !isCodingPlan);
+      const showBaseUrlField = isLocalPreset
+        || (customModel && (preset === 'openai_compatible' || preset === 'openai_responses') && !isCodingPlan);
       const showCustomCloudKeyField = !isLocalPreset && customModel;
       const showLocalKeyField = isLocalPreset && localKeyEnabled;
       const showDisplayNameField = isLocalPreset && !initial.__new;
@@ -671,11 +666,20 @@ function hasStoredCredential(record) {
         }).sort((a, b) => (a.loaded === false ? 1 : 0) - (b.loaded === false ? 1 : 0)); // 已加载/未知的排前，未加载的沉底
       }
       function buildLocalModelPayload(row) {
+        // Ollama/LM Studio 的 max_model_len 是运行时生效值（/api/ps 的生效
+        // 上下文、/api/v0/models 的 loaded_context_length），随加载状态与
+        // 服务端配置变化：不能持久化为用户声明——声明在
+        // resolve_context_window 里永久 min-clamp 后续探测，且本表单对
+        // local 预设隐藏该字段，用户无法纠正。引擎在每次 spawn 时按服务
+        // 类别原生探测实时采纳（Ollama /api/ps→show、LM Studio
+        // /api/v0/models），存 null 即可。vLLM 的 /v1/models max_model_len
+        // 是部署配置，保持既有持久化语义。
+        const runtimeProbedProvider = row.provider === 'ollama' || row.provider === 'lm_studio';
         return {
           id: makeModelId(),
           name: settingsCopy.localModelName(row.model),
           preset: 'local_vllm',
-          context_window_tokens: row.max_model_len || null,
+          context_window_tokens: runtimeProbedProvider ? null : (row.max_model_len || null),
           max_output_tokens: null,
           model: row.model,
           base_url: row.base_url,
@@ -732,16 +736,28 @@ function hasStoredCredential(record) {
         setPickerOpen(false);
         // 手动添加本地模型是显式切换:未手动改过档位时回到「自动处理」。
         if (!imageCapabilityTouched) setImageCapability(imageCapabilityForCatalogModel(''));
-        // 本地模型 → 手动添加是显式切换 route：丢弃草稿残留的思考深度，回落到 vLLM
-        // 默认 off（防 SSE timeout）。否则新建 DeepSeek 草稿初始化的 high 会被当成
-        // 合法 vLLM 档位保留，保存时显式写入 reasoning_effort=high，绕过桥接层
-        // 「vllm→off」的默认约束。与 applyCatalogItem / chooseModel 的切换语义一致。
+        // Local model → manual add is an explicit route switch: drop the
+        // draft's leftover thinking effort and fall back to the vLLM default
+        // lowest thinking tier low. Otherwise the high a fresh DeepSeek draft
+        // starts with would be kept as a legitimate vLLM tier and saved as an
+        // explicit reasoning_effort=high, bypassing the bridge's "vllm→low"
+        // default constraint. Same switch semantics as applyCatalogItem /
+        // chooseModel.
         setReasoningEffort(reasoningEffortForModelSwitch({ preset: 'local_vllm', model: '', vendor, base_url: defs.baseUrl }));
       }
       const catalogSectionTitleClass = `px-1 mb-2 text-[12px] leading-4 font-semibold text-[#8A8A8E] dark:text-[#8E8E93]`;
       const catalogGroupClass = `overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`;
       const formGroup = `overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`;
       const formDivider = 'border-black/[0.10] dark:border-white/[0.10]';
+      // Custom-entry description for the provider model picker and the catalog
+      // picker: both key off the same group fields (key/providerKind/preset).
+      const customModelDescFor = (group, copy) => (group && group.key === 'tencent_token_plan'
+        ? copy.customTokenPlanDesc
+        : (group && group.providerKind === PROVIDER_KIND_CODING_PLAN
+          ? copy.customCodingPlanDesc
+          : (group && group.preset === 'local_vllm'
+            ? copy.customLocalDesc
+            : (group && (group.preset === 'openai_compatible' || group.preset === 'openai_responses') ? copy.customCompatibleDesc : copy.customModelDesc))));
       const renderProviderModelField = () => {
         const items = activeProvider ? activeProvider.items : [];
         const known = items.some(item => !item.custom && catalogItemMatchesModel(item, model));
@@ -795,7 +811,7 @@ function hasStoredCredential(record) {
                       <span className="min-w-0 flex-1">
                         <span className={`block text-[14px] leading-5 truncate ${active ? ('text-[#007AFF] dark:text-[#64B5F6]') : ('text-[#1C1C1E] dark:text-[#F2F2F7]')}`}>{item.custom ? ((activeProvider && settingsCopy.customModelTitles[activeProvider.key]) || settingsCopy.customModelTitle(selectedProvider)) : (item.title || item.model || `${settingsCopy.customModel} ID`)}</span>
                         {item.desc && <span className={`block mt-0.5 text-[12px] leading-[16px] truncate text-[#8A8A8E] dark:text-[#8E8E93]`}>{item.custom
-                          ? (activeProvider && activeProvider.key === 'tencent_token_plan' ? settingsCopy.customTokenPlanDesc : (activeProvider && activeProvider.providerKind === PROVIDER_KIND_CODING_PLAN ? settingsCopy.customCodingPlanDesc : (activeProvider.preset === 'local_vllm' ? settingsCopy.customLocalDesc : (activeProvider.preset === 'openai_compatible' ? settingsCopy.customCompatibleDesc : settingsCopy.customModelDesc))))
+                          ? customModelDescFor(activeProvider, settingsCopy)
                           : (settingsCopy.modelDescriptions[item.desc] || item.desc)}</span>}
                       </span>
                       {active && <Check size={17} strokeWidth={2.4} className={'text-[#007AFF] dark:text-[#64B5F6]'} />}
@@ -839,14 +855,19 @@ function hasStoredCredential(record) {
         <div className={withBorder ? `min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b last:border-b-0 ${formDivider}` : 'min-h-[54px] flex items-center gap-3 px-4 py-2.5'}>
           {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and input are siblings; the label has no htmlFor association, switching to span would deviate from the existing structure */}
           <label className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>API Key</label>
-          <input type={showKey ? 'text' : 'password'} autoComplete="off" value={apiKey} onChange={e => { setApiKey(e.target.value); if (e.target.value.trim()) setKeyAction('replace'); }}
+          {/* Always type="text" + WebkitTextSecurity masking: type=password triggers the WebView2 built-in eye button (duplicating the show/hide toggle), same as ProviderFormModal.
+              type=password implied autoCorrect/autoCapitalize/spellCheck off; type=text does not, and handing a secret to the platform spellchecker (or letting autocapitalize mangle a pasted key) is not acceptable — so they are set explicitly, matching ProviderFormModal. */}
+          <input type="text" data-testid="model-api-key-input"
+            autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+            value={apiKey} onChange={e => { setApiKey(e.target.value); if (e.target.value.trim()) setKeyAction('replace'); }}
+            style={showKey ? undefined : { WebkitTextSecurity: 'disc' }}
             placeholder={hasSavedKey ? '••••••••' : settingsCopy.apiKeyPlaceholder}
             className={`min-w-0 flex-1 bg-transparent text-right text-[14px] leading-5 outline-none text-[#1C1C1E] placeholder:text-[#8A8A8E] dark:text-[#F2F2F7] dark:placeholder:text-[#636366]`} />
           <button type="button" onClick={toggleApiKeyVisibility} className="shrink-0 text-[14px] text-[#007AFF]">{showKey ? settingsCopy.hide : settingsCopy.show}</button>
         </div>
       );
       const renderCloudProviderPicker = () => {
-        const bySection = ['coding_plan', 'official_api', 'custom'].map(section => ({
+        const bySection = ['coding_plan', 'official_api', 'aggregator', 'custom'].map(section => ({
           section,
           title: settingsCopy.catalogSections[section] || MODEL_CATALOG_SECTIONS[section],
           groups: catalogGroups.filter(group => (group.section || 'official_api') === section),
@@ -891,7 +912,7 @@ function hasStoredCredential(record) {
                   const active = preset === group.preset && !item.custom && catalogItemMatchesModel(item, model);
                   const itemTitle = item.custom ? (settingsCopy.customModelTitles[group.key] || settingsCopy.customModelTitle(presetProviderLabel(group.preset, t))) : item.title;
                   const itemDescription = item.custom
-                    ? (group.key === 'tencent_token_plan' ? settingsCopy.customTokenPlanDesc : (group.providerKind === PROVIDER_KIND_CODING_PLAN ? settingsCopy.customCodingPlanDesc : (group.preset === 'local_vllm' ? settingsCopy.customLocalDesc : (group.preset === 'openai_compatible' ? settingsCopy.customCompatibleDesc : settingsCopy.customModelDesc))))
+                    ? customModelDescFor(group, settingsCopy)
                     : (settingsCopy.modelDescriptions[item.desc] || item.desc);
                   return (
                     <button
@@ -917,7 +938,7 @@ function hasStoredCredential(record) {
       const renderLocalPicker = () => {
         const rows = localCandidateRows(localDetectResult);
         const mutedText = 'text-[#8A8A8E] dark:text-[#98989D]';
-        const actionClass = `shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/16 dark:bg-[#0A84FF]/20 dark:text-[#0A84FF] dark:hover:bg-[#0A84FF]/28`;
+        const actionClass = `shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/[0.16] dark:bg-[#0A84FF]/20 dark:text-[#0A84FF] dark:hover:bg-[#0A84FF]/[0.28]`;
         return (
           <div className="space-y-4">
             <section>
@@ -1122,7 +1143,7 @@ function hasStoredCredential(record) {
                 </span>
                 <button type="button" data-testid="image-capability-test" onClick={handleImageCapabilityTest}
                   disabled={imageTesting || !model.trim() || !baseUrl.trim()}
-                  className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium disabled:opacity-45 ${isDark ? 'bg-[#0A84FF]/20 text-[#0A84FF] hover:bg-[#0A84FF]/28' : 'bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/16'}`}>
+                  className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium disabled:opacity-45 ${isDark ? 'bg-[#0A84FF]/20 text-[#0A84FF] hover:bg-[#0A84FF]/[0.28]' : 'bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/[0.16]'}`}>
                   {imageTesting ? t.testingConn : settingsCopy.imageCapabilityTest}
                 </button>
               </div>
@@ -1136,7 +1157,13 @@ function hasStoredCredential(record) {
             {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling; cancel button in the modal header */}
             <div data-testid="model-form-dialog" role="dialog" aria-modal="true"
               onClick={e => e.stopPropagation()}
-              className={`w-[440px] max-w-[90vw] max-h-[76vh] overflow-y-auto custom-scrollbar rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+              className={`w-[440px] max-w-[90vw] max-h-[76vh] flex flex-col overflow-hidden rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+              {/* 滚动必须收敛在内层 min-h-0 容器上，不要放回圆角弹窗本体：在
+                  fixed + backdrop-filter 祖先链下，个别 WebKit 内核（用户反馈的
+                  环境无法复现，疑为 webkit2gtk/旧 WebView）不会为「max-h +
+                  overflow-y-auto 同元素」的组合建立滚动区，模型列表下半部分
+                  无法滚动选择。内层 flex 滚动区在所有内核行为一致。 */}
+              <div data-testid="model-form-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain custom-scrollbar">
               <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b border-black/[0.10] dark:border-white/[0.10]`}>
                 <div>
                   <h2 className="text-[20px] leading-6 font-semibold">{t.modelFormAddTitle}</h2>
@@ -1158,6 +1185,7 @@ function hasStoredCredential(record) {
                 </div>
               </div>
               <div className="px-5 py-4">{pickerTab === 'local' ? renderLocalPicker() : renderCloudProviderPicker()}</div>
+              </div>
             </div>
           </div>
         );
@@ -1166,7 +1194,9 @@ function hasStoredCredential(record) {
         <div data-testid="model-form-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 animate-in fade-in duration-150">
           {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling; cancel button in the modal header */}
           <div data-testid="model-form-dialog" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}
-            className={`w-[430px] max-w-[90vw] max-h-[76vh] overflow-y-auto custom-scrollbar rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+            className={`w-[430px] max-w-[90vw] max-h-[76vh] flex flex-col overflow-hidden rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+            {/* 同上方 picker 弹窗：滚动收敛在内层 min-h-0 容器，不放圆角弹窗本体。 */}
+            <div data-testid="model-form-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain custom-scrollbar">
             <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b ${formDivider}`}>
               <div>
                 <h2 className="text-[20px] leading-6 font-semibold">{modalTitle}</h2>
@@ -1300,7 +1330,7 @@ function hasStoredCredential(record) {
                         {testResult ? testResult.message : settingsCopy.testBeforeSave}
                       </span>
                       <button type="button" onClick={handleTest} disabled={testing || !baseUrl.trim()}
-                        className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium disabled:opacity-45 bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/16 dark:bg-[#0A84FF]/20 dark:text-[#0A84FF] dark:hover:bg-[#0A84FF]/28`}>
+                        className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium disabled:opacity-45 bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/[0.16] dark:bg-[#0A84FF]/20 dark:text-[#0A84FF] dark:hover:bg-[#0A84FF]/[0.28]`}>
                         {testing ? t.testingConn : t.testConnection}
                       </button>
                     </div>
@@ -1322,6 +1352,7 @@ function hasStoredCredential(record) {
                 className="h-10 px-5 rounded-full bg-[#007AFF] text-white text-[15px] font-semibold transition-colors disabled:opacity-35">
                 {savingModel ? settingsCopy.saving : t.modelSaveBtn}
               </button>
+            </div>
             </div>
           </div>
         </div>
@@ -1360,7 +1391,7 @@ function hasStoredCredential(record) {
       );
     };
     /** @param {{ checked: boolean, onChange: (checked: boolean) => void }} props - Switch state. */
-    const IOSSwitch = ({ checked, onChange, disabled }) => <Toggle checked={checked} onChange={onChange} disabled={disabled} size="md" />;
+    const IOSSwitch = ({ checked, onChange, disabled, 'aria-label': ariaLabel }) => <Toggle checked={checked} onChange={onChange} disabled={disabled} size="md" aria-label={ariaLabel} />;
     /** @param {{ id: string, icon: import('react').ReactNode, label: string, dot?: boolean, active: boolean, onSelect: (id: string) => void }} props - Sidebar section entry. */
     const SectionButton = ({ id, icon, label, dot, active, onSelect }) => (
       <button
@@ -1436,6 +1467,7 @@ function hasStoredCredential(record) {
                   {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and input are siblings; the label has no htmlFor association, switching to span would deviate from the existing structure */}
                   <label className="shrink-0 text-[14px] leading-5">API Key</label>
                   <input type="text" value={draftKey} onChange={e => setDraftKey(e.target.value)}
+                    autoCorrect="off" autoCapitalize="off" spellCheck={false}
                     // biome-ignore lint/a11y/noAutofocus: the edit-search-source modal focuses the key input on open; focus is the input intent
                     autoFocus
                     placeholder={hasSavedKey ? '••••••••' : settingsCopy.apiKeyPlaceholder}
@@ -1482,8 +1514,8 @@ function hasStoredCredential(record) {
       </div>
     );
     // iOS-style confirm dialog (stacked buttons: red confirm on top, blue cancel below; backdrop click does not close).
-    // Three isomorphic sites: model delete / search source delete / memory delete; RestartDialog (two-column grid, wider) is not one of them.
-    // Optional testid/confirmTestId mount the memory delete dialog's test pins; desc is omitted where the dialog carries no description row.
+    // Four isomorphic sites: model delete / search source delete / memory delete / feedback close; RestartDialog (two-column grid, wider) is not one of them.
+    // Optional testid/confirmTestId mount the test pins the memory-delete and feedback-close dialogs need; desc is omitted where the dialog carries no description row.
     const SheetConfirmDialog = ({ title, desc, confirmLabel, cancelLabel, onConfirm, onCancel, testid, confirmTestId }) => (
       <div data-testid={testid} className="fixed inset-0 z-[110] flex items-center justify-center bg-black/35 backdrop-blur-md px-4">
         <div className={`w-[270px] overflow-hidden rounded-[14px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7]`}>
@@ -1567,9 +1599,67 @@ function hasStoredCredential(record) {
       // user toggles off and back on (set_enabled's re-enable is the only
       // resume path). Without this hint the stop state is invisible in
       // settings — the safety loop's exit must be discoverable.
-      const stopped = !!computerUse.stopped;
+      //
+      // Gated on the toggle still reading ON: the hint tells the user to turn
+      // the feature off and back on, so showing it next to a switch they have
+      // already turned off asked them to redo the step they had just taken —
+      // halfway through the only recovery path the feature offers.
+      const stopped = !!computerUse.stopped && !!computerUse.enabled;
+      // macOS permission onboarding: one snapshot fetch on mount (and a
+      // re-read after the user answers the OS dialogs). Null = unknown or no
+      // permission flow (web stub rejection, older backend, non-macOS): the
+      // row stays hidden instead of showing permanently-false toggles. A
+      // `false` grant is advisory — TCC applies a fresh grant to processes
+      // launched after it, so the hint always pairs a miss with the restart
+      // step instead of polling for a flip.
+      const [permStatus, setPermStatus] = useState(null);
+      const [permBusy, setPermBusy] = useState(false);
+      useEffect(() => {
+        if (unsupported) return;
+        if (!bridge.available || !bridge.computerUse) return;
+        let cancelled = false;
+        bridge.computerUse.permissionStatus()
+          .catch(() => null)
+          .then((status) => { if (!cancelled) setPermStatus(status || null); });
+        return () => { cancelled = true; };
+      }, [unsupported]);
+      const refreshPermStatus = () => {
+        if (!bridge.available || !bridge.computerUse) return Promise.resolve(null);
+        return bridge.computerUse.permissionStatus()
+          .catch(() => null)
+          .then((status) => { setPermStatus(status || null); return status; });
+      };
+      const permMissing = !!permStatus && permStatus.supported
+        && (permStatus.screen_recording === false || permStatus.accessibility === false);
+      const permValue = permStatus && permStatus.supported
+        ? `${t.uiComputerUse.permScreenRecording} ${permStatus.screen_recording ? t.uiComputerUse.permGranted : t.uiComputerUse.permNotGranted} · ${t.uiComputerUse.permAccessibility} ${permStatus.accessibility ? t.uiComputerUse.permGranted : t.uiComputerUse.permNotGranted}`
+        : null;
+      const openPermissionDialogs = () => {
+        if (!bridge.available || !bridge.computerUse || permBusy) return;
+        setPermBusy(true);
+        // A rejection here must not hide the row: keep the last snapshot and
+        // surface the failure through the section's actionError slot (same
+        // surface as the toggle), then re-read whatever the dialogs changed.
+        bridge.computerUse.requestPermissions()
+          .catch((error) => setActionError(t.uiComputerUse.actionFailed(String(error && error.message ? error.message : error))))
+          .finally(() => { setPermBusy(false); void refreshPermStatus(); });
+      };
       return (
         <IOSSection title={t.uiComputerUse.settingsSection}>
+          {permValue && (
+            <IOSRow
+              label={t.uiComputerUse.permTitle}
+              desc={permMissing ? t.uiComputerUse.permRestartHint : undefined}
+            >
+              <div className="flex flex-col items-end gap-1.5 max-sm:items-stretch">
+                <span className={`text-[12px] leading-4 ${permMissing ? 'text-[#FF9500] dark:text-[#FF9F0A]' : 'text-[#8A8A8E] dark:text-[#98989D]'}`}>{permValue}</span>
+                {permMissing && (
+                  <button type="button" disabled={permBusy} onClick={openPermissionDialogs}
+                    className={`px-3 py-1.5 rounded-lg text-[12px] border border-black/10 hover:bg-black/5 disabled:opacity-50 dark:border dark:border-white/10 dark:hover:bg-white/10`}>{t.uiComputerUse.permRequest}</button>
+                )}
+              </div>
+            </IOSRow>
+          )}
           <IOSRow
             label={t.uiComputerUse.settingsToggle}
             desc={
@@ -1610,8 +1700,219 @@ function hasStoredCredential(record) {
       );
     };
 
+    /**
+     * Global bring-to-front shortcut (default combo Ctrl/Cmd+Alt+P, presents
+     * the window while Pinvou runs in the background; OFF by default).
+     * Desktop-only: the web lane renders none of this section (caller !isWeb
+     * gate); with globalShortcutsAvailable=false the switch and input grey
+     * out and the desc shows the unsupported copy. The switch and the combo
+     * input share one single-flight command channel (each call submits the
+     * full enabled+accelerator config, same flightRef pattern as
+     * ComputerUse); "invalid"/"conflict" write the localized error into the
+     * owning row's desc slot (conflict's technical message goes to console
+     * only), and a failed save reverts the UI by simply not mirroring. An
+     * enabled request answered disabled with a message (session cannot
+     * support it) still commits, but the switch row's desc turns into the
+     * unsupported copy.
+     *
+     * State model: `enabled` and the saved accelerator are read LIVE from
+     * the bridge settings slice — the bridge mirror refreshes that slice
+     * after every committed save (registered or disabled, always reporting
+     * the persisted accelerator), so the UI derives from the disk mirror, a
+     * failed save rolls the toggle back for free, and a pre-snapshot toggle
+     * cannot submit a stale combo: the whole section stays disabled until
+     * the slice exists. Only the accelerator input is local (display form);
+     * it follows the saved combo while untouched, and the dirty check
+     * compares display forms.
+     * Persistence is owned exclusively by set_global_shortcut_config (the
+     * bridge syncs the settings snapshot); update_settings is never used.
+     * @param {{ t: object, platformCapabilities: { globalShortcutsAvailable?: boolean } }} props - Dictionary and platform capability slice.
+     */
+    const GlobalShortcutSettingSection = ({ t, platformCapabilities }) => {
+      const copy = t.uiSettings;
+      const slice = useBridgeState(['settings']);
+      // Live disk-mirror state; `null` while the settings snapshot has not
+      // loaded. Rendering interactive defaults before it arrives would let a
+      // toggle submit the default combo over whatever disk holds. A failed
+      // get_settings leaves a truthy fallback {theme, color_scheme, language}
+      // in the slice — not disk truth for this section — so the gate also
+      // requires the shortcut fields to be present.
+      const rawSettings = (slice && slice.settings) || null;
+      const prefs = rawSettings && typeof rawSettings.global_shortcut_enabled === 'boolean'
+        ? rawSettings
+        : null;
+      const available = !!(platformCapabilities && platformCapabilities.globalShortcutsAvailable);
+      // Rust defaults global_shortcut_enabled to false: only an explicit true
+      // shows as on; unloaded settings render as off (and stay disabled).
+      const enabled = prefs ? prefs.global_shortcut_enabled === true : false;
+      const savedAccelerator = prefs
+        ? (normalizeGlobalShortcutDraft(prefs.global_shortcut_accelerator) || GLOBAL_SHORTCUT_DEFAULT_ACCELERATOR)
+        : GLOBAL_SHORTCUT_DEFAULT_ACCELERATOR;
+      const [draftAccelerator, setDraftAccelerator] = useState(() => formatGlobalShortcutForDisplay(savedAccelerator));
+      const [actionError, setActionError] = useState('');
+      const [errorSlot, setErrorSlot] = useState('toggle');
+      const [pending, setPending] = useState(false);
+      // Same synchronous single-flight as ComputerUseSettingSection: the
+      // disabled attribute lags one render, so a double-click would fire two
+      // concurrent commands — the ref intercepts inside the event handler.
+      const flightRef = useRef({ busy: false });
+      // The input follows the saved combo while the user has not typed:
+      // the settings snapshot may load after mount, and a racing save
+      // mirror may change the saved combo later. editedRef marks a
+      // user-touched draft, syncedFoldRef the fold of the saved combo the
+      // draft currently displays. draftRef mirrors the draft for the async
+      // completion handlers, which would otherwise read a stale render-time
+      // value.
+      const draftRef = useRef(draftAccelerator);
+      const editedRef = useRef(false);
+      const syncedFoldRef = useRef(foldGlobalShortcutDraft(draftAccelerator));
+      const updateDraft = useCallback((value) => {
+        draftRef.current = value;
+        setDraftAccelerator(value);
+      }, []);
+      useEffect(() => {
+        if (editedRef.current) return;
+        const display = formatGlobalShortcutForDisplay(savedAccelerator);
+        const fold = foldGlobalShortcutDraft(display);
+        if (fold === syncedFoldRef.current) return;
+        syncedFoldRef.current = fold;
+        updateDraft(display);
+      }, [savedAccelerator, updateDraft]);
+      const applyConfig = (nextEnabled, nextAccelerator, slot) => {
+        if (flightRef.current.busy) return;
+        if (!prefs || !bridge.available || !bridge.settings || typeof bridge.settings.setGlobalShortcutConfig !== 'function') return;
+        flightRef.current.busy = true;
+        setActionError('');
+        setPending(true);
+        bridge.settings.setGlobalShortcutConfig(nextEnabled, nextAccelerator)
+          .then((result) => {
+            const status = result && result.status;
+            if (status === 'registered' || status === 'disabled') {
+              // `enabled` and `savedAccelerator` are live bridge-mirror
+              // state: the wrapper refreshed the slice before this callback
+              // ran, so both already describe the committed save, and a
+              // failed save reverts them by not mirroring at all. Only the
+              // draft needs local care: fold it back in sync when it
+              // matches the submitted combo modulo case/whitespace/alias
+              // spelling (Rust already normalized; do not leave a phantom
+              // dirty flag behind); otherwise treat it as a combo the user
+              // is still editing and leave it alone.
+              if (result && typeof result.accelerator === 'string' && result.accelerator) {
+                const normalized = normalizeGlobalShortcutDraft(result.accelerator);
+                const draft = draftRef.current;
+                if (foldGlobalShortcutDraft(draft) === foldGlobalShortcutDraft(formatGlobalShortcutForDisplay(nextAccelerator))
+                  || foldGlobalShortcutDraft(draft) === foldGlobalShortcutDraft(nextAccelerator)) {
+                  editedRef.current = false;
+                  const display = formatGlobalShortcutForDisplay(normalized);
+                  syncedFoldRef.current = foldGlobalShortcutDraft(display);
+                  updateDraft(display);
+                }
+              }
+              // disabled + message only happens when the session cannot
+              // support shortcuts (e.g. Wayland): the intent was persisted,
+              // but the switch row's desc must show the localized
+              // unsupported notice instead of a silent success.
+              if (status === 'disabled' && nextEnabled === true && result.message) {
+                setActionError(copy.globalShortcutUnsupportedDesc);
+                setErrorSlot('toggle');
+              }
+              return;
+            }
+            if (status === 'conflict' && result && result.message) {
+              console.warn('[settings] global shortcut conflict detail', result.message);
+            }
+            setActionError(status === 'invalid' ? copy.globalShortcutInvalid
+              : status === 'conflict' ? copy.globalShortcutConflict
+              : copy.globalShortcutSaveFailed);
+            setErrorSlot(slot);
+          })
+          .catch((error) => {
+            // The wrapper contract never rejects (hard failures resolve
+            // null); this only guards against an unexpected exception
+            // latching the flight flag.
+            console.warn('[settings] global shortcut config failed', error);
+            setActionError(copy.globalShortcutSaveFailed);
+            setErrorSlot(slot);
+          })
+          .finally(() => {
+            flightRef.current.busy = false;
+            setPending(false);
+          });
+      };
+      // Dirty check compares display forms: draft holds the display form,
+      // savedAccelerator the machine-canonical string.
+      const acceleratorDirty = normalizeGlobalShortcutDraft(draftAccelerator) !== formatGlobalShortcutForDisplay(savedAccelerator);
+      const acceleratorPlausible = isPlausibleGlobalShortcutAccelerator(draftAccelerator);
+      // Errors land in the owning row's slot regardless of availability: on
+      // an unavailable session the only operable action is switching a
+      // residual shortcut off, and a failed disable must be visible instead
+      // of console-only.
+      const toggleDesc = actionError && errorSlot === 'toggle'
+        ? actionError
+        : available ? copy.globalShortcutEnableDesc : copy.globalShortcutUnsupportedDesc;
+      const acceleratorDesc = actionError && errorSlot === 'accelerator' ? actionError : undefined;
+      const saveAccelerator = () => {
+        // Plausibility gates the click, not the button: a never-valid draft
+        // (dangling separator, modifiers only) keeps Save enabled and
+        // explains itself here instead of wedging silently (same pattern as
+        // the localPort row).
+        if (!acceleratorPlausible) {
+          setActionError(copy.globalShortcutInvalid);
+          setErrorSlot('accelerator');
+          return;
+        }
+        applyConfig(enabled, globalShortcutDraftToRust(draftAccelerator), 'accelerator');
+      };
+      return (
+        <IOSSection title={copy.globalShortcuts}>
+          <IOSRow label={copy.globalShortcutEnable} desc={toggleDesc}>
+            {/* An unavailable session may still switch off a residual
+                enabled=true (the Rust disable path deliberately has no
+                availability gate — it is always safe); only turning the
+                shortcut ON needs a capable session. The whole section stays
+                disabled until the settings snapshot has loaded. */}
+            <IOSSwitch
+              checked={enabled}
+              disabled={!prefs || (!available && !enabled) || pending}
+              aria-label={copy.globalShortcutEnable}
+              onChange={value => applyConfig(!!value, savedAccelerator, 'toggle')}
+            />
+          </IOSRow>
+          <IOSRow label={copy.globalShortcutAccelerator} desc={acceleratorDesc}>
+            <div className="flex items-center gap-2 max-sm:w-full">
+              <input
+                type="text"
+                value={draftAccelerator}
+                onChange={e => {
+                  editedRef.current = true;
+                  // Same pattern as the localPort row: typing invalidates
+                  // the row's error, so a fixed-up draft no longer shows
+                  // the stale invalid copy next to it.
+                  if (errorSlot === 'accelerator') setActionError('');
+                  updateDraft(e.target.value);
+                }}
+                disabled={!prefs || !available || pending}
+                placeholder={copy.globalShortcutPlaceholder}
+                aria-label={copy.globalShortcutAccelerator}
+                data-testid="global-shortcut-accelerator"
+                autoCorrect="off" autoCapitalize="off" spellCheck={false}
+                className="h-8 w-36 rounded-lg border border-black/[0.12] bg-transparent px-2.5 text-[13px] leading-5 outline-none focus:border-[#007AFF] disabled:opacity-45 dark:border-white/[0.14] dark:focus:border-[#0A84FF] max-sm:w-full"
+              />
+              <button
+                type="button"
+                data-testid="global-shortcut-save"
+                disabled={!prefs || !available || pending || !acceleratorDirty}
+                onClick={saveAccelerator}
+                className="h-8 shrink-0 rounded-full bg-[#007AFF]/10 px-3 text-[13px] font-medium text-[#007AFF] transition-colors hover:bg-[#007AFF]/20 disabled:opacity-35 dark:bg-[#0A84FF]/20 dark:text-[#0A84FF]"
+              >{t.uiSettingsDetail.save}</button>
+            </div>
+          </IOSRow>
+        </IOSSection>
+      );
+    };
+
     // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
-    const SettingsView = ({ activeTheme, colorScheme, onColorSchemeChange, language, setLanguage, superPerm, setSuperPerm, taskCompletedNotif, setTaskCompletedNotif, searchProvider, setSearchProvider, enabledSearchProviders, onAddSearchProvider, onDeleteSearchProvider, setSearchApiKey, savedModels, activeModelId, onSaveModel, onDeleteModel, onSetActiveModel, onSaveSearchConfig, onConfirmSearchConfig, onMemoryEnabledChange, onPetEnabledChange, bs, t, sidebarDateGrouping = true, onSidebarDateGroupingChange, updateFocusTick, onCloseSettings, initialSection = 'general' }) => {
+    const SettingsView = ({ activeTheme, colorScheme, onColorSchemeChange, language, setLanguage, superPerm, setSuperPerm, taskCompletedNotif, setTaskCompletedNotif, searchProvider, setSearchProvider, enabledSearchProviders, onAddSearchProvider, onDeleteSearchProvider, setSearchApiKey, savedModels, activeModelId, onSaveModel, onDeleteModel, onSetActiveModel, onSaveSearchConfig, onConfirmSearchConfig, onMemoryEnabledChange, onPetEnabledChange, bs, t, sidebarDateGrouping = true, onSidebarDateGroupingChange, chatStreamingAnimation = true, onChatStreamingAnimationChange, updateFocusTick, onCloseSettings, initialSection = 'general' }) => {
       const settingsCopy = t.uiSettingsDetail;
       const platformCapabilities = (bs && bs.platformCapabilities) || {};
       const showSuperPermissionSettings = !!platformCapabilities.showSuperPermissionSettings;
@@ -1660,7 +1961,7 @@ function hasStoredCredential(record) {
       ];
       const feedbackAllowedExt = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'mov', 'webm']);
       const feedbackVideoExt = new Set(['mp4', 'mov', 'webm']);
-      const feedbackBaseName = p => String(p || '').replaceAll('\\', '/').split('/').pop() || String(p || '');
+      const feedbackBaseName = p => pathBasename(p, { fallback: String(p || '') });
       const feedbackExt = p => {
         const name = feedbackBaseName(p);
         const idx = name.lastIndexOf('.');
@@ -2126,6 +2427,17 @@ function hasStoredCredential(record) {
               <IOSSwitch checked={sidebarDateGrouping} onChange={onSidebarDateGroupingChange} />
             </IOSRow>
           </IOSSection>
+          {/* Chat behavior gets its own group. The web lane cannot persist
+              this key (WebSettingsPatch has no `chat` field and hard-rejects
+              the patch), so the section stays desktop-only like the voice
+              postprocess toggle instead of rendering an empty titled group. */}
+          {!isWeb && (
+          <IOSSection title={t.chatSection}>
+            <IOSRow label={t.chatStreamingAnimation} desc={t.chatStreamingAnimationDesc}>
+              <IOSSwitch checked={chatStreamingAnimation} onChange={onChatStreamingAnimationChange} />
+            </IOSRow>
+          </IOSSection>
+          )}
           {canConfigureDesktopNotifications && (
           <IOSSection title={t.uiSettings.notifications}>
             <IOSRow label={t.uiSettings.taskNotice} desc={t.uiSettings.taskNoticeDesc}>
@@ -2161,6 +2473,13 @@ function hasStoredCredential(record) {
               onClose={handleVoiceShortcutInfoClose}
               onToggleShortcut={handleVoiceShortcutInfoEnable}
             />
+          )}
+          {/* The global shortcut is a desktop capability: the web lane has
+              neither the command nor any global-window concept, so hide the
+              whole section (same gating pattern as the notifications
+              section's can gate). */}
+          {!isWeb && (
+            <GlobalShortcutSettingSection t={t} platformCapabilities={platformCapabilities} />
           )}
           {canUsePet && (
           <section className="mb-6">
@@ -2357,7 +2676,12 @@ function hasStoredCredential(record) {
         const updateReady = !!(bs && bs.updateReady);
         const updateProgress = (bs && bs.updateProgress) || 0;
         const isWindowsUpdate = upd && upd.platform === 'windows';
-        const updateError = (bs && bs.updateError) || (bs && bs.updateCheckError && bs.updateCheckError !== 'latest' ? bs.updateCheckError : '');
+        // The localized hint replaces the raw backend string (it may carry request
+        // details and be untranslated); the raw cause stays in bridge state and
+        // is logged by the updater for diagnostics.
+        const updateError = bs && bs.updateError
+          ? t.updateInstallFailed
+          : (bs && bs.updateCheckError && bs.updateCheckError !== 'latest' ? t.updateCheckFailed : '');
         const updateStatusDesc = updateDownloading
           ? (updateProgress >= 100 ? t.uiSettings.installingUpdate : t.uiSettings.downloading(updateProgress))
           : updateReady
@@ -2427,7 +2751,7 @@ function hasStoredCredential(record) {
               </IOSSection>
             )}
             {canUseComputerUse && <ComputerUseSettingSection t={t} />}
-            <div id="settings-dependencies">
+            {canInstallDependencies && <div id="settings-dependencies">
               <IOSSection
                 title={t.depCheckTitle}
                 footer={usesHomebrewDependencyInstaller ? t.depInstallNoteMac : (usesBundledDependencyInstaller ? t.depInstallNoteWindows : t.depInstallNote)}
@@ -2457,7 +2781,7 @@ function hasStoredCredential(record) {
                   </IOSRow>
                 )}
               </IOSSection>
-            </div>
+            </div>}
           </>
         );
       };
@@ -2751,17 +3075,15 @@ function hasStoredCredential(record) {
           )}
           {/* Feedback-close confirm layer: sits above the feedback panel (z-[100]), same recipe as MemoryDeleteDialog (backdrop click does not close) */}
           {feedbackOpen && feedbackCloseConfirm && (
-            <div data-testid="feedback-close-confirm" className="fixed inset-0 z-[110] flex items-center justify-center bg-black/35 backdrop-blur-md px-4">
-              <div className={`w-[270px] overflow-hidden rounded-[14px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7]`}>
-                <div className="px-5 pt-5 pb-4 text-center">
-                  <h3 className="text-[17px] leading-6 font-semibold">{t.feedbackCloseConfirm}</h3>
-                </div>
-                <div className={`border-t border-black/[0.12] dark:border-white/[0.12]`}>
-                  <button type="button" data-testid="feedback-close-confirm-ok" onClick={() => { setFeedbackCloseConfirm(false); closeFeedback(); }} className={`w-full h-12 text-[17px] font-semibold text-[#FF3B30] border-b border-black/[0.12] dark:border-white/[0.12]`}>{t.feedbackCloseAnyway}</button>
-                  <button type="button" onClick={() => setFeedbackCloseConfirm(false)} className="w-full h-12 text-[17px] font-semibold text-[#007AFF]">{t.cancel}</button>
-                </div>
-              </div>
-            </div>
+            <SheetConfirmDialog
+              testid="feedback-close-confirm"
+              confirmTestId="feedback-close-confirm-ok"
+              title={t.feedbackCloseConfirm}
+              confirmLabel={t.feedbackCloseAnyway}
+              cancelLabel={t.cancel}
+              onConfirm={() => { setFeedbackCloseConfirm(false); closeFeedback(); }}
+              onCancel={() => setFeedbackCloseConfirm(false)}
+            />
           )}
           {feedbackNotice && (
             <div className="fixed left-1/2 bottom-8 z-[130] -translate-x-1/2 px-4 py-2.5 rounded-full bg-black/80 text-white text-[14px] shadow-xl backdrop-blur-md">

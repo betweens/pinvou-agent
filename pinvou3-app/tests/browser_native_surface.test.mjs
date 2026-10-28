@@ -9,6 +9,10 @@ const browserView = readFileSync(
   path.join(projectRoot, 'src', 'features', 'browser', 'BrowserView.jsx'),
   'utf8',
 );
+const nativeSurfaceCoordinator = readFileSync(
+  path.join(projectRoot, 'src', 'features', 'browser', 'native-surface-coordinator.js'),
+  'utf8',
+);
 const browserManager = readFileSync(
   path.join(projectRoot, 'src-tauri', 'src', 'features', 'browser', 'mod.rs'),
   'utf8',
@@ -105,7 +109,11 @@ test('IPC capability is granted only to named WebViews and not inherited by chil
 });
 
 test('browser presentation renders only the native surface without screenshot streaming', () => {
-  assert.match(browserView, /browser_show_native_surface/);
+  assert.match(nativeSurfaceCoordinator, /browser_show_native_surface/);
+  // The view drives the one physical surface only through the coordinator;
+  // a direct surface command in the view would bypass its ownership and
+  // visibility-sequence protocol.
+  assert.doesNotMatch(browserView, /browser_(?:show|hide)_native_surface|browser_begin_surface_generation/);
   assert.doesNotMatch(browserView, /listenTauri\(['"]browser:frame/);
   assert.doesNotMatch(browserView, /browser_set_streaming/);
   assert.doesNotMatch(browserView, /data:image\/(?:jpeg|png);base64/);
@@ -149,7 +157,7 @@ test('Linux child WebView uses a fixed dock overlay and stays hidden on layout f
 test('Windows MCP enables pageId routing and structured targetId output', () => {
   assert.match(
     browserWrapper,
-    /\['--experimental-page-id-routing', '--experimental-structured-content'\]/,
+    /\['--page-id-routing', '--experimental-structured-content'\]/,
   );
 });
 
@@ -194,6 +202,20 @@ test('normal mode uses one Right Dock switcher for artifact and browser entries'
   assert.match(main, /browserDockAvailable=\{browserDockAvailable\}/);
   assert.match(main, /platformCapabilities\.browserNativeDisplay/);
   assert.match(main, /invokeTauri\('browser_prepare', \{ sessionId: requestedSessionId \}\)/);
+  // The lazy browser chunk is prefetched inside the workspace preparation so
+  // the fetch hides behind the Rust round-trip instead of the first paint:
+  // after the browserActive early-return, before the prepare round-trip.
+  // Both anchors occur once in the file, so the two bounded windows pin the
+  // ordering inside openBrowserDock without matching unrelated occurrences.
+  assert.equal((main.match(/if \(browserActive\) return;/g) || []).length, 1);
+  assert.equal((main.match(/invokeTauri\('browser_prepare'/g) || []).length, 1);
+  assert.match(main, /if \(browserActive\) return;[\s\S]{0,600}prefetchView\('browser'\)/);
+  assert.match(main, /prefetchView\('browser'\)[\s\S]{0,800}invokeTauri\('browser_prepare'/);
+  // Exactly two call sites: the dock funnel above and the NAV_PREFETCH entry,
+  // through which the mobile navigation funnel (navigateFromScheduledRun)
+  // prefetches the browser chunk at tap time like every other navigable view.
+  assert.equal((main.match(/prefetchView\('browser'\)/g) || []).length, 2);
+  assert.match(main, /browser: \(\) => prefetchView\('browser'\)/);
   assert.match(main, /const \[browserPaneStates, setBrowserPaneStates\] = useState\(\{\}\)/);
   assert.match(main, /browserPaneStateFor\(browserPaneStates, browserSessionId\)/);
   assert.match(main, /rightDockActivePanelId=\{browserDockSelectedPanelId\}/);
@@ -232,13 +254,17 @@ test('native surface suspension is centrally derived for every occlusion path', 
     'savedConfirm',
     'webAccessOpen',
     'apiKeyGateOpen',
-    'vllmSetupModalOpen',
     'bs.pinvouModal',
     'isCompactShell && isSidebarOpen',
     'isCompactShell && mobileMoreOpen',
     // The state name alone appears at every picker touchpoint; only the
     // intent entry suspends the dock, so assert that exact fragment.
     "moveToProjectSession ? 'move-picker' : ''",
+    // The rebind confirm dialog is the move picker's sibling and needs its own
+    // intent entry (review #463 round-10 T1): with only the state name present
+    // the dock stays live under the modal, and in the partial state that modal
+    // is the sole retry entry.
+    "rebindDraft ? 'rebind' : ''",
   ]) {
     assert.ok(main.includes(blocker), `missing native-surface blocker: ${blocker}`);
   }
@@ -256,16 +282,16 @@ test('native surface suspension is centrally derived for every occlusion path', 
   assert.match(attachmentDropOverlay, /useRightDockOcclusion\(`attachment-drop-\$\{overlayId\}`, active\)/);
   assert.match(attachmentDropOverlay, /if \(active && !publicationReady\) return null/);
   assert.match(browserView, /if \(shouldSuspendNativeSurface\) \{[\s\S]{0,160}claimNativeSurfaceHide/);
-  assert.match(browserView, /const nativeSurfaceCoordinator = \{/);
-  assert.match(browserView, /nativeSurfaceCoordinator\.owner !== owner/);
+  assert.match(nativeSurfaceCoordinator, /const nativeSurfaceCoordinator = \{/);
+  assert.match(nativeSurfaceCoordinator, /nativeSurfaceCoordinator\.owner !== owner/);
   assert.match(browserView, /disposed \|\| !ownsNativeSurfaceShow/);
   assert.match(browserView, /let lastShownBoundsKey = ''/);
   assert.match(browserView, /if \(boundsKey === lastShownBoundsKey\) return;/);
   assert.match(browserView, /if \(shown\) lastShownBoundsKey = boundsKey;/);
-  assert.match(browserView, /browser_begin_surface_generation/);
-  assert.match(browserView, /visibilityGeneration/);
-  assert.match(browserView, /visibilitySequence/);
-  assert.doesNotMatch(browserView, /visibilityEpoch|nextNativeSurfaceVisibilityEpoch/);
+  assert.match(nativeSurfaceCoordinator, /browser_begin_surface_generation/);
+  assert.match(nativeSurfaceCoordinator, /visibilityGeneration/);
+  assert.match(nativeSurfaceCoordinator, /visibilitySequence/);
+  assert.doesNotMatch(nativeSurfaceCoordinator, /visibilityEpoch|nextNativeSurfaceVisibilityEpoch/);
 });
 
 test('occluding UI, task switches, and Right Dock state publish only after native hide ACK', () => {
@@ -279,17 +305,17 @@ test('occluding UI, task switches, and Right Dock state publish only after nativ
   assert.match(main, /setPublishedBrowserOverlayIntent\(browserOverlayIntent\)/);
   assert.match(main, /browserOverlayPublicationReady && createPortal/);
   assert.match(main, /closeBrowserDock\(selectedSessionId\)/);
-  assert.match(browserView, /export async function acquireNativeSurfaceTransitionHide/);
-  assert.match(browserView, /nativeSurfaceCoordinator\.transitionOwners\.size > 0/);
-  assert.match(browserView, /nativeSurfaceCoordinator\.transitionOwners\.add\(owner\)/);
-  assert.match(browserView, /nativeSurfaceCoordinator\.transitionOwners\.delete\(owner\)/);
-  assert.match(browserView, /const hide = claimNativeSurfaceHide\(owner, sessionId\)/);
-  assert.match(browserView, /await hide/);
-  assert.match(browserView, /retainOnFailure = false/);
-  assert.match(browserView, /createDegradedNativeSurfaceHideLease\(\{/);
-  assert.match(browserView, /isFailedNativeSurfaceHideGenerationCurrent\(\{/);
-  assert.match(browserView, /retryHide: \(\) => claimNativeSurfaceHide\(owner, sessionId\)/);
-  assert.doesNotMatch(browserView, /failedIntentOwner === owner/);
+  assert.match(nativeSurfaceCoordinator, /export async function acquireNativeSurfaceTransitionHide/);
+  assert.match(nativeSurfaceCoordinator, /nativeSurfaceCoordinator\.transitionOwners\.size > 0/);
+  assert.match(nativeSurfaceCoordinator, /nativeSurfaceCoordinator\.transitionOwners\.add\(owner\)/);
+  assert.match(nativeSurfaceCoordinator, /nativeSurfaceCoordinator\.transitionOwners\.delete\(owner\)/);
+  assert.match(nativeSurfaceCoordinator, /const hide = claimNativeSurfaceHide\(owner, sessionId\)/);
+  assert.match(nativeSurfaceCoordinator, /await hide/);
+  assert.match(nativeSurfaceCoordinator, /retainOnFailure = false/);
+  assert.match(nativeSurfaceCoordinator, /createDegradedNativeSurfaceHideLease\(\{/);
+  assert.match(nativeSurfaceCoordinator, /isFailedNativeSurfaceHideGenerationCurrent\(\{/);
+  assert.match(nativeSurfaceCoordinator, /retryHide: \(\) => claimNativeSurfaceHide\(owner, sessionId\)/);
+  assert.doesNotMatch(nativeSurfaceCoordinator, /failedIntentOwner === owner/);
   assert.match(main, /requestBrowserUiCommitAck\(\)\.then/);
   assert.match(main, /useLayoutEffect\(\(\) => \{[\s\S]*?browserUiCommitWaitersRef/);
   assert.match(main, /if \(!browserUiCommitMountedRef\.current\) return Promise\.resolve\(false\)/);
@@ -314,8 +340,25 @@ test('task switches discard stale status and mount a fresh BrowserView instance'
   assert.match(browserView, /const tabsRequestEpochRef = useRef\(0\)/);
   assert.match(browserView, /sessionIdRef\.current === requestedSessionId/);
   assert.match(browserView, /st\?\.sessionId !== requestedSessionId/);
-  const keyedBrowserViews = main.match(/<BrowserView\s+[\s\S]{0,100}?key=\{browserSessionId\}/g) || [];
+  // The browser view is a lazy route: the entry must not statically import it
+  // (that would pin the whole pane graph back into the main chunk), and both
+  // mounts go through the same React.lazy factory keyed by session.
+  assert.match(main, /lazy\(\(\) => VIEW_LOADERS\.browser\(\)/);
+  // Any quoted reference to the BrowserView module path from the entry (named,
+  // namespace, side-effect or dynamic import, with or without the .jsx
+  // extension) would re-pin the pane graph into the entry; the dynamic import
+  // lives only in view-loaders.js. The build-time lazy-chunk gate
+  // (lazyChunkContracts.browser) is the second net for any other spelling.
+  assert.doesNotMatch(main, /['"]\.\.\/features\/browser\/BrowserView(?:\.jsx)?['"]/);
+  const allBrowserViews = main.match(/<LazyBrowserView\b/g) || [];
+  const keyedBrowserViews = main.match(/<LazyBrowserView\s+[\s\S]{0,100}?key=\{browserSessionId\}/g) || [];
+  assert.equal(allBrowserViews.length, 2, 'only the compact and dock BrowserView mounts may exist');
   assert.equal(keyedBrowserViews.length, 2, 'compact and dock BrowserView instances must both be keyed by session');
+  assert.match(
+    main,
+    /\{browserActive \? \(\s*<ViewErrorBoundary t=\{t\} variant="panel">\s*<Suspense fallback=\{null\}>\s*<LazyBrowserView/,
+    'dock BrowserView must isolate lazy chunk loading and failures from the app root',
+  );
 });
 
 test('user takeover is visible, recovers after idle, and supports immediate handoff', () => {
@@ -444,12 +487,11 @@ test('exit events do not wait on the browser lock and always clean coordination 
   const exitEnd = tauriApp.indexOf('tauri::RunEvent::Resumed', exitStart);
   assert.ok(exitStart >= 0 && exitEnd > exitStart, 'Tauri exit handler must remain discoverable');
   const exitHandler = tauriApp.slice(exitStart, exitEnd);
-  assert.match(exitHandler, /shutdown_browser_before_process_end\(app\)/);
-  const shutdownHelper = tauriApp.slice(
-    tauriApp.indexOf('fn shutdown_browser_before_process_end'),
-    tauriApp.indexOf('pub(crate) async fn prepare_app_restart'),
+  assert.match(
+    exitHandler,
+    /browser\.shutdown_on_exit\(\)/,
+    'the inlined exit branch must keep the nonblocking browser shutdown',
   );
-  assert.match(shutdownHelper, /browser\.shutdown_on_exit\(\)/);
   assert.doesNotMatch(
     exitHandler,
     /mgr\.stop\(\)\.await/,
@@ -623,11 +665,57 @@ test('BrowserCore tab commits marker, WebDriver bind, initial navigation, then p
   );
   assert.match(
     userCreate,
-    /about:blank#pinvou-tab-[\s\S]{0,900}bind_staged_native_target\([\s\S]{0,900}bind_target\([\s\S]{0,900}navigate_tab_after_bind\(/,
+    /\{HOST_BLANK_MARKER_TAB_PREFIX\}\{tab_token\}[\s\S]{0,900}bind_staged_native_target\([\s\S]{0,900}bind_target\([\s\S]{0,900}navigate_tab_after_bind\(/,
   );
   assert.match(nativeHost, /staged_user_tabs: HashMap/);
   assert.match(nativeHost, /requires_automation_binding[\s\S]{0,240}capabilities\(\)\.agent_automation/);
   assert.match(nativeHost, /candidate\.publish\(\)/);
+});
+
+test('every browser/mod.rs blank-tab marker references the shared const, never a hand-typed literal', () => {
+  // Round-2 review minor: only create_native_bound_tab was const-by-name
+  // pinned; handle_hosted_browser_request and create_agent_popup_tab could
+  // revert to hand-typed literals (plus a typo) with every test green. All
+  // three production sites must go through HOST_BLANK_MARKER_TAB_PREFIX, and
+  // no production line may hand-type the value (the mod.rs literal below
+  // belongs to this file's test module).
+  const uses = [...browserManager.matchAll(/\{HOST_BLANK_MARKER_TAB_PREFIX\}/g)].length;
+  assert.equal(
+    uses,
+    3,
+    'browser/mod.rs blank-tab markers must all reference the shared platform const',
+  );
+  for (const fn of [
+    'handle_hosted_browser_request',
+    'create_agent_popup_tab',
+    'async fn create_native_bound_tab',
+  ]) {
+    assert.ok(browserManager.includes(fn), `${fn} must exist`);
+  }
+  const production = browserManager.slice(0, browserManager.lastIndexOf('#[cfg(test)]'));
+  assert.doesNotMatch(
+    production,
+    /about:blank#pinvou-tab-/,
+    'the blank-tab marker value must stay single-sourced in the platform constant',
+  );
+  // Round-8 review minor: host.rs's two blank-tab CONSTRUCTION sites (the
+  // workspace-restore arm and marked_blank_url) are const-bound like mod.rs.
+  // The one remaining hand-typed occurrence in host.rs production is the
+  // comparison inside the generated bootstrap JS raw string (it also names
+  // the session marker), which host.rs's own unit tests value-pin.
+  const hostProduction = nativeHost.slice(0, nativeHost.lastIndexOf('#[cfg(test)]'));
+  const hostConstUses = [...hostProduction.matchAll(/\{HOST_BLANK_MARKER_TAB_PREFIX\}/g)].length;
+  assert.equal(
+    hostConstUses,
+    2,
+    'host.rs blank-tab constructions must reference the shared platform const',
+  );
+  const hostHandTyped = [...hostProduction.matchAll(/about:blank#pinvou-tab-/g)].length;
+  assert.equal(
+    hostHandTyped,
+    1,
+    'the bootstrap JS comparison is the only hand-typed marker allowed in host.rs production',
+  );
 });
 
 test('Linux WebDriver safely rebinds with a host marker without injecting remote-page identity', () => {
@@ -854,7 +942,7 @@ test('popup reuses only a fully begun lease and other popups become User-control
     nativeHost.indexOf('.on_new_window'),
     nativeHost.indexOf('let webview = match window.add_child'),
   );
-  assert.match(popupHandler, /popup_agent_authorization/);
+  assert.match(popupHandler, /retain_agent_operation_for_popup\(&popup_session_id, &popup_tab_token\)/);
   assert.match(popupHandler, /create_popup_tab\(&session_id, url\.to_string\(\), authorization\)/);
   assert.doesNotMatch(popupHandler, /agent_input_in_progress/);
   assert.doesNotMatch(popupHandler, /agent_initiated/);

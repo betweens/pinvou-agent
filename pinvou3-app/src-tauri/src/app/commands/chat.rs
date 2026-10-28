@@ -90,16 +90,18 @@ pub(crate) async fn chat_with_reservation(
     }
     // 默认标题会话用首条消息自动命名（原生代码会话与 ACP 同一语义）。
     // 命名失败不阻断发送——标题是展示层信息，正文投递才是关键路径。
-    let title_source = if message.trim().is_empty() {
+    // A leading session-mention injection block is stripped before the
+    // fallback branch (first_send_title_source): a refs-only + attachment
+    // first send still titles after the attachment basename.
+    let title_source = super::sessions::first_send_title_source(
+        message.trim(),
         attachments
             .as_deref()
             .unwrap_or_default()
             .first()
-            .map(|attachment| attachment.basename.clone())
-            .unwrap_or_default()
-    } else {
-        message.trim().to_string()
-    };
+            .map(|attachment| attachment.basename.as_str()),
+    )
+    .to_string();
     if let Err(error) = super::sessions::apply_default_session_title(store, &sid, &title_source) {
         log::warn!("[pinvou3][chat] auto title failed for {sid}: {error}");
     }
@@ -210,6 +212,7 @@ pub(crate) async fn chat_with_reservation(
             reference_absolute,
         )
     };
+    super::personas::unequip_persona_deleted_elsewhere(app, store, &sid);
     let pending_injections = store.take_pending_turn_injections(&sid);
     // Side B 卡片池: 加持后首条消息一次性 prepend 完整人设 body(agency-agents-zh)。
     // 之后每 turn 只靠 equip_anchor 轻锚点维持身份(EnginePool 注入),不再重灌 body。
@@ -284,14 +287,22 @@ pub(crate) async fn chat_with_reservation(
     }
     // 取该 session 的 mode 状态（mode + 多智能体开关）。
     let mode_state = store.mode_state(&sid);
-    // 多智能体模式（ADR-0006）：所有产生模型 turn 的入口共用提醒组装；每轮
-    // 重申而非首轮一次性教学，关掉开关即保持原消息不变。
+    // 多智能体模式（ADR-0006）：所有产生模型 turn 的入口共用同一装配——快照
+    // 与候选行同源捕获；蜂群契约本体在 spawn 级 instructions，用户内容逐字透传。
+    // 候选匹配只看用户原文（raw_message），不看 full 里已拼接的 persona 正文 /
+    // KB 引导 / 附件引用，避免注入文本的领域词虚假抬升无关专家卡。The
+    // session-mention injection block in the raw text is a machine contract,
+    // not user vocabulary (its fixed English words like "read_session" would
+    // spuriously hit expert n-grams), so it is stripped under the same rule
+    // as titles and checkpoint labels (round-27 asto m6: the added lines are
+    // English — CONTRIBUTING's comment-language rule).
+    let match_source = super::sessions::strip_session_mention_block(&raw_message);
     let prepared_delegation = super::multiagent::prepare_delegation_turn(
         pool,
         &sid,
         mode_state.multi_agent,
-        &raw_message,
         full,
+        super::multiagent::MatchSource(match_source),
     );
     full = prepared_delegation.content;
     let mode = mode_state.mode;
@@ -305,11 +316,23 @@ pub(crate) async fn chat_with_reservation(
     // 也覆盖计数失败导致的 None 序号快照）。
     let mut created_snapshot_id: Option<String> = None;
     if store.is_code_session(&sid) {
+        // The turn-checkpoint label is user-facing on the rewind surface: strip
+        // the session-mention injection block the way titles/bubbles do, so a
+        // refs-carrying first turn labels the checkpoint with the user's text
+        // instead of the machine contract (review round-10 M1). Lookalike
+        // prose passes through unchanged, matching the strip semantics. A
+        // refs-only turn (no user text after the strip) persists an EMPTY
+        // label by intent (round-16 m2): the rewind UI keys off checkpoint
+        // counts, and an empty label beats leaking the contract header.
+        let checkpoint_label = super::sessions::strip_session_mention_block(&display_content)
+            .trim()
+            .to_string();
         created_snapshot_id = super::checkpoints::create_turn_checkpoint(
             store,
             &sid,
             roots.ledger.clone(),
             roots.execution.clone(),
+            checkpoint_label,
             "chat",
         )
         .await;
@@ -330,6 +353,7 @@ pub(crate) async fn chat_with_reservation(
             mode.to_app_mode(),
             restrict_tools.unwrap_or(false),
             prepared_delegation.expert_snapshot,
+            prepared_delegation.expert_candidates,
             reservation,
         )
         .await
@@ -354,7 +378,14 @@ pub(crate) async fn chat_with_reservation(
                 }
             }
             if memory_enabled {
-                crate::features::memory::record_turn_user(&sid, &raw_message);
+                // Long-memory records user prose, not the machine contract:
+                // strip the injection block like every other user-text
+                // surface (round-15 m6 — the fixed English contract words
+                // must not enter the memory index as domain terms).
+                crate::features::memory::record_turn_user(
+                    &sid,
+                    super::sessions::strip_session_mention_block(&raw_message),
+                );
             }
             log::info!(
                 "[pinvou3][chat] engine send ok sid={} send_elapsed_ms={} total_elapsed_ms={}",
@@ -510,15 +541,18 @@ fn display_chat_message(
     if attachments.is_empty() {
         return message.to_string();
     }
-    let names = attachments
-        .iter()
-        .map(|attachment| attachment.basename.as_str())
-        .collect::<Vec<_>>();
     // Persist a JSON array after the human-readable marker. Unlike the legacy
     // `name · name` format, this preserves every legal filename exactly.
-    // Serializing a Vec<&str> to a JSON array cannot fail (no map keys, no
-    // non-string types).
-    let names = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string());
+    // The array is assembled from `Value::String` directly, so producing it is
+    // infallible by construction: there is no serializer that can fail here and
+    // therefore no fallback value that could misrepresent the attachment list.
+    let names = serde_json::Value::Array(
+        attachments
+            .iter()
+            .map(|attachment| serde_json::Value::String(attachment.basename.clone()))
+            .collect(),
+    )
+    .to_string();
     if message.trim().is_empty() {
         format!("📎 {names}")
     } else {

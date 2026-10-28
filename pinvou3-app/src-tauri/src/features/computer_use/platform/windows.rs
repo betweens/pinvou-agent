@@ -59,6 +59,7 @@ use std::time::Duration;
 use enigo::{Button, Direction, Enigo, Keyboard, Mouse, Settings};
 use uiautomation::UIAutomation;
 use uiautomation::types::{ControlType, Point, TreeScope, UIProperty};
+use windows::Win32::UI::Accessibility::TreeScope as RawTreeScope;
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetWindowDC, HBITMAP, HDC, HGDIOBJ,
@@ -72,47 +73,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
-use xcap::Monitor;
 
 use super::super::backend::ComputerUseBackend;
+use super::super::guard::raw_element_binding;
 use super::super::types::{
     Capabilities, Capture, ComputerUseError, ElementInfo, Key, MouseButton, ScrollDirection,
     UiTreeOptions,
 };
 use super::helpers::{
-    TYPE_CHUNK_CHARS, TypeRun, drag_waypoints, map_scroll, normalize_typed_newlines, sanitize_name,
-    screening_name, split_type_runs,
+    CHORD_HOLD_MS, CLICK_SETTLE_MS, DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES,
+    DRAG_PRESS_SETTLE_MS, DRAG_STEP_DELAY_MS, DRAG_STEPS, HOLD_CANCEL_POLL_MS, MAX_NAME_CHARS,
+    MAX_TREE_DEPTH, MAX_TREE_NODES, MULTI_CLICK_INTERVAL_MS, TYPE_CHUNK_CHARS, TypeRun,
+    combine_drag_errors, drag_waypoints, map_scroll, map_xcap_err, normalize_typed_newlines,
+    pick_monitor, release_reverse, sanitize_name, screening_hit, split_type_runs,
 };
 
-/// Wait before a click so the previous move has settled (the target process consumes mouse
-/// move events).
-const CLICK_SETTLE_MS: u64 = 30;
-/// Interval between adjacent clicks of a double/triple click (far below the system 500ms
-/// double-click threshold).
-const MULTI_CLICK_INTERVAL_MS: u64 = 40;
-/// Pause after the drag press and before movement starts, giving the target window time to
-/// enter drag-recognition state.
-const DRAG_PRESS_SETTLE_MS: u64 = 60;
-/// Number of interpolated steps along the drag path (some apps only recognize a drag after
-/// receiving enough motion events).
-const DRAG_STEPS: usize = 8;
-/// Interval between adjacent drag waypoints.
-const DRAG_STEP_DELAY_MS: u64 = 12;
-/// Pause between pressing all keys and releasing them in reverse, improving the hit rate of
-/// modifier chords (alt+Tab etc.).
-const CHORD_HOLD_MS: u64 = 20;
-/// Granularity of the hold_key sleep: a stop/timeout cancel flag is polled at least this
-/// often, so an abandoned hold stops within this window instead of the full hold duration.
-const HOLD_CANCEL_POLL_MS: u64 = 100;
-
-/// `ui_tree` defaults/caps: depth and node count (prevents giant trees from overwhelming the
-/// worker thread and the text budget).
-const DEFAULT_TREE_MAX_DEPTH: u32 = 8;
-const DEFAULT_TREE_MAX_NODES: u32 = 400;
-const MAX_TREE_DEPTH: u32 = 24;
-const MAX_TREE_NODES: u32 = 2000;
-/// Character cap for a single name line.
-const MAX_NODE_NAME_CHARS: usize = 80;
 /// Defensive cap for climbing from the focused element up to its owning window.
 const MAX_ANCESTOR_CLIMB: u32 = 16;
 
@@ -275,10 +250,6 @@ fn check_injection(context: &str, requested: u32, sent: u32) -> Result<(), Compu
     )))
 }
 
-fn map_xcap_err(context: &str, err: xcap::XCapError) -> ComputerUseError {
-    ComputerUseError::failed(format!("{context}: {err}"))
-}
-
 /// BitBlts one monitor's pixels into an RGBA buffer, replicating xcap 0.9.8's
 /// `capture_monitor` with two correctness fixes. xcap 0.9.8 (still the newest
 /// release upstream) discards `SelectObject`'s previous-object return and lets
@@ -411,6 +382,23 @@ fn map_input_err(context: &str, err: enigo::InputError) -> ComputerUseError {
         }
     }
     ComputerUseError::failed(format!("{context}: {err}"))
+}
+
+/// `TreeScope_Element | TreeScope_Children` as the raw UIA flag value. UIA's
+/// `TreeScope` is a bitmask; the `uiautomation` crate models it as a plain
+/// enum, so the combination the per-node descent needs has no variant.
+const TREE_SCOPE_ELEMENT_AND_CHILDREN: i32 = 3;
+
+/// The tree range a cache request covers.
+///
+/// Not `uiautomation::types::TreeScope`, which cannot express
+/// `Element | Children` (see [`TREE_SCOPE_ELEMENT_AND_CHILDREN`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheScope {
+    /// The retrieved element only.
+    Element,
+    /// The retrieved element **and** its direct children.
+    ElementAndChildren,
 }
 
 fn map_uia_err(context: &str, err: uiautomation::Error) -> ComputerUseError {
@@ -552,7 +540,7 @@ fn format_tree_line(
         &element
             .get_cached_name()
             .map_err(|e| map_uia_err("ui_tree name", e))?,
-        MAX_NODE_NAME_CHARS,
+        MAX_NAME_CHARS,
     );
     let rect = element
         .get_cached_bounding_rectangle()
@@ -606,10 +594,21 @@ fn element_info_from_cache(
     let secure = element
         .is_cached_password()
         .map_err(|e| map_uia_err(&format!("{context} password"), e))?;
-    let display_name = sanitize_name(&name, MAX_NODE_NAME_CHARS);
+    let display_name = sanitize_name(&name, MAX_NAME_CHARS);
+    let role = format!("{control_type:?}");
+    // Bound while the raw strings are still in scope (see `raw_binding`).
+    // Disclosed collapse: an element whose cached name is empty binds
+    // hash("", role), so every empty-named element of the same role shares
+    // one binding — and the binding is (name, role), not element identity,
+    // so raw-identical labels in different windows bind alike. The macOS and
+    // Linux producers collapse the same way and the tool description
+    // discloses the class; distinguishing true identity needs a
+    // platform-stable element id and is tracked as a follow-up.
+    let raw_binding = raw_element_binding(&name, &role);
     Ok(ElementInfo {
-        role: format!("{control_type:?}"),
-        screening_name: screening_name(&name, &display_name),
+        role,
+        name_screening_hit: screening_hit(&name),
+        raw_binding,
         name: display_name,
         x: rect.get_left(),
         y: rect.get_top(),
@@ -652,8 +651,24 @@ fn write_tree_node(
     }
     // Fetch failures do not consume budget: destroyed elements must not crowd out slots for
     // visible nodes.
-    let Ok(cached) = element.build_updated_cache(cache) else {
-        return Ok(());
+    //
+    // Access denied is the exception, and this is the leg where it actually
+    // happens: `build_updated_cache` is the cross-process call, so an elevated
+    // target blocked by UIPI fails HERE. (The cached getters below read a
+    // local record; per UIA they report "not in the cache", never
+    // E_ACCESSDENIED.) Swallowing it returned an empty tree and `Ok` — the
+    // caller could not tell "nothing on screen" from "not allowed to look".
+    //
+    // It is only propagated while the tree is still empty. Once any node has
+    // been serialized the denial is a single inaccessible branch inside a
+    // usable tree, which is the same churn the tolerated arm exists for, and
+    // failing the whole call over it would be worse than the partial answer.
+    let cached = match element.build_updated_cache(cache) {
+        Ok(cached) => cached,
+        Err(error) if writer.next_index == 0 && error.code() == E_ACCESSDENIED => {
+            return Err(map_uia_err("ui_tree node fetch", error));
+        }
+        Err(_) => return Ok(()),
     };
     writer.remaining -= 1;
     let index = writer.next_index;
@@ -663,8 +678,19 @@ fn write_tree_node(
     // serialization — the same churn the fetch leg tolerates. Treat it as
     // "this branch ended" too: fall back to a nameless line for this node
     // and keep the tree usable instead of failing the whole call.
+    //
+    // Access denied is NOT churn and is not tolerated: it means the target is
+    // elevated and UIPI is blocking the read, which the caller has to be told
+    // about instead of being handed an anonymous tree. Swallowing every error
+    // class here is what let a cache request that never cached the node's own
+    // properties render an entire tree as `<unreadable element>` without one
+    // error surfacing.
+    // `format_tree_line` has already run its errors through `map_uia_err`, so
+    // the access-denied class arrives as `Unavailable`; every other read
+    // failure is `Failed` and stays tolerated.
     let line = match format_tree_line(index, depth, &cached) {
         Ok(line) => line,
+        Err(error @ ComputerUseError::Unavailable { .. }) => return Err(error),
         Err(_) => format!(
             "{}[{}] <unreadable element>",
             "  ".repeat(depth as usize),
@@ -699,32 +725,6 @@ fn write_tree_node(
         }
     }
     Ok(())
-}
-
-/// Merge the interpolated-move and button-release results of `drag`. The
-/// release always runs, but `Result::and` kept only the first error: when the
-/// release failed too, callers never learned that the mouse button may still
-/// be pressed (the macOS/Linux backends already surface this signal).
-fn combine_drag_errors(
-    move_result: Result<(), ComputerUseError>,
-    release_result: Result<(), ComputerUseError>,
-) -> Result<(), ComputerUseError> {
-    match (move_result, release_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        // Only the path move failed and the release succeeded: report the
-        // move error unchanged.
-        (Err(move_error), Ok(())) => Err(move_error),
-        // Single-failure cases keep the ORIGINAL error kind: a UIPI-blocked
-        // release is `unavailable` — the "run elevated" classification
-        // upstreams rely on must survive the stranded-button annotation.
-        (Ok(()), Err(release)) => {
-            Err(release.same_kind(format!("{release}; the mouse button may still be pressed")))
-        }
-        (Err(move_error), Err(release)) => Err(move_error.same_kind(format!(
-            "drag move failed ({move_error}); its release also failed ({release}); \
-             the mouse button may still be pressed"
-        ))),
-    }
 }
 
 pub(super) struct WindowsComputerUseBackend {
@@ -776,35 +776,14 @@ impl WindowsComputerUseBackend {
         })
     }
 
-    /// Pick the monitor to capture: the screen under the cursor, falling back to the primary
-    /// screen, and finally degrading to the first screen.
-    fn pick_monitor(cursor: Option<(i32, i32)>) -> Result<Monitor, ComputerUseError> {
-        if let Some((x, y)) = cursor {
-            if let Ok(monitor) = Monitor::from_point(x, y) {
-                return Ok(monitor);
-            }
-        }
-        let mut monitors =
-            Monitor::all().map_err(|err| map_xcap_err("cannot enumerate monitors", err))?;
-        if let Some(primary) = monitors
-            .iter()
-            .position(|m| m.is_primary().unwrap_or(false))
-        {
-            return Ok(monitors.swap_remove(primary));
-        }
-        monitors
-            .drain(..)
-            .next()
-            .ok_or_else(|| ComputerUseError::unavailable("no monitor available for screen capture"))
-    }
-
     /// Property cache request: merges many per-node cross-process COM round-trips into a
     /// single batched read. `scope` gives the tree range of the cached fetch (`ui_tree`'s
-    /// per-node descent uses `Children`; single-element reads use `Element`); scopes beyond
-    /// `Element` apply the control-view filter, consistent with the UIA standard view.
+    /// per-node descent needs the element **and** its children; single-element reads need
+    /// the element); scopes beyond `Element` apply the control-view filter, consistent with
+    /// the UIA standard view.
     fn property_cache(
         uia: &UIAutomation,
-        scope: TreeScope,
+        scope: CacheScope,
     ) -> Result<uiautomation::core::UICacheRequest, ComputerUseError> {
         let cache = uia
             .create_cache_request()
@@ -822,10 +801,35 @@ impl WindowsComputerUseBackend {
                 .add_property(property)
                 .map_err(|e| map_uia_err("ui_tree cache request", e))?;
         }
-        cache
-            .set_tree_scope(scope)
-            .map_err(|e| map_uia_err("ui_tree cache scope", e))?;
-        if scope != TreeScope::Element {
+        match scope {
+            CacheScope::Element => cache
+                .set_tree_scope(TreeScope::Element)
+                .map_err(|e| map_uia_err("ui_tree cache scope", e))?,
+            CacheScope::ElementAndChildren => {
+                // UIA caches the retrieved element's own properties only when the scope
+                // includes `TreeScope_Element`: "if you set only TreeScope_Children ... the
+                // properties of children of that element are cached, but not those of the
+                // element itself. To ensure that caching is done for the retrieved element
+                // itself, you must include TreeScope_Element." With `Children` alone every
+                // `get_cached_*` on the node failed, and because `write_tree_node` treats a
+                // formatting failure as element churn the descent emitted a correctly shaped
+                // tree in which every node read `<unreadable element>`.
+                //
+                // The crate's `TreeScope` enum cannot express the combination (no combined
+                // variant, and `Subtree` would restore the unbounded whole-subtree fetch the
+                // per-node descent replaced), so the value is set on the underlying COM
+                // interface.
+                // SAFETY: `cache` owns the interface for the duration of the call and
+                // `SetTreeScope` only stores a scalar on it.
+                unsafe {
+                    cache
+                        .as_ref()
+                        .SetTreeScope(RawTreeScope(TREE_SCOPE_ELEMENT_AND_CHILDREN))
+                }
+                .map_err(|e| ComputerUseError::failed(format!("ui_tree cache scope: {e}")))?;
+            }
+        }
+        if scope != CacheScope::Element {
             let control_view = uia
                 .get_control_view_condition()
                 .map_err(|e| map_uia_err("ui_tree cache filter", e))?;
@@ -870,23 +874,6 @@ impl WindowsComputerUseBackend {
         Ok(current)
     }
 
-    /// Release the pressed keys in reverse; even on a mid-way error, best-effort release
-    /// everything and return the first error.
-    fn release_reverse(pressed: &[enigo::Key], enigo: &mut Enigo) -> Result<(), enigo::InputError> {
-        let mut first_err = None;
-        for key in pressed.iter().rev() {
-            if let Err(err) = enigo.key(*key, Direction::Release) {
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
-            }
-        }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
-    }
-
     /// Press all keys (rolling back those already pressed on error), pause, then release in reverse.
     fn chord(&mut self, keys: &[Key], hold: Duration) -> Result<(), ComputerUseError> {
         let mut pressed: Vec<enigo::Key> = Vec::with_capacity(keys.len());
@@ -905,12 +892,12 @@ impl WindowsComputerUseBackend {
                 Err(err) => {
                     // Chord resolution failed midway: release the pressed modifiers first to
                     // avoid stuck keys.
-                    let _ = Self::release_reverse(&pressed, &mut self.enigo);
+                    let _ = release_reverse(&pressed, &mut self.enigo);
                     return Err(err);
                 }
             };
             if let Err(err) = self.enigo.key(mapped, Direction::Press) {
-                let _ = Self::release_reverse(&pressed, &mut self.enigo);
+                let _ = release_reverse(&pressed, &mut self.enigo);
                 return Err(map_input_err("key press", err));
             }
             pressed.push(mapped);
@@ -926,7 +913,7 @@ impl WindowsComputerUseBackend {
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::SeqCst))
             {
-                let _ = Self::release_reverse(&pressed, &mut self.enigo);
+                let _ = release_reverse(&pressed, &mut self.enigo);
                 return Err(ComputerUseError::unavailable(
                     "hold was cancelled (caller timeout or stop); the keys have been released",
                 ));
@@ -935,8 +922,7 @@ impl WindowsComputerUseBackend {
             sleep(step);
             remaining -= step;
         }
-        Self::release_reverse(&pressed, &mut self.enigo)
-            .map_err(|err| map_input_err("key release", err))
+        release_reverse(&pressed, &mut self.enigo).map_err(|err| map_input_err("key release", err))
     }
 
     /// Multi-monitor-correct absolute movement: calls `SendInput` directly via windows-sys,
@@ -996,7 +982,7 @@ impl ComputerUseBackend for WindowsComputerUseBackend {
 
     fn capture(&mut self) -> Result<Capture, ComputerUseError> {
         let cursor = self.cursor_position().ok();
-        let monitor = Self::pick_monitor(cursor)?;
+        let monitor = pick_monitor(cursor)?;
         let origin_x = monitor
             .x()
             .map_err(|err| map_xcap_err("monitor origin", err))?;
@@ -1208,7 +1194,7 @@ impl ComputerUseBackend for WindowsComputerUseBackend {
         // unbounded by the budget (a desktop-level fallback can be tens of thousands of
         // nodes) and MAX_TREE_NODES only governed serialization. The serialization-layer
         // MAX_TREE_NODES/MAX_TREE_DEPTH semantics stay unchanged.
-        let cache = Self::property_cache(&uia, TreeScope::Children)?;
+        let cache = Self::property_cache(&uia, CacheScope::ElementAndChildren)?;
         let mut out = String::new();
         let mut writer = TreeWriter {
             next_index: 0,
@@ -1246,7 +1232,7 @@ impl ComputerUseBackend for WindowsComputerUseBackend {
 
     fn focused_element(&mut self) -> Result<Option<ElementInfo>, ComputerUseError> {
         let uia = self.uia_client()?;
-        let cache = Self::property_cache(&uia, TreeScope::Element)?;
+        let cache = Self::property_cache(&uia, CacheScope::Element)?;
         let element = uia
             .get_focused_element_build_cache(&cache)
             .map_err(|e| map_uia_err("focused_element", e))?;
@@ -1259,7 +1245,7 @@ impl ComputerUseBackend for WindowsComputerUseBackend {
         y: i32,
     ) -> Result<Option<ElementInfo>, ComputerUseError> {
         let uia = self.uia_client()?;
-        let cache = Self::property_cache(&uia, TreeScope::Element)?;
+        let cache = Self::property_cache(&uia, CacheScope::Element)?;
         let element = uia
             .element_from_point_build_cache(Point::new(x, y), &cache)
             .map_err(|e| map_uia_err("element_at_point", e))?;
@@ -1275,6 +1261,8 @@ pub(super) fn create_backend() -> Result<Box<dyn ComputerUseBackend>, ComputerUs
 mod tests {
     use super::*;
 
+    use xcap::Monitor;
+
     /// Unwrap [`MappedKey::Key`] (test helper).
     fn unwrap_mapped(plan: Result<MappedKey, ComputerUseError>) -> Option<enigo::Key> {
         match plan {
@@ -1282,34 +1270,6 @@ mod tests {
             Ok(MappedKey::UnicodeOnly(c)) => panic!("unexpected UnicodeOnly({c})"),
             Err(_) => None,
         }
-    }
-
-    /// A move-failure sample for [`combine_drag_errors`] (test helper).
-    fn failed_move() -> ComputerUseError {
-        ComputerUseError::failed("move aborted")
-    }
-
-    /// A release-failure sample for [`combine_drag_errors`] (with map_input_err-style context).
-    fn failed_release() -> ComputerUseError {
-        ComputerUseError::failed("drag release: injected 0/1 events")
-    }
-
-    #[test]
-    fn normalize_typed_newlines_maps_cr_and_crlf() {
-        // Borrowed when there is no CR.
-        let plain = "abc";
-        let borrowed = normalize_typed_newlines(plain);
-        assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(borrowed.as_ref(), "abc");
-        // CRLF collapses to one '\n' (not two).
-        assert_eq!(normalize_typed_newlines("a\r\nb").as_ref(), "a\nb");
-        // Lone CR maps too.
-        assert_eq!(normalize_typed_newlines("a\rb").as_ref(), "a\nb");
-        // Mixed forms all normalize.
-        assert_eq!(
-            normalize_typed_newlines("a\r\nb\rc\nd").as_ref(),
-            "a\nb\nc\nd"
-        );
     }
 
     #[test]
@@ -1443,41 +1403,6 @@ mod tests {
         // Only awareness == 2 with a context that really is PMv2 passes.
         assert!(thread_is_pmv2(2, true));
         assert!(!thread_is_pmv2(1, true));
-    }
-
-    #[test]
-    fn drag_error_merging_surfaces_stranded_button() {
-        // Both succeed: nothing to merge.
-        assert!(combine_drag_errors(Ok(()), Ok(())).is_ok());
-        // Only the move failed: the move error passes through unchanged.
-        assert_eq!(
-            combine_drag_errors(Err(failed_move()), Ok(()))
-                .unwrap_err()
-                .to_string(),
-            "failed: move aborted"
-        );
-        // Only the release failed: the stranded-button warning must surface.
-        let only_release = combine_drag_errors(Ok(()), Err(failed_release()))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            only_release.contains("the mouse button may still be pressed"),
-            "{only_release}"
-        );
-        // Both fail: the move failure AND the stranded-button warning must
-        // both be present (`result.and(release)` used to drop the latter).
-        let both = combine_drag_errors(Err(failed_move()), Err(failed_release()))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            both.contains("drag move failed (failed: move aborted)"),
-            "{both}"
-        );
-        assert!(both.contains("its release also failed"), "{both}");
-        assert!(
-            both.contains("the mouse button may still be pressed"),
-            "{both}"
-        );
     }
 
     #[test]

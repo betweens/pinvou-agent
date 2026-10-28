@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 use agent_backend_api::SecretText;
-use fs2::FileExt;
-use hf_hub::api::sync::ApiBuilder;
-use hf_hub::{Cache, Repo, RepoType};
+use fs4::FileExt;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
 use rand::random;
@@ -15,19 +13,29 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use crate::fs_guard::{FileIdentity, is_link_or_reparse, path_identity};
 use crate::{
-    GAIA_DATASET_REVISION, GAIA_PARQUET_SIZE, GAIA_SCORER_REVISION, GaiaDataset, GaiaDatasetError,
+    GAIA_DATASET_REVISION, GAIA_PARQUET_PATH, GAIA_PARQUET_SHA256_BYTES, GAIA_PARQUET_SIZE,
+    GAIA_SCORER_REVISION, GaiaDataset, GaiaDatasetError,
 };
 
 const GAIA_REPO_ID: &str = "gaia-benchmark/GAIA";
-const GAIA_PARQUET_PATH: &str = "2023/validation/metadata.level1.parquet";
 const READY_SCHEMA: &str = "pinvou-gaia-ready/v1";
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 128;
 const MAX_TRANSFER_FILES: usize = MAX_ATTACHMENTS + 1;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ENV_NAME_BYTES: usize = 128;
+const MAX_METADATA_ENTRIES: usize = 4096;
 const MAX_METADATA_BODY_BYTES: u64 = 2 * 1024 * 1024;
+/// reqwest's blocking default is a fresh 30s deadline per read (not a total
+/// request deadline); stated here so an upstream default change cannot silently
+/// alter the hang behavior. Stalled reads fail; slow-but-flowing transfers do
+/// not.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Identifies the client to the Hub and its mirrors (replaces the `ureq/…`
+/// default UA the hf-hub client used to send).
+const HUB_USER_AGENT: &str = concat!("pinvou-adapter-gaia/", env!("CARGO_PKG_VERSION"));
 const MAX_METADATA_PATH_BYTES: usize = 512;
 const MAX_METADATA_PATH_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_INTEGRITY_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -137,7 +145,8 @@ pub struct GaiaAcquisition {
 }
 
 impl GaiaAcquisition {
-    pub fn snapshot_root(&self) -> &Path {
+    #[cfg(test)]
+    fn snapshot_root(&self) -> &Path {
         &self.snapshot_root
     }
 
@@ -145,7 +154,8 @@ impl GaiaAcquisition {
         &self.revision
     }
 
-    pub fn dataset(&self) -> &GaiaDataset {
+    #[cfg(test)]
+    fn dataset(&self) -> &GaiaDataset {
         &self.dataset
     }
 
@@ -212,11 +222,14 @@ pub struct SnapshotDownloadRequest<'a> {
     revision: &'a str,
     remote_path: &'a str,
     token: &'a SecretText,
-    scratch_root: &'a Path,
     expected: &'a SnapshotFileMetadata,
     remaining_budget: u64,
 }
 
+// The fields are private by design, so these getters are the only way code
+// outside this module — including a downstream `SnapshotDownloader`
+// implementation, which must fulfill the preflight/download contract from
+// exactly these inputs — can read the request.
 impl SnapshotDownloadRequest<'_> {
     pub fn repo_id(&self) -> &str {
         self.repo_id
@@ -253,7 +266,6 @@ impl fmt::Debug for SnapshotDownloadRequest<'_> {
             .field("expected_size", &self.expected.size)
             .field("remaining_budget", &self.remaining_budget)
             .field("token", &"[redacted]")
-            .field("scratch_root", &"[redacted]")
             .finish()
     }
 }
@@ -263,9 +275,10 @@ pub struct SnapshotPreflightRequest<'a> {
     revision: &'a str,
     remote_paths: &'a [PathBuf],
     token: &'a SecretText,
-    scratch_root: &'a Path,
 }
 
+// Same contract as [`SnapshotDownloadRequest`]: a downstream downloader can
+// only learn what to preflight through these public getters.
 impl SnapshotPreflightRequest<'_> {
     pub fn repo_id(&self) -> &str {
         self.repo_id
@@ -292,7 +305,6 @@ impl fmt::Debug for SnapshotPreflightRequest<'_> {
             .field("revision", &self.revision)
             .field("remote_path_count", &self.remote_paths.len())
             .field("token", &"[redacted]")
-            .field("scratch_root", &"[redacted]")
             .finish()
     }
 }
@@ -393,12 +405,7 @@ impl SnapshotDownloader for HfSnapshotDownloader {
         if request.repo_id != GAIA_REPO_ID || request.revision != GAIA_DATASET_REVISION {
             return Err(SnapshotFetchFailure);
         }
-        let repo = hf_repo(
-            request.token,
-            request.scratch_root,
-            request.repo_id,
-            request.revision,
-        )?;
+        let handle = hf_repo(request.repo_id, request.revision)?;
         let requested = request
             .remote_paths
             .iter()
@@ -407,12 +414,10 @@ impl SnapshotDownloader for HfSnapshotDownloader {
         if requested.len() != request.remote_paths.len() {
             return Err(SnapshotFetchFailure);
         }
-        let response = repo
-            .info_request()
-            .query("blobs", "true")
-            .call()
+        let paths: Vec<String> = requested.iter().cloned().collect();
+        let entries = fetch_paths_info_bounded(&handle.endpoint, request.token, &paths)
             .map_err(|_| SnapshotFetchFailure)?;
-        Ok(parse_hf_metadata(response.into_reader(), &requested)?.siblings)
+        Ok(parse_hf_metadata(entries, &requested)?.siblings)
     }
 
     fn download(
@@ -423,36 +428,52 @@ impl SnapshotDownloader for HfSnapshotDownloader {
         if request.repo_id != GAIA_REPO_ID || request.revision != GAIA_DATASET_REVISION {
             return Err(SnapshotFetchFailure);
         }
-        let repo = hf_repo(
-            request.token,
-            request.scratch_root,
-            request.repo_id,
-            request.revision,
-        )?;
+        let handle = hf_repo(request.repo_id, request.revision)?;
         if request.expected.remote_path() != Path::new(request.remote_path)
             || request.expected.size() > request.remaining_budget
         {
             return Err(SnapshotFetchFailure);
         }
-        let url = repo.url(request.remote_path);
-        let response = ureq::AgentBuilder::new()
-            .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
+        let url = format!(
+            "{}/datasets/{GAIA_REPO_ID}/resolve/{GAIA_DATASET_REVISION}/{}",
+            handle.endpoint.trim_end_matches('/'),
+            percent_encode_remote_path(request.remote_path)
+        );
+        // reqwest's default redirect policy strips the Authorization header on
+        // cross-host redirects, so the bearer token only ever reaches the
+        // endpoint (and its same-host redirects). The timeout is reqwest
+        // blocking's own default (a fresh 30s deadline per read, not a total
+        // request deadline) stated explicitly so an upstream default change
+        // cannot silently alter the hang behavior.
+        let response = reqwest::blocking::Client::builder()
+            .timeout(READ_TIMEOUT)
+            .user_agent(HUB_USER_AGENT)
             .build()
+            .map_err(|_| SnapshotFetchFailure)?
             .get(&url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", request.token.expose_to_backend()),
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", request.token.expose_to_backend()),
             )
-            .call()
+            .send()
+            .map_err(|_| SnapshotFetchFailure)?
+            .error_for_status()
             .map_err(|_| SnapshotFetchFailure)?;
         let content_length = response
-            .header("Content-Length")
-            .map(|value| value.parse::<u64>().map_err(|_| SnapshotFetchFailure))
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .ok_or(SnapshotFetchFailure)
+            })
             .transpose()?;
         let parent = destination.parent().ok_or(SnapshotFetchFailure)?;
         create_private_parent_directories(parent)?;
         stream_verified_file(
-            response.into_reader(),
+            response,
             content_length,
             destination,
             request.expected,
@@ -462,59 +483,132 @@ impl SnapshotDownloader for HfSnapshotDownloader {
     }
 }
 
+// The resolve URL interpolates a remote-supplied path, so every byte outside
+// RFC 3986's unreserved set (plus the `/` path separator) is percent-encoded.
+// The values are anchored to the compiled-in parquet digest before any request
+// is issued, but encoding here keeps a future spec drift (`?`, `#`, `%`,
+// whitespace) from restructuring the URL rather than failing the download.
+fn percent_encode_remote_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+                encoded.push(HEX_DIGITS[(byte & 0xF) as usize] as char);
+            }
+        }
+    }
+    encoded
+}
+
 struct HfRepoMetadata {
     siblings: Vec<SnapshotFileMetadata>,
 }
 
-#[derive(Deserialize)]
-struct RawHfRepoMetadata {
-    sha: String,
-    siblings: Vec<RawHfSiblingMetadata>,
+// Both Hub round-trips this crate makes (the bounded paths-info preflight and
+// the streamed resolve download) are issued directly through reqwest, so the
+// handle only carries the resolved endpoint. The endpoint comes from
+// HF_ENDPOINT when set (networks in mainland China can point it at the
+// https://hf-mirror.com mirror). Note: HF_ENDPOINT receives the bearer token
+// too, so it must only point to a trusted endpoint (see docs/gaia-benchmark.md).
+struct HfRepoHandle {
+    endpoint: String,
 }
 
-#[derive(Deserialize)]
-struct RawHfSiblingMetadata {
-    rfilename: String,
-    size: Option<u64>,
-    lfs: Option<RawHfLfsMetadata>,
-    #[serde(rename = "blobId", alias = "blob_id")]
-    blob_id: Option<String>,
+fn hf_repo(repo_id: &str, revision: &str) -> Result<HfRepoHandle, ()> {
+    if repo_id != GAIA_REPO_ID || revision != GAIA_DATASET_REVISION {
+        return Err(());
+    }
+    let endpoint = std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".to_owned());
+    Ok(HfRepoHandle {
+        endpoint: endpoint.trim_end_matches('/').to_owned(),
+    })
 }
 
-#[derive(Deserialize)]
-struct RawHfLfsMetadata {
+// The paths-info endpoint pins the revision in the URL, so the entries are
+// already scoped to GAIA_DATASET_REVISION; validation here only needs to enforce
+// the shape of each entry (path hygiene, size/digest presence, exact coverage of
+// the requested set). Unlike the old repo-info round-trip (whose response echoed
+// the revision and was checked against GAIA_DATASET_REVISION), paths-info
+// responses carry no revision echo, so revision binding rests on the URL segment
+// alone — a hostile HF_ENDPOINT mirror could serve metadata for another
+// revision. That mirror is already trusted with the bearer token (see
+// HfRepoHandle), and content integrity does not depend on the metadata: the
+// scored parquet is pinned by the compiled-in size/sha256 checks and every
+// downloaded file is digest-verified before it is published out of staging.
+//
+// The request is issued with a hard byte cap in front of the JSON parser instead
+// of hf-hub's `get_paths_info` (which reads the body unbounded): the entry-shape
+// caps below only see post-parse values, so a hostile HF_ENDPOINT mirror must not
+// be able to force an unbounded allocation before rejection. The wire shape —
+// POST {"paths":[...]} to /api/datasets/{repo}/paths-info/{revision}, response a
+// bare array of type-tagged entries — mirrors hf-hub's own request. The `lfs`
+// object on the wire carries the content digest in `oid` (plus `size` and
+// `pointerSize`); hf-hub 1.0's `BlobLfsInfo` instead declares a `sha256` field,
+// which the endpoint never sends — the digest is therefore read from `oid` with
+// `sha256` accepted only as a redundant mirror-side cross-check.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum RawPathsInfoEntry {
+    File {
+        oid: String,
+        size: u64,
+        path: String,
+        #[serde(default)]
+        lfs: Option<RawPathsInfoLfs>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPathsInfoLfs {
     oid: Option<String>,
     sha256: Option<String>,
     size: Option<u64>,
 }
 
-fn hf_repo(
+fn fetch_paths_info_bounded(
+    endpoint: &str,
     token: &SecretText,
-    scratch_root: &Path,
-    repo_id: &str,
-    revision: &str,
-) -> Result<hf_hub::api::sync::ApiRepo, ()> {
-    if repo_id != GAIA_REPO_ID || revision != GAIA_DATASET_REVISION {
-        return Err(());
-    }
-    let cache_dir = scratch_root.join(".hf-cache").join("hub");
-    fs::create_dir_all(&cache_dir).map_err(|_| ())?;
-    let api = ApiBuilder::from_cache(Cache::new(cache_dir))
-        .with_progress(false)
-        .with_token(Some(token.expose_to_backend().to_owned()))
+    paths: &[String],
+) -> Result<Vec<RawPathsInfoEntry>, ()> {
+    let url = format!(
+        "{}/api/datasets/{}/paths-info/{}",
+        endpoint.trim_end_matches('/'),
+        GAIA_REPO_ID,
+        GAIA_DATASET_REVISION,
+    );
+    // Same redirect posture as the download path: reqwest's default policy
+    // strips the Authorization header on cross-host redirects, so the bearer
+    // token only ever reaches the endpoint (and its same-host redirects).
+    let response = reqwest::blocking::Client::builder()
+        .timeout(READ_TIMEOUT)
+        .user_agent(HUB_USER_AGENT)
         .build()
+        .map_err(|_| ())?
+        .post(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", token.expose_to_backend()),
+        )
+        .json(&serde_json::json!({ "paths": paths }))
+        .send()
+        .map_err(|_| ())?
+        .error_for_status()
         .map_err(|_| ())?;
-    Ok(api.repo(Repo::with_revision(
-        GAIA_REPO_ID.to_owned(),
-        RepoType::Dataset,
-        GAIA_DATASET_REVISION.to_owned(),
-    )))
+    parse_paths_info_body(response)
 }
 
-fn parse_hf_metadata(
-    mut reader: impl Read,
-    requested: &HashSet<String>,
-) -> Result<HfRepoMetadata, ()> {
+fn parse_paths_info_body(mut reader: impl Read) -> Result<Vec<RawPathsInfoEntry>, ()> {
     let mut body = Vec::new();
     reader
         .by_ref()
@@ -524,57 +618,69 @@ fn parse_hf_metadata(
     if body.len() as u64 > MAX_METADATA_BODY_BYTES {
         return Err(());
     }
-    let raw: RawHfRepoMetadata = serde_json::from_slice(&body).map_err(|_| ())?;
-    if raw.sha != GAIA_DATASET_REVISION
-        || raw.sha.len() != 40
-        || !raw.sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || raw.siblings.len() > 4096
-    {
+    serde_json::from_slice(&body).map_err(|_| ())
+}
+
+fn parse_hf_metadata(
+    entries: Vec<RawPathsInfoEntry>,
+    requested: &HashSet<String>,
+) -> Result<HfRepoMetadata, ()> {
+    if entries.len() > MAX_METADATA_ENTRIES {
         return Err(());
     }
     let mut total_path_bytes = 0_usize;
-    let mut siblings = Vec::with_capacity(raw.siblings.len());
+    let mut siblings = Vec::with_capacity(entries.len());
     let mut matched = HashSet::new();
-    for sibling in raw.siblings {
-        if sibling.rfilename.is_empty()
-            || sibling.rfilename.len() > MAX_METADATA_PATH_BYTES
-            || !sibling.rfilename.is_ascii()
-        {
+    for entry in entries {
+        let RawPathsInfoEntry::File {
+            oid,
+            size,
+            path,
+            lfs,
+        } = entry
+        else {
+            return Err(());
+        };
+        if path.is_empty() || path.len() > MAX_METADATA_PATH_BYTES || !path.is_ascii() {
             return Err(());
         }
-        let relative = PathBuf::from(&sibling.rfilename);
+        let relative = PathBuf::from(&path);
         validate_relative(&relative)?;
-        total_path_bytes = total_path_bytes
-            .checked_add(sibling.rfilename.len())
-            .ok_or(())?;
+        total_path_bytes = total_path_bytes.checked_add(path.len()).ok_or(())?;
         if total_path_bytes > MAX_METADATA_PATH_TOTAL_BYTES {
             return Err(());
         }
-        if !requested.contains(&sibling.rfilename) {
+        if !requested.contains(&path) {
             continue;
         }
-        if !matched.insert(sibling.rfilename.clone()) {
+        if !matched.insert(path.clone()) {
             return Err(());
         }
-        let size = sibling.size.ok_or(())?;
-        let metadata = if let Some(lfs) = sibling.lfs {
+        let metadata = if let Some(lfs) = lfs {
             if lfs.size != Some(size) {
                 return Err(());
             }
+            // The wire puts the LFS content sha256 in `lfs.oid` (optionally with
+            // a "sha256:" prefix on mirrors that copy the pointer-file shape);
+            // `sha256` is only sent by non-conforming mirrors and must agree.
             let oid = lfs
                 .oid
                 .as_deref()
-                .map(|value| value.strip_prefix("sha256:").unwrap_or(value).to_owned());
-            let digest_text = match (oid, lfs.sha256) {
+                .map(|value| value.strip_prefix("sha256:").unwrap_or(value));
+            let sha256 = lfs
+                .sha256
+                .as_deref()
+                .map(|value| value.strip_prefix("sha256:").unwrap_or(value));
+            let digest_text = match (oid, sha256) {
                 (Some(oid), Some(sha256)) if oid == sha256 => oid,
                 (Some(oid), None) => oid,
                 (None, Some(sha256)) => sha256,
                 _ => return Err(()),
             };
-            let digest = parse_sha256(&digest_text)?;
+            let digest = parse_sha256(digest_text)?;
             SnapshotFileMetadata::new(relative, size, digest)
         } else {
-            let digest = parse_git_sha1(sibling.blob_id.as_deref().ok_or(())?)?;
+            let digest = parse_git_sha1(&oid)?;
             SnapshotFileMetadata::new_git_blob(relative, size, digest)
         };
         siblings.push(metadata);
@@ -654,7 +760,7 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
     }
 
     pub fn acquire(&self, source: GaiaSource) -> Result<GaiaAcquisition, GaiaFetchError> {
-        self.acquire_expected(source, GAIA_PARQUET_SIZE, production_digest())
+        self.acquire_expected(source, GAIA_PARQUET_SIZE, GAIA_PARQUET_SHA256_BYTES)
     }
 
     pub fn verify_offline(
@@ -664,7 +770,7 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
         self.verify_ready(
             snapshot_root.as_ref(),
             GAIA_PARQUET_SIZE,
-            production_digest(),
+            GAIA_PARQUET_SHA256_BYTES,
         )
     }
 
@@ -675,7 +781,7 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
         self.verify_source_expected(
             snapshot_root.as_ref(),
             GAIA_PARQUET_SIZE,
-            production_digest(),
+            GAIA_PARQUET_SHA256_BYTES,
             &OFFICIAL_LEVEL1_ATTACHMENTS,
         )
     }
@@ -780,7 +886,7 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
         let dataset = verify_dataset(&canonical_source, expected_size, expected_digest)
             .map_err(classify_import_verification)?;
         let trusted: &[TrustedAttachmentSpec] =
-            if expected_size == GAIA_PARQUET_SIZE && expected_digest == production_digest() {
+            if expected_size == GAIA_PARQUET_SIZE && expected_digest == GAIA_PARQUET_SHA256_BYTES {
                 &OFFICIAL_LEVEL1_ATTACHMENTS
             } else {
                 #[cfg(any(test, feature = "test-support"))]
@@ -835,7 +941,7 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
         )
         .map_err(|_| GaiaFetchError::DownloadFailed)?;
         let parquet_paths = vec![PathBuf::from(GAIA_PARQUET_PATH)];
-        let parquet_metadata = self.preflight(token, staging, &parquet_paths)?;
+        let parquet_metadata = self.preflight(token, &parquet_paths)?;
         if parquet_metadata.len() != 1
             || parquet_metadata[0].size() != expected_size
             || parquet_metadata[0].expected_sha256() != Some(&expected_digest)
@@ -864,7 +970,7 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
         if attachments.len() > MAX_ATTACHMENTS {
             return Err(GaiaFetchError::VerifyFailed);
         }
-        let attachment_metadata = self.preflight(token, staging, &attachments)?;
+        let attachment_metadata = self.preflight(token, &attachments)?;
         let mut sizes = vec![parquet_metadata[0].size()];
         sizes.extend(attachment_metadata.iter().map(SnapshotFileMetadata::size));
         validate_remote_budget(&sizes).map_err(|_| GaiaFetchError::DownloadFailed)?;
@@ -875,10 +981,6 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
                 .ok_or(GaiaFetchError::DownloadFailed)?;
             self.download_one(token, staging, &relative, metadata, &mut actual_bytes)?;
         }
-        let cache = staging.join(".hf-cache");
-        if cache.exists() {
-            fs::remove_dir_all(cache).map_err(|_| GaiaFetchError::DownloadFailed)?;
-        }
         validate_snapshot_budget(staging).map_err(|_| GaiaFetchError::DownloadFailed)?;
         Ok(())
     }
@@ -886,7 +988,6 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
     fn preflight(
         &self,
         token: &SecretText,
-        staging: &Path,
         remote_paths: &[PathBuf],
     ) -> Result<Vec<SnapshotFileMetadata>, GaiaFetchError> {
         if remote_paths.is_empty() {
@@ -897,7 +998,6 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
             revision: GAIA_DATASET_REVISION,
             remote_paths,
             token,
-            scratch_root: staging,
         };
         let metadata = self
             .downloader
@@ -924,7 +1024,6 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
             revision: GAIA_DATASET_REVISION,
             remote_path: remote,
             token,
-            scratch_root: staging,
             expected,
             remaining_budget: MAX_TOTAL_BYTES
                 .checked_sub(*actual_total)
@@ -997,14 +1096,6 @@ impl<D: SnapshotDownloader> GaiaSnapshotManager<D> {
             &GAIA_DATASET_REVISION[..12]
         ))
     }
-}
-
-fn production_digest() -> [u8; 32] {
-    [
-        0x5e, 0x57, 0x4b, 0x0f, 0xae, 0xb4, 0x60, 0x3b, 0x81, 0x6e, 0x42, 0x6c, 0xf7, 0xc7, 0xae,
-        0xfb, 0x1f, 0xe3, 0x98, 0xd3, 0x2f, 0x9c, 0x48, 0x61, 0xe1, 0xa4, 0xe3, 0x30, 0x4f, 0x2b,
-        0x12, 0x81,
-    ]
 }
 
 fn verify_dataset(
@@ -1180,7 +1271,7 @@ fn verify_parquet_digest(
     }
     let mut file = File::open(path).map_err(|_| ())?;
     let mut hasher = Sha256::new();
-    let copied = std::io::copy(&mut file, &mut hasher).map_err(|_| ())?;
+    let copied = std::io::copy(&mut file, &mut Sha256Writer(&mut hasher)).map_err(|_| ())?;
     if copied != expected_size || <[u8; 32]>::from(hasher.finalize()) != expected_digest {
         return Err(());
     }
@@ -1284,7 +1375,6 @@ struct DigestingWriter<'a> {
     sha256: &'a mut Sha256,
     git_sha1: &'a mut Sha1,
 }
-
 impl<'a> DigestingWriter<'a> {
     fn new(sha256: &'a mut Sha256, git_sha1: &'a mut Sha1) -> Self {
         Self { sha256, git_sha1 }
@@ -1295,6 +1385,22 @@ impl Write for DigestingWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.sha256.update(buffer);
         self.git_sha1.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// digest 0.11 (sha2/sha1 0.11) no longer implements `std::io::Write` for
+// hashers (moved to the separate `digest-io` crate), so streaming copies hash
+// through this adapter instead.
+pub(crate) struct Sha256Writer<'a>(pub(crate) &'a mut Sha256);
+
+impl Write for Sha256Writer<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buffer);
         Ok(buffer.len())
     }
 
@@ -1433,7 +1539,7 @@ fn verify_attachment_integrity(
         let mut hasher = Sha256::new();
         let copied = std::io::copy(
             &mut std::io::Read::by_ref(&mut file).take(MAX_FILE_BYTES + 1),
-            &mut hasher,
+            &mut Sha256Writer(&mut hasher),
         )
         .map_err(|_| ())?;
         if copied != attachment.size()
@@ -1919,104 +2025,6 @@ fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
-#[cfg(unix)]
-pub(crate) fn is_link_or_reparse(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-pub(crate) fn is_link_or_reparse(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn is_link_or_reparse(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ObjectIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ObjectIdentity {
-    volume: u32,
-    index: u64,
-}
-
-#[cfg(not(any(unix, windows)))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ObjectIdentity;
-
-#[cfg(unix)]
-fn path_identity(path: &Path) -> Result<ObjectIdentity, ()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    Ok(ObjectIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn path_identity(path: &Path) -> Result<ObjectIdentity, ()> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
-    };
-
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(());
-    }
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    let succeeded = unsafe { GetFileInformationByHandle(handle, information.as_mut_ptr()) };
-    unsafe { CloseHandle(handle) };
-    if succeeded == 0 {
-        return Err(());
-    }
-    let information = unsafe { information.assume_init() };
-    let identity = ObjectIdentity {
-        volume: information.dwVolumeSerialNumber,
-        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
-    };
-    if identity.index == 0 {
-        return Err(());
-    }
-    Ok(identity)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn path_identity(_path: &Path) -> Result<ObjectIdentity, ()> {
-    Ok(ObjectIdentity)
-}
-
 struct AcquisitionLock {
     file: File,
 }
@@ -2025,9 +2033,9 @@ impl AcquisitionLock {
     fn claim(root: &Path) -> Result<Self, GaiaFetchError> {
         let path = root.join(".pinvou-gaia-acquire.lock");
         let file = open_private_lock_file(&path).map_err(|_| GaiaFetchError::VerifyFailed)?;
-        match FileExt::try_lock_exclusive(&file) {
+        match FileExt::try_lock(&file) {
             Ok(()) => {}
-            Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            Err(fs4::TryLockError::WouldBlock) => {
                 return Err(GaiaFetchError::Busy);
             }
             Err(_) => return Err(GaiaFetchError::VerifyFailed),
@@ -2065,9 +2073,9 @@ fn open_private_lock_file(path: &Path) -> Result<File, ()> {
 
 struct OwnedDirectory {
     parent: PathBuf,
-    parent_identity: ObjectIdentity,
+    parent_identity: FileIdentity,
     path: PathBuf,
-    identity: ObjectIdentity,
+    identity: FileIdentity,
     armed: std::cell::Cell<bool>,
 }
 
@@ -2197,9 +2205,31 @@ mod review_contract_tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
-    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema};
-    use parquet::arrow::ArrowWriter;
+    use crate::test_fixtures::{FixtureRow, FixtureSchema, snapshot_batch, write_parquet};
+
+    #[test]
+    fn percent_encode_remote_path_keeps_unreserved_and_slashes() {
+        assert_eq!(
+            percent_encode_remote_path(GAIA_PARQUET_PATH),
+            GAIA_PARQUET_PATH
+        );
+        assert_eq!(
+            percent_encode_remote_path("data/level-1_v2/file.name~"),
+            "data/level-1_v2/file.name~"
+        );
+    }
+
+    #[test]
+    fn percent_encode_remote_path_encodes_url_structural_bytes() {
+        assert_eq!(
+            percent_encode_remote_path("a b?c#d%e&f=g"),
+            "a%20b%3Fc%23d%25e%26f%3Dg"
+        );
+        assert_eq!(
+            percent_encode_remote_path("数据.json"),
+            "%E6%95%B0%E6%8D%AE.json"
+        );
+    }
 
     struct DenyDownloader;
 
@@ -2248,68 +2278,25 @@ mod review_contract_tests {
             GAIA_DATASET_REVISION,
         )
         .unwrap();
-        let metadata_names = [
-            "Steps",
-            "Number of steps",
-            "How long did this take?",
-            "Tools",
-            "Number of tools",
-        ];
-        let metadata: ArrayRef = Arc::new(StructArray::new(
-            Fields::from(
-                metadata_names
-                    .iter()
-                    .map(|name| ArrowField::new(*name, DataType::Utf8, true))
-                    .collect::<Vec<_>>(),
-            ),
-            metadata_names
-                .iter()
-                .map(|_| Arc::new(StringArray::from(vec![Some("synthetic")])) as ArrayRef)
-                .collect(),
-            None,
-        ));
-        let columns: Vec<(&str, ArrayRef)> = vec![
-            ("task_id", Arc::new(StringArray::from(vec!["safe-task-1"]))),
-            (
-                "Question",
-                Arc::new(StringArray::from(vec!["PRIVATE_QUESTION_SENTINEL"])),
-            ),
-            ("Level", Arc::new(Int64Array::from(vec![1]))),
-            (
-                "Final answer",
-                Arc::new(StringArray::from(vec!["PRIVATE_REFERENCE_SENTINEL"])),
-            ),
-            (
-                "file_name",
-                Arc::new(StringArray::from(vec![
-                    with_attachment.then_some("input.bin"),
-                ])),
-            ),
-            (
-                "file_path",
-                Arc::new(StringArray::from(vec![
-                    with_attachment.then_some("2023/validation/input.bin"),
-                ])),
-            ),
-            ("Annotator Metadata", metadata),
-        ];
-        let schema = Arc::new(Schema::new(
-            columns
-                .iter()
-                .map(|(name, array)| ArrowField::new(*name, array.data_type().clone(), true))
-                .collect::<Vec<_>>(),
-        ));
-        let batch = RecordBatch::try_new(
-            schema,
-            columns.into_iter().map(|(_, array)| array).collect(),
-        )
-        .unwrap();
-        let path = root.join(GAIA_PARQUET_PATH);
-        let file = File::create(&path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        let bytes = fs::read(path).unwrap();
+        let rows = [FixtureRow {
+            task_id: "safe-task-1",
+            question: "PRIVATE_QUESTION_SENTINEL",
+            level: 1,
+            reference: "PRIVATE_REFERENCE_SENTINEL",
+            file_name: with_attachment.then_some("input.bin"),
+            file_path: with_attachment.then_some("2023/validation/input.bin"),
+        }];
+        // The attachment uses the fetch layer's own name and bytes, so only
+        // the shared batch and parquet writer are reused here.
+        let batch = snapshot_batch(
+            &rows,
+            &FixtureSchema {
+                attachment_bytes: None,
+                ..FixtureSchema::default()
+            },
+        );
+        write_parquet(&root.join(GAIA_PARQUET_PATH), &batch, None);
+        let bytes = fs::read(root.join(GAIA_PARQUET_PATH)).unwrap();
         (bytes.len() as u64, Sha256::digest(bytes).into())
     }
 
@@ -2386,41 +2373,228 @@ mod review_contract_tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn tree_file(
+        path: &str,
+        oid: &str,
+        size: u64,
+        lfs: Option<RawPathsInfoLfs>,
+    ) -> RawPathsInfoEntry {
+        RawPathsInfoEntry::File {
+            oid: oid.to_owned(),
+            size,
+            path: path.to_owned(),
+            lfs,
+        }
+    }
+
     #[test]
-    fn fetch_metadata_body_is_bounded_and_requires_content_digest() {
-        let valid_digest = "11".repeat(32);
-        let body = format!(
-            r#"{{"sha":"{GAIA_DATASET_REVISION}","siblings":[{{"rfilename":"README.md","size":3}},{{"rfilename":"safe/file","size":7,"lfs":{{"oid":"sha256:{valid_digest}","size":7}}}}]}}"#
+    fn paths_info_body_read_is_bounded_and_parses_wire_entries() {
+        // The take() wrapper bounds how far the reader is pulled ahead of the
+        // parser, and the length check rejects anything over the cap.
+        assert!(
+            parse_paths_info_body(std::io::repeat(b'x').take(MAX_METADATA_BODY_BYTES + 1)).is_err()
         );
+        // The same must hold for a body the parser would happily accept. This
+        // oversized-but-valid array alone would still be caught by truncation
+        // (take() cuts it mid-entry), so the decisive arm is the one below.
+        let entry = format!(
+            r#"{{"type":"file","oid":"{}","size":1,"path":"f"}},"#,
+            "3".repeat(20),
+        );
+        let repetitions = (MAX_METADATA_BODY_BYTES as usize / entry.len()) + 1;
+        let mut oversized_json = String::with_capacity(repetitions * entry.len() + 2);
+        oversized_json.push('[');
+        for _ in 0..repetitions {
+            oversized_json.push_str(&entry);
+        }
+        oversized_json.pop();
+        oversized_json.push(']');
+        assert!(parse_paths_info_body(oversized_json.as_bytes()).is_err());
+        // A body of exactly cap+1 bytes that is valid JSON as a whole: take()
+        // does not truncate it, so if the length check were deleted the parser
+        // would accept it and the download would proceed on oversized
+        // metadata. This arm pins the check itself, not the truncation.
+        let single = r#"{"type":"file","oid":"3","size":1,"path":"f"}"#;
+        let framed_len = single.len() + 2; // '[' + entry + ']'
+        let padding = (MAX_METADATA_BODY_BYTES + 1) as usize - framed_len;
+        let mut exact = String::with_capacity((MAX_METADATA_BODY_BYTES + 1) as usize);
+        exact.push('[');
+        for _ in 0..padding {
+            exact.push(' ');
+        }
+        exact.push_str(single);
+        exact.push(']');
+        assert_eq!(exact.len() as u64, MAX_METADATA_BODY_BYTES + 1);
+        assert!(parse_paths_info_body(exact.as_bytes()).is_err());
+        // A valid under-cap wire body parses into typed entries, and entries
+        // whose tag is not "file" fall into the catch-all arm instead of
+        // failing deserialization (parse_hf_metadata rejects them).
+        let valid = format!(
+            r#"[{{"type":"file","oid":"{}","size":3,"path":"safe/file"}},
+                {{"type":"directory","oid":"{}","path":"safe"}}]"#,
+            "33".repeat(20),
+            "44".repeat(20),
+        );
+        let parsed = parse_paths_info_body(valid.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed[0], RawPathsInfoEntry::File { .. }));
+        assert!(matches!(parsed[1], RawPathsInfoEntry::Other));
+    }
+
+    #[test]
+    fn paths_info_parses_real_hub_wire_lfs_entries() {
+        // Byte-for-byte shape of a live response from
+        // POST /api/datasets/{repo}/paths-info/{rev} (observed 2026-10-15 on a
+        // public LFS dataset): the content digest lives in `lfs.oid`, the lfs
+        // object also carries `pointerSize`, and the entry carries `xetHash` —
+        // unknown keys are ignored. hf-hub 1.0's own `BlobLfsInfo` declares a
+        // `sha256` field the endpoint never sends, so requiring it breaks every
+        // LFS entry; this test deserializes the real shape end-to-end.
+        let digest = "11".repeat(32);
+        let body = format!(
+            r#"[{{"type":"file","oid":"{}","size":419088,"lfs":{{"oid":"{digest}","size":419088,"pointerSize":131}},"xetHash":"{}","path":"safe/file"}}]"#,
+            "33".repeat(20),
+            "44".repeat(32),
+        );
+        let entries = parse_paths_info_body(body.as_bytes()).unwrap();
         let requested = HashSet::from(["safe/file".to_owned()]);
-        let parsed = parse_hf_metadata(body.as_bytes(), &requested).unwrap();
+        let parsed = parse_hf_metadata(entries, &requested).unwrap();
+        assert_eq!(parsed.siblings.len(), 1);
+        assert_eq!(parsed.siblings[0].expected_sha256(), Some(&[0x11; 32]));
+    }
+
+    #[test]
+    fn fetch_metadata_requires_consistent_lfs_size_and_content_digest() {
+        let valid_digest = "11".repeat(32);
+        let requested = HashSet::from(["safe/file".to_owned()]);
+        let lfs_with = |oid: Option<&str>, sha256: Option<&str>, size: u64| {
+            Some(RawPathsInfoLfs {
+                oid: oid.map(str::to_owned),
+                sha256: sha256.map(str::to_owned),
+                size: Some(size),
+            })
+        };
+        // The wire puts the bare hex digest in lfs.oid.
+        let parsed = parse_hf_metadata(
+            vec![
+                tree_file("README.md", &"22".repeat(20), 3, None),
+                tree_file(
+                    "safe/file",
+                    &"33".repeat(20),
+                    7,
+                    lfs_with(Some(valid_digest.as_str()), None, 7),
+                ),
+            ],
+            &requested,
+        )
+        .unwrap();
         assert_eq!(parsed.siblings.len(), 1);
         assert_eq!(parsed.siblings[0].expected_sha256(), Some(&[0x11; 32]));
 
-        let no_lfs_or_blob_id = format!(
-            r#"{{"sha":"{GAIA_DATASET_REVISION}","siblings":[{{"rfilename":"safe/file","size":7}}]}}"#
-        );
-        assert!(parse_hf_metadata(no_lfs_or_blob_id.as_bytes(), &requested).is_err());
-        let size_mismatch = format!(
-            r#"{{"sha":"{GAIA_DATASET_REVISION}","siblings":[{{"rfilename":"safe/file","size":7,"lfs":{{"oid":"sha256:{valid_digest}","size":8}}}}]}}"#
-        );
-        assert!(parse_hf_metadata(size_mismatch.as_bytes(), &requested).is_err());
+        // A non-LFS entry must carry a parseable git blob id.
         assert!(
             parse_hf_metadata(
-                std::io::repeat(b'x').take(MAX_METADATA_BODY_BYTES + 1),
-                &requested,
+                vec![tree_file("safe/file", "not-a-blob-id", 7, None)],
+                &requested
             )
             .is_err()
         );
+        // LFS metadata must agree with the entry size and carry a digest.
+        assert!(
+            parse_hf_metadata(
+                vec![tree_file(
+                    "safe/file",
+                    &"33".repeat(20),
+                    7,
+                    lfs_with(Some(valid_digest.as_str()), None, 8)
+                )],
+                &requested
+            )
+            .is_err()
+        );
+        let missing_digest = lfs_with(None, None, 7);
+        assert!(
+            parse_hf_metadata(
+                vec![tree_file("safe/file", &"33".repeat(20), 7, missing_digest)],
+                &requested
+            )
+            .is_err()
+        );
+        // A "sha256:"-prefixed oid (pointer-file shape some mirrors send) is
+        // accepted, a redundant sha256 that agrees is accepted, one that
+        // disagrees is rejected, and sha256 alone still works as a fallback.
+        let prefixed = format!("sha256:{valid_digest}");
+        let prefixed_parsed = parse_hf_metadata(
+            vec![tree_file(
+                "safe/file",
+                &"33".repeat(20),
+                7,
+                lfs_with(Some(prefixed.as_str()), None, 7),
+            )],
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(
+            prefixed_parsed.siblings[0].expected_sha256(),
+            Some(&[0x11; 32])
+        );
+        parse_hf_metadata(
+            vec![tree_file(
+                "safe/file",
+                &"33".repeat(20),
+                7,
+                lfs_with(Some(valid_digest.as_str()), Some(valid_digest.as_str()), 7),
+            )],
+            &requested,
+        )
+        .unwrap();
+        assert!(
+            parse_hf_metadata(
+                vec![tree_file(
+                    "safe/file",
+                    &"33".repeat(20),
+                    7,
+                    lfs_with(
+                        Some(valid_digest.as_str()),
+                        Some("99".repeat(32).as_str()),
+                        7
+                    )
+                )],
+                &requested
+            )
+            .is_err()
+        );
+        let sha_only = parse_hf_metadata(
+            vec![tree_file(
+                "safe/file",
+                &"33".repeat(20),
+                7,
+                lfs_with(None, Some(valid_digest.as_str()), 7),
+            )],
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(sha_only.siblings[0].expected_sha256(), Some(&[0x11; 32]));
+        // The entry count is bounded.
+        let overflow = (0..MAX_METADATA_ENTRIES + 1)
+            .map(|index| tree_file(&format!("f{index}"), &"44".repeat(20), 1, None))
+            .collect();
+        assert!(parse_hf_metadata(overflow, &requested).is_err());
     }
 
     #[test]
     fn fetch_non_lfs_blob_id_accepts_exact_content_and_rejects_same_size_tampering() {
         let requested = HashSet::from(["safe/file".to_owned()]);
-        let body = format!(
-            r#"{{"sha":"{GAIA_DATASET_REVISION}","siblings":[{{"rfilename":"safe/file","size":7,"blobId":"2a190ee76159c1b3cc6a437daa73d594b339cbdf"}}]}}"#
-        );
-        let parsed = parse_hf_metadata(body.as_bytes(), &requested).unwrap();
+        let parsed = parse_hf_metadata(
+            vec![tree_file(
+                "safe/file",
+                "2a190ee76159c1b3cc6a437daa73d594b339cbdf",
+                7,
+                None,
+            )],
+            &requested,
+        )
+        .unwrap();
         let expected = &parsed.siblings[0];
         let root = test_directory("git-blob-integrity");
         let trusted = root.join("trusted");

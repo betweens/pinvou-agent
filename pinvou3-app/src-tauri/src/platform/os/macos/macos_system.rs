@@ -13,7 +13,9 @@ pub fn current_system_locale() -> Option<String> {
 }
 
 // Shared Unix helpers come from the same posix.rs implementation as Linux.
-pub use super::super::posix::{make_private_dir, process_alive};
+pub use super::super::posix::{
+    bundled_node, make_private_dir, process_alive, try_make_private_dir,
+};
 
 /// 校验路径存在且至少有一个可执行位(owner/group/other 任一有 x bit)。
 /// 与 Linux 侧 `which` 自带的可执行性校验对齐:`command_exists` 此前只调
@@ -152,12 +154,12 @@ pub fn nvidia_smi_candidates() -> Vec<&'static str> {
     Vec::new()
 }
 
-/// Returns the bundled Node.js runtime reused from codex-bridge on macOS.
-/// Consumers fall back to PATH discovery when the runtime is absent.
-pub fn bundled_node() -> Option<PathBuf> {
-    crate::platform::paths::bundled_connector_node()
-}
-
+/// `command_exists` is spawn-faithful here even though it also scans
+/// `extra_lookup_dirs()`: `lib.rs` `ensure_release_env` prepends every one of those
+/// dirs (Homebrew bin + the cask app's MacOS dir) to the *process* PATH during
+/// single-threaded startup, so a bare "soffice" that passes the preflight is also
+/// resolvable by the later spawn. The absolute cask path stays as the fallback that
+/// feeds the "dependency missing" diagnostics.
 pub fn libreoffice_tool_path() -> PathBuf {
     if command_exists("soffice") {
         PathBuf::from("soffice")

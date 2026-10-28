@@ -73,6 +73,14 @@ const onnxRuntimeSmoke = readApp(
   "scripts",
   "test-onnx-runtime.ps1",
 );
+const runtimeManifestHarness = readApp(
+  "src-tauri",
+  "packaging",
+  "windows",
+  "runtime",
+  "scripts",
+  "test-runtime-manifest-contract.ps1",
+);
 const installerHook = readApp(
   "src-tauri",
   "packaging",
@@ -80,13 +88,15 @@ const installerHook = readApp(
   "nsis",
   "installer-hooks.nsh",
 );
-const vcRedistTempPreflight = readApp(
+const vcRedistTempPreflightPath = path.join(
+  appRoot,
   "src-tauri",
   "packaging",
   "windows",
   "nsis",
   "vcredist-temp-preflight.ps1",
 );
+const vcRedistTempPreflight = fs.readFileSync(vcRedistTempPreflightPath, "utf8");
 const runtimeWrapper = readApp("scripts", "tauri", "windows-runtime.js");
 const installerAdapter = readApp("scripts", "tauri", "windows-installer.js");
 const buildScript = readApp("scripts", "tauri", "build.js");
@@ -138,8 +148,12 @@ for (const contract of [
   "Assert-WindowsRuntimeStagedFilesExact",
   "System.IO.Compression.ZipFile",
   "Write-Utf8WithoutBom",
+  "Write-Utf8Atomically",
   "Test-StageInventory",
   ".verified-stage.json",
+  "Get-CachedVerifiedManifest",
+  "Enter-ResolverLock",
+  ".resolver.lock",
   "Get-RuntimeDescriptorContent",
   "onnxRuntimeDylib",
   'delivery = "download-on-first-use"',
@@ -195,6 +209,34 @@ assert.match(runtimeManifestContract, /\$null -eq \$Manifest\.stagedFiles/u);
 assert.match(runtimeManifestContract, /Dictionary\[string, object\]/u);
 assert.match(runtimeManifestContract, /Windows runtime lifecycle contains an extra file/u);
 assert.match(runtimeManifestContract, /Windows runtime staged file failed verification/u);
+// Windows PowerShell 5.1 spawned under a pwsh 7 parent (CI step shells, pwsh
+// terminals) inherits pwsh's PSModulePath: Get-FileHash then raises
+// CommandNotFound and Get-Acl resolves the unloadable PowerShell 7 module,
+// so the native harnesses die before their assertions while the aggregate
+// CI step still reports green. Each direct 5.1 entry point must restore the
+// host default module path before its first module-dependent cmdlet.
+const modulePathGuard =
+  /PSVersionTable\.PSVersion\.Major -lt 6[\s\S]*?System32\\WindowsPowerShell\\v1\.0\\Modules/u;
+assert.match(
+  runtimeManifestContract,
+  modulePathGuard,
+  "the shared runtime manifest library must restore the 5.1 module path for every dot-sourcing entry point",
+);
+assert.match(
+  vcRedistTempPreflight,
+  modulePathGuard,
+  "the VC++ temp preflight must restore the 5.1 module path itself (no shared library runs before it)",
+);
+assert.match(
+  initScript,
+  modulePathGuard,
+  "the runtime init script must restore the 5.1 module path before its lock-file hashing",
+);
+assert.ok(
+  runtimeScript.indexOf('. (Join-Path $PSScriptRoot "runtime-manifest-contract.ps1")') <
+    runtimeScript.indexOf("Add-Type -AssemblyName"),
+  "the resolver must dot-source the shared library before Add-Type so the module path is restored first",
+);
 const stagedFilesCheck = runtimeScript.indexOf("Assert-WindowsRuntimeStagedFilesExact");
 const derivedVcStage = runtimeScript.indexOf("Preparing descriptor-owned VC++ runtime component");
 const payloadCleanup = runtimeScript.indexOf("Remove-Item -LiteralPath $stageContext.PayloadRoot");
@@ -236,7 +278,143 @@ assert.match(initScript, /--include=/);
 assert.match(initScript, /\[switch\]\$OnnxOnly/);
 assert.match(initScript, /GIT_LFS_SKIP_SMUDGE/);
 assert.match(initScript, /onnxruntime-win-x64-\*-runtime\.zip/);
-assert.match(initScript, /pinvou3-windows-runtime-\$expectedCommit/);
+assert.match(initScript, /pinvou3-windows-runtime-\$cacheSchema-\$expectedCommit/);
+assert.match(
+  initScript,
+  /\$lockSha256\.Substring\(0, 16\)/u,
+  "the Jenkins cache key must embed the lock content hash so lock changes invalidate it",
+);
+assert.match(initScript, /Get-RuntimeLockSha256/);
+assert.match(initScript, /Enter-RuntimeResolverLock/);
+assert.match(
+  initScript,
+  /\$cacheSchema = "v5"/u,
+  "the cache schema literal must stay pinned so a bump is a conscious, reviewed edit",
+);
+assert.ok(
+  initScript.includes('$resolverLockPath = Join-Path $resolverCacheRoot ".resolver.lock"') &&
+    runtimeScript.includes('$resolverLockPath = Join-Path $stagingParent ".resolver.lock"'),
+  "submodule initialization and runtime staging must share the same workspace lock",
+);
+assert.ok(
+  initScript.includes(
+    '$resolverCacheRoot = Join-Path $repoRoot "pinvou3-app\\src-tauri\\target\\windows-runtime"',
+  ) && runtimeScript.includes('$stagingParent = Join-Path $tauriRoot "target\\windows-runtime"'),
+  "the two scripts' lock-directory derivations must stay identical, not just the lock file name",
+);
+assert.match(
+  runtimeScript,
+  /\$sourceVerificationMarkerPath = Join-Path \$stagingParent "\.verified-lock"/u,
+);
+assert.match(
+  runtimeScript,
+  /Get-CachedVerifiedManifest -VerifyContent:\(\$Mode -eq "Validate"\)/u,
+  "Stage may trust cached source metadata; Validate must re-hash the locked content",
+);
+assert.ok(
+  runtimeScript.includes(
+    "if ($VerifyContent -and (Get-Sha256 -Path $sourcePath) -ne [string]$entry.sha256)",
+  ),
+  "the Validate-mode content re-hash guard must stay inside Get-CachedVerifiedManifest, not just at its call site",
+);
+// The size-only cache is safe only while the cached path re-runs the full
+// runtime identity check itself (marker match alone must never authorize
+// per-file sizes), and a vanished checkout must decline to the full path so
+// the actionable "not initialized" message survives the cache. Pin the call
+// ordering inside Get-CachedVerifiedManifest's own body; removing either the
+// checkout guard or the identity re-check there must fail here loudly.
+const cachedFnStart = runtimeScript.indexOf("function Get-CachedVerifiedManifest");
+const cachedMarkerIdx = runtimeScript.indexOf(
+  "Test-VerificationMarker -Path $sourceVerificationMarkerPath",
+  cachedFnStart,
+);
+const cachedCheckoutIdx = runtimeScript.indexOf(
+  "Test-Path -LiteralPath $RuntimeRoot -PathType Container",
+  cachedFnStart,
+);
+const cachedIdentityIdx = runtimeScript.indexOf("Assert-RuntimeIdentity", cachedFnStart);
+const cachedSizeIdx = runtimeScript.indexOf(
+  "$sourcePath).Length -ne [long]$entry.bytes",
+  cachedFnStart,
+);
+assert.ok(
+  cachedFnStart !== -1 &&
+    cachedMarkerIdx > cachedFnStart &&
+    cachedCheckoutIdx > cachedMarkerIdx &&
+    cachedIdentityIdx > cachedCheckoutIdx &&
+    cachedSizeIdx > cachedIdentityIdx,
+  "the cached path must decline to the full path when the checkout is gone and re-run the runtime identity check between the marker check and the per-file size loop, not trust sizes on the marker alone",
+);
+assert.ok(
+  runtimeScript.includes("param([int]$TimeoutSeconds = 120)") &&
+    initScript.includes("param([int]$TimeoutSeconds = 120)"),
+  "both lock holders must keep the same default 120s waiter timeout (the documented fail-and-retry contract)",
+);
+assert.match(
+  runtimeScript,
+  /^\$resolverLock = Enter-ResolverLock$/mu,
+  "the lock call site must invoke the shared 120s default (no per-call -TimeoutSeconds override)",
+);
+assert.match(
+  initScript,
+  /^\$resolverLock = Enter-RuntimeResolverLock$/mu,
+  "the lock call site must invoke the shared 120s default (no per-call -TimeoutSeconds override)",
+);
+assert.equal(
+  (runtimeScript.match(/Write-Utf8Atomically -Path \$sourceVerificationMarkerPath/gu) || []).length,
+  2,
+  "the workspace source-metadata marker must be rewritten on both the full-verify and the cached-rebuild paths",
+);
+assert.match(runtimeScript, /Write-Utf8Atomically -Path \$runtimeDescriptorPath/u);
+assert.match(runtimeScript, /Write-Utf8Atomically -Path \$generatedConfigPath/u);
+assert.match(
+  runtimeScript,
+  /Write-Utf8Atomically -Path \$onnxDevDescriptorPath/u,
+  "the ONNX dev descriptor is shared-visibility state and must be written atomically",
+);
+const atomicFnStart = runtimeScript.indexOf("function Write-Utf8Atomically");
+const atomicFnEnd = runtimeScript.indexOf("\nfunction ", atomicFnStart);
+assert.ok(atomicFnStart !== -1 && atomicFnEnd > atomicFnStart);
+const atomicFnBody = runtimeScript.slice(atomicFnStart, atomicFnEnd);
+assert.match(
+  atomicFnBody,
+  /^\s*if \(Test-Path -LiteralPath \$Path -PathType Leaf\) \{$/mu,
+  "the atomic writer must branch on an existing destination",
+);
+assert.match(
+  atomicFnBody,
+  /^\s*\[System\.IO\.File\]::Replace\(\$temporaryPath, \$Path, \[NullString\]::Value\)$/mu,
+  "an existing destination must be swapped in via File.Replace (atomic ReplaceFile) with a real null backup (PowerShell coerces a plain $null argument to an empty string, which Replace would resolve as the backup path), because Move-Item -Force deletes the destination before the rename and the unlocked descriptor readers in scripts/tauri/windows-runtime.js would observe the file missing",
+);
+assert.match(
+  atomicFnBody,
+  /^\s*\[System\.IO\.File\]::Move\(\$temporaryPath, \$Path\)$/mu,
+  "a fresh destination must still take the plain move path (File.Replace requires an existing destination)",
+);
+const atomicFnCode = atomicFnBody
+  .split("\n")
+  .filter((line) => !line.trimStart().startsWith("#"))
+  .join("\n");
+assert.doesNotMatch(
+  atomicFnCode,
+  /Move-Item/,
+  "no delete-before-move primitive may re-enter the atomic writer",
+);
+assert.match(
+  runtimeManifestHarness,
+  /\. \(Join-Path \$PSScriptRoot "resolve-runtime\.ps1"\) -ImportFunctionsOnly/u,
+  "the manifest harness must import the resolver functions to exercise Write-Utf8Atomically behaviorally",
+);
+assert.match(
+  runtimeManifestHarness,
+  /foreach \(\$generation in @\("second", "third"\)\)/u,
+  "the manifest harness must exercise repeated atomic replacement (the re-stage path), not only first creation",
+);
+assert.match(
+  runtimeManifestHarness,
+  /Assert-Throws -Name "atomic replace under a sharing reader"/u,
+  "the manifest harness must prove a failed atomic replacement preserves the previous descriptor",
+);
 assert.match(initScript, /\$previousErrorActionPreference = \$ErrorActionPreference/);
 assert.match(initScript, /\$ErrorActionPreference = "Continue"/);
 assert.match(initScript, /\$exitCode = \$LASTEXITCODE/);
@@ -298,6 +476,7 @@ for (const recoveryHint of [
   "释放系统盘空间",
   "检查系统临时目录权限",
   "重启 Windows 后重试",
+  "日志：$WINDIR\\Temp\\Pinvou3-vcredist.log",
 ]) {
   assert.ok(
     installerHook.includes(recoveryHint),
@@ -319,6 +498,116 @@ assert.match(
   /Join-Path \$windowsRootPath "Installer"/,
   "preflight must target the Windows Installer directory",
 );
+assert.match(
+  vcRedistTempPreflight,
+  /S-1-5-18/,
+  "SYSTEM must keep access to the repaired directories",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /S-1-5-32-544/,
+  "Administrators must keep access to the repaired directories",
+);
+// SID constants alone are not a behavior pin: require the full grant chain
+// (both SIDs in the applied set, rule granted and written back, every ensured
+// directory running the grant) so deleting the ACL repair still fails here.
+assert.match(
+  vcRedistTempPreflight,
+  /\$requiredSids = @\(\$systemSid, \$administratorsSid\)/,
+  "SYSTEM and Administrators SIDs must form the required-access set",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /\[void\]\$acl\.AddAccessRule\(\$rule\)/,
+  "the required-access set must be granted through ACL access rules",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /Set-Acl -LiteralPath \$Path -AclObject \$acl/,
+  "granted ACL rules must be written back to the repaired directory",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /Add-RequiredAccess -Path \$Path/,
+  "every ensured system directory must receive the required ACL entries",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /Ensure-SystemDirectory -Path \$windowsTempPath/,
+  "the Windows temp directory must run the ACL-preserving ensure",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /Ensure-SystemDirectory -Path \$windowsInstallerPath -HiddenSystem/,
+  "the Windows Installer directory must run the ACL-preserving ensure",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /SetEnvironmentVariable\(\$Name, \$FallbackPath, "Machine"\)/,
+  "machine TEMP/TMP repair must persist the resolved absolute fallback path",
+);
+assert.doesNotMatch(
+  vcRedistTempPreflight,
+  /FallbackValue|%SystemRoot%\\Temp/u,
+  "machine TEMP/TMP repair must not persist an unexpanded REG_SZ value",
+);
+assert.doesNotMatch(
+  vcRedistTempPreflight,
+  /Remove-Item|RemoveAccessRule|PurgeAccessRules/u,
+  "VC++ temp repair must not delete installer cache or existing ACL entries",
+);
+// PowerShell returns every uncaptured pipeline value from a function, so
+// diagnostics written with Write-Output would be concatenated into the repaired
+// path. The repaired paths travel through [ref] parameters instead.
+assert.match(
+  vcRedistTempPreflight,
+  /-ResolvedPath \(\[ref\]\$machineTemp\)/u,
+  "TEMP repair must return its path separately from diagnostic output",
+);
+assert.match(
+  vcRedistTempPreflight,
+  /-ResolvedPath \(\[ref\]\$machineTmp\)/u,
+  "TMP repair must return its path separately from diagnostic output",
+);
+assert.doesNotMatch(
+  vcRedistTempPreflight,
+  /Write-Output "(?:Repaired|required|Created|Machine|\$Target)/iu,
+  "preflight diagnostics must not contaminate PowerShell function return values",
+);
+if (process.platform === "win32") {
+  // Run the real script twice against a fake Windows root: the first run
+  // creates the directories, the second must be idempotent. Machine-level
+  // TEMP/TMP changes are skipped so the smoke never needs elevation.
+  const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pinvou-vcredist-preflight-"));
+  const fakeWindowsRoot = path.join(smokeRoot, "Windows");
+  try {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const result = spawnSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          vcRedistTempPreflightPath,
+          "-WindowsRoot",
+          fakeWindowsRoot,
+          "-SkipMachineEnvironment",
+        ],
+        { encoding: "utf8" },
+      );
+      assert.equal(
+        result.status,
+        0,
+        `VC++ temp preflight attempt ${attempt} failed: ${result.stderr || result.stdout}`,
+      );
+    }
+    assert.ok(fs.statSync(path.join(fakeWindowsRoot, "Temp")).isDirectory());
+    assert.ok(fs.statSync(path.join(fakeWindowsRoot, "Installer")).isDirectory());
+  } finally {
+    fs.rmSync(smokeRoot, { recursive: true, force: true });
+  }
+}
 for (const [name, version] of [
   ["MAJOR", vcMajor],
   ["MINOR", vcMinor],
@@ -391,10 +680,13 @@ assert.match(
   /isDev && process\.platform === "win32" \? stageWindowsOnnxRuntime\(\) : null/,
   "Windows dev must stage only the pinned ONNX Runtime before starting Tauri",
 );
-assert.doesNotMatch(
+// Positive anchor: only a build/bundle command may widen into the full
+// packaging runtime. A negative "(hasTauriBuildCommand || isDev)" scan would
+// also hit the unrelated Windows toolchain-check gate above.
+assert.match(
   buildScript,
-  /\(hasTauriBuildCommand \|\| isDev\)[\s\S]*?stageWindowsRuntime\(\)/,
-  "Windows dev must not stage the complete packaging runtime",
+  /hasTauriBuildCommand && process\.platform === "win32"\s*\?\s*stageWindowsRuntime\(\)/u,
+  "only a build/bundle command must stage the complete packaging runtime",
 );
 assert.match(
   buildScript,
@@ -500,6 +792,23 @@ assert.doesNotMatch(
   "public Windows runtime builds must not depend on cross-repository credentials",
 );
 assert.match(windowsBuildJob, /npm run runtime:windows:init/);
+// The installer integration test self-skips unless the runtime is staged and
+// it is invoked directly with --require-staged-runtime (node --test drops the
+// flag); without these pins a dropped or reordered step would make it skip
+// silently forever instead of failing.
+const windowsInitStep = windowsBuildJob.indexOf("npm run runtime:windows:init");
+const windowsStageStep = windowsBuildJob.indexOf("npm run runtime:windows:stage");
+const windowsInstallerTestStep = windowsBuildJob.indexOf(
+  "node tests/windows_runtime_installer_integration.test.js --require-staged-runtime",
+);
+assert.ok(
+  windowsStageStep > windowsInitStep,
+  "the release job must stage the Windows runtime after materializing the submodule",
+);
+assert.ok(
+  windowsInstallerTestStep > windowsStageStep,
+  "the installer integration test must run directly, after the runtime is staged",
+);
 assert.doesNotMatch(
   windowsBuildJob,
   /runtime-access|available == 'true'|available != 'true'/,

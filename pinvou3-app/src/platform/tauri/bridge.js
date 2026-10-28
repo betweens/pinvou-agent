@@ -10,7 +10,7 @@
 
 let pinvouSharedtauriMainCache = null;
 function pinvouSharedtauriMain() {
-  if (!pinvouSharedtauriMainCache) pinvouSharedtauriMainCache = window.PinvouBridgeShared.create("tauriMain", { state, BT_TABLE, PINVOU_SCENE_EVENTS_STORAGE_PREFIX, invoke, startThinking, recordAuthoritySyncDiagnostic, getBuffer, runSyncOnSession, notify, scheduledRunSessionOwners, sessionStates });
+  if (!pinvouSharedtauriMainCache) pinvouSharedtauriMainCache = window.PinvouBridgeShared.create("tauriMain", { state, BT_TABLE, PINVOU_SCENE_EVENTS_STORAGE_PREFIX, invoke, startThinking, recordAuthoritySyncDiagnostic, getBuffer, runSyncOnSession, notify, addChatItem, extractArtifactPaths, scheduledRunSessionOwners, sessionStates, isDeliverable, personaPlaceholderTitles });
   return pinvouSharedtauriMainCache;
 }
 
@@ -116,23 +116,10 @@ function pinvouSharedtauriMain() {
   // 优先委托共享渲染器 window.PinvouMarkdownRenderer（npm 版，含语法高亮）；在其尚未安装的
   // 短暂窗口退回 vendor 全局兜底。兜底实现已收敛到 shared/markdown-bridge-fallback.js
   // （随 index.html 以普通脚本加载，暴露 window.PinvouMarkdownBridgeFallback），消除两份逐字复制。
-  // 最末级 fallback 必须自带 escapeHtml：共享脚本未加载时 renderMarkdown 仍会被
-  // dangerouslySetInnerHTML 消费，原文返回即 fail-open。escapeHtml 作为安全原语保留在本文件
-  // （不依赖任何外部脚本），仅 marked.parse+sanitize 这段较重的兜底被抽到共享文件。
-  function escapeHtml(s) {
-    return String(s).replaceAll(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-    });
-  }
-  function renderMarkdown(text) {
-    if (window.PinvouMarkdownRenderer && typeof window.PinvouMarkdownRenderer.renderMarkdown === "function") {
-      return window.PinvouMarkdownRenderer.renderMarkdown(text);
-    }
-    if (window.PinvouMarkdownBridgeFallback && typeof window.PinvouMarkdownBridgeFallback.renderMarkdown === "function") {
-      return window.PinvouMarkdownBridgeFallback.renderMarkdown(text);
-    }
-    return escapeHtml(text || "");
-  }
+  // 整条 fallback 链（含最末级的 escapeHtml fail-open）都在 shared/bridge-shared-helpers.js
+  // 的 renderMarkdown 里；本文件只剩转发 —— 共享基座未加载时这里直接抛错（加载期即暴露），
+  // 而不是静默 fail-open（round-9 review：原文注释仍声称 escapeHtml 保留在本文件）。
+function renderMarkdown(text) { return pinvouSharedtauriMain().renderMarkdown(text); }
 
 
   // The pet is a separate WebView and must not own a second copy of the main
@@ -221,6 +208,11 @@ function pinvouSharedtauriMain() {
       localVllmSupported: false,
       codexAcpSupported: false,
       browserNativeDisplay: false,
+      localEmbedSupported: false,
+      // Global wake-up shortcut (set_global_shortcut_config); false on Wayland
+      // Linux. Fail-closed so the settings toggle stays disabled until
+      // load_platform_capabilities corrects the slice.
+      globalShortcutsAvailable: false,
     },
     settings: null,
     selectedPet: "lingling",
@@ -283,6 +275,11 @@ function pinvouSharedtauriMain() {
     // create_session via the workspacePath parameter, cleared after successful
     // materialization, reset by enterDraft.
     draftWorkspacePath: null,
+    // Draft staging for the project channel (§9.3): the keychain snapshot and
+    // project ownership, passed down with the materializing create_session;
+    // null/empty = a plain-folder or temporary draft.
+    draftWorkspaceRoots: [],
+    draftProjectId: null,
     // 最新 plan/todos 快照（用于 mode header 进度 chip，与 plan_ready 卡解耦）
     planSnapshot: { plan: null, todos: null },
     // 当前 session 产物列表 [{ path, basename }]
@@ -342,14 +339,6 @@ function pinvouSharedtauriMain() {
     depsInstalling: false,    // 一键安装进行中(brew/apt/winget)
     depsInstallError: null,   // 安装失败原因(stderr 透传/取消/包管理器不可用)
     depsInstallProgress: null, // 安装进度 {package,current,total,detail}(后端 deps:install_progress 事件)
-    // 厂商预装本地大模型一键引导:首屏检测结果 + 引导执行态
-    vllmSetup: null,          // {eligible, may_offer_setup, has_packages, engine_state:'stopped' in community (sole enum variant; vendor builds may extend), ...}
-    vllmBootstrapping: false, // 引导进行中(pkexec + 拉起 + 轮询就绪)
-    vllmSetupPhase: null,     // phase: 'authorizing'|'waiting'|'ready' (set locally to 'authorizing' when the flow starts; defensive vendor-edition UI field — the community backend never emits phase events)
-    vllmSetupAttempt: 0,      // probe count during the waiting phase (defensive: vendor-edition UI field; the community-edition backend never emits phase events)
-    vllmBootstrapDone: null,  // 成功结果 {base_url, model}, 据此显示「立即重启」
-    vllmBootstrapError: null, // 失败原因(pkexec stderr / 超时透传)
-    vllmSetupDismissed: false,// 本次会话内点了「跳过」,不再弹(不写持久标记)
     voiceInput: {
       status: "idle",         // idle | requesting_permission | recording | transcribing | postprocessing | completed | cancelled | failed
       message: "",
@@ -444,8 +433,16 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       imageUnknown: "Image input capability of the current model is unknown. If it supports images, set image input to “Supports images” in model settings; you can also configure a vision model.",
       sessionModelStale: id => `The model selected for this conversation is no longer available (missing saved model: ${id}). Please pick a model again in this conversation.`,
       turnAlreadyInProgress: "⚠️ This chat is already processing a turn. The duplicate send was not executed.",
-      steerDropped: "Queued message was not delivered (turn interrupted), cancelled",
+      steerDropped: "Queued message was not delivered (turn interrupted); your text was restored to the input",
+      steerFailedTimedOut: "Interrupt failed (engine did not answer in time); your text was restored to the input",
+      steerFailedQueuedTimedOut: "Interrupt failed (engine did not answer in time); the message stayed queued and will be sent in order",
+      steerDroppedQueued: "Queued message was not delivered (turn interrupted); it stayed queued and will be sent in order",
       steerFailed: "Interrupt failed (session unavailable or engine not running); your text was restored to the input",
+      steerFailedLost: "Interrupt failed (turn interrupted); the message was not delivered and could not be restored — send it again",
+      steerFailedQueued: "Interrupt failed (session unavailable or engine not running); the message stayed queued and will be sent in order",
+      steerDroppedDuringEdit: "The edit could not be applied (turn interrupted); the queued message stayed unchanged and will be sent in order",
+      steerEditRestored: "The edit could not be applied (turn interrupted); the original message was not delivered and its text was restored to the input — retry the edit",
+      steerFailedUnconfirmed: "Interrupt failed (delivery could not be confirmed); the queued message was not re-queued — check the transcript before sending it again",
       interruptQueuedFailed: "Interrupt & send failed; the message was restored to the queue",
       interruptBusy: "Another interrupt is already in progress; the message stays queued — retry in a moment",
       compactStart: "⏳ Compacting context", compactDone: "✓ Context compacted", compactFail: "⚠️ Compaction failed", compactCancel: "Context compaction canceled", compactAuto: " (auto)",
@@ -453,7 +450,6 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       compactPruneMerged: "Auto-compaction: tool-result cleanup, messages unchanged",
       compactInactive: "The session engine is not running yet. Send a message before compacting the context",
       gpuUnavailable: "GPU info unavailable",
-      cpuUnavailable: "CPU info unavailable",
       superOn: "⚠️ Super permission enabled", superOff: "Super permission disabled",
       approved: "✅ Approved", echoGo: "✅ Do it",
       acceptPlanFailed: "⚠️ accept_plan failed: ",
@@ -461,7 +457,7 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       replanRequested: "📋 Asking the AI to re-plan…",
       openFailed: "⚠️ Open failed: ", pasteImageFailed: "⚠️ Paste image failed: ",
       filePickUnavailable: "⚠️ File picker unavailable", filePickFailed: "⚠️ File selection failed: ",
-      equipNoSession: "⚠️ Open or create a chat before equipping an expert", equipFailed: "⚠️ Equip failed: ",
+      equipFailed: "⚠️ Equip failed: ",
       shellOutputOmitted: kind => `[Earlier ${kind} output omitted]`, shellUnknownExit: "unknown",
       shellTaskFinished: code => `[Task finished, exit code: ${code}]`,
       skillContentHidden: "(Skill loaded, content hidden)",
@@ -486,12 +482,13 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       voiceTranscribing: "Transcribing…",
       voicePostprocessing: "Polishing voice text…",
       voiceTaskPostprocessing: "Rewriting voice task…",
-      voiceStructuredPostprocessing: "Structuring voice text…",
       voiceEditPostprocessing: "Editing current input…",
       voiceRecordingTooShort: "Recording is too short. Please try again.",
       voiceRecordingTooLong: "Recording is too long. Please shorten it and try again.",
       voiceAudioInvalid: "The recorded audio is invalid. Please record again.",
       voiceMicUnavailable: "The microphone is in use by another app. Close it or pick another microphone, then try again.",
+      voiceMicBusyOtherWindow: "Voice input is already recording in another app window. Stop it there, then try again.",
+      voiceMicOwnershipUnavailable: "Recording ownership could not be verified (start failed closed). Please try again.",
       voiceWrittenBack: "Transcribed text inserted into the input box",
       voiceTaskSent: "Voice task sent",
       voiceEditPreviewReady: "Voice edit ready to review",
@@ -514,13 +511,14 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       fileMediaFilterName: "Images and videos",
       kbPickFolderTitle: "Choose folders to import into the knowledge base",
       rebindPickFolderTitle: "Choose the folder to rebind this project to",
+      manageAddFolderTitle: "Choose a folder to add to the project",
+      workspacePickFolderTitle: "Choose a workspace folder",
       memoryWriteFailed: "Memory write failed: ", memoryIgnoreFailed: "Failed to ignore memory: ", memoryNeverFailed: "Failed to set \"never ask\": ",
-      attachNeedSession: "⚠️ Start a new chat before adding attachments", attachEmptyFile: "Empty files cannot be added", attachAddCancelled: "Attachment add canceled", attachInvalidResult: "Attachment add returned no valid result", deviceUploadFailed: "⚠️ Upload failed: ",
+      attachEmptyFile: "Empty files cannot be added", attachAddCancelled: "Attachment add canceled", attachInvalidResult: "Attachment add returned no valid result", deviceUploadFailed: "⚠️ Upload failed: ",
       planTicketInvalid: "⚠️ The plan credential is no longer valid. Regenerate the plan before executing.",
       remoteTurnSyncing: "⚠️ This chat is still syncing a turn finished on another device. Try again shortly.",
       mountCollectionFailed: "Failed to mount collection: ",
-      metricNotApplicable: "N/A", metricUnavailable: "Not provided",
-      targetKindRemote: "Remote model", targetKindLocal: "Local model", targetKindInvalid: "Config error",
+      metricUnavailable: "Not provided",
       betaVersionSuffix: " (Beta)",
       depsInstallManual: "The missing items cannot be installed in one click. Install them as described in the notes above each missing item, then re-check.",
       remoteCmdNotAllowed: cmd => "Remote control does not allow this command: " + cmd,
@@ -545,8 +543,16 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       imageUnknown: "現在のモデルの画像入力能力は不明です。画像に対応している場合は、モデル設定で画像入力能力を「画像対応」に設定してください。ビジョンモデルを構成することもできます。",
       sessionModelStale: id => `この会話で選択したモデルの設定は無効になりました（見つからない設定: ${id}）。会話でモデルを選び直してください。`,
       turnAlreadyInProgress: "⚠️ このチャットでは別のターンを処理中です。重複した送信は実行されませんでした。",
-      steerDropped: "キューしたメッセージが未達（ターン中断）のため取り消しました",
+      steerDropped: "キューしたメッセージが未達（ターン中断）のため、内容は入力欄に復元しました",
+      steerFailedTimedOut: "割り込みに失敗しました（エンジンが時間内に応答しませんでした）。内容は入力欄に復元しました",
+      steerFailedQueuedTimedOut: "割り込みに失敗しました（エンジンが時間内に応答しませんでした）。内容はキューに残り、順に送信されます",
+      steerDroppedQueued: "キューしたメッセージが未達（ターン中断）のため、キューに残り、順に送信されます",
       steerFailed: "割り込みに失敗しました（セッション無効またはエンジン未起動）。内容は入力欄に復元しました",
+      steerFailedLost: "割り込みに失敗しました（ターン中断）。メッセージは未達のまま復元できません。もう一度送信してください",
+      steerFailedQueued: "割り込みに失敗しました（セッション無効またはエンジン未起動）。内容はキューに残り、順に送信されます",
+      steerDroppedDuringEdit: "編集は適用できませんでした（ターン中断）。キューしたメッセージは変更されず、順に送信されます",
+      steerEditRestored: "編集は適用できませんでした（ターン中断）。元のメッセージは未達のため、内容を入力欄に復元しました。編集をやり直してください",
+      steerFailedUnconfirmed: "割り込みに失敗しました（配信結果を確認できません）。キューのメッセージは元に戻していません。履歴を確認してから再送を判断してください",
       interruptQueuedFailed: "割り込み送信に失敗しました。メッセージはキューに復元しました",
       interruptBusy: "別の割り込みが進行中のため実行できません。メッセージはキューに残ります。しばらくしてから再試行してください",
       compactStart: "⏳ コンテキストを圧縮中", compactDone: "✓ コンテキスト圧縮完了", compactFail: "⚠️ 圧縮に失敗", compactCancel: "コンテキストの圧縮をキャンセルしました", compactAuto: "（自動）",
@@ -554,7 +560,6 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       compactPruneMerged: "自動圧縮: ツール結果を整理、メッセージ数は不変",
       compactInactive: "セッション Engine はまだ起動していません。メッセージを送信してからコンテキストを圧縮してください",
       gpuUnavailable: "GPU 情報を取得できません",
-      cpuUnavailable: "CPU 情報を取得できません",
       superOn: "⚠️ スーパー権限が有効になりました", superOff: "スーパー権限が無効になりました",
       approved: "✅ 承認済み", echoGo: "✅ これでいく",
       acceptPlanFailed: "⚠️ accept_plan に失敗: ",
@@ -562,7 +567,7 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       replanRequested: "📋 AI にプランを出し直させています…",
       openFailed: "⚠️ 開けませんでした: ", pasteImageFailed: "⚠️ 画像の貼り付けに失敗: ",
       filePickUnavailable: "⚠️ ファイル選択を利用できません", filePickFailed: "⚠️ ファイル選択に失敗: ",
-      equipNoSession: "⚠️ エキスパートを装備する前にチャットを開くか新規作成してください", equipFailed: "⚠️ 装備に失敗: ",
+      equipFailed: "⚠️ 装備に失敗: ",
       shellOutputOmitted: kind => `[途中の${kind === "stderr" ? "標準エラー" : "標準出力"}を省略]`, shellUnknownExit: "不明",
       shellTaskFinished: code => `[タスク終了、終了コード: ${code}]`,
       skillContentHidden: "（スキルを読み込みました。内容は非表示です）",
@@ -587,12 +592,13 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       voiceTranscribing: "音声を認識中…",
       voicePostprocessing: "音声テキストを整えています…",
       voiceTaskPostprocessing: "音声タスクを整理しています…",
-      voiceStructuredPostprocessing: "リストに整理中…",
       voiceEditPostprocessing: "現在の入力を編集しています…",
       voiceRecordingTooShort: "録音時間が短すぎます。再試行してください。",
       voiceRecordingTooLong: "録音が長すぎます。短くして再試行してください。",
       voiceAudioInvalid: "録音データが無効です。もう一度録音してください。",
       voiceMicUnavailable: "マイクは他のアプリで使用中です。使用中のアプリを終了するか、別のマイクを選んでから再試行してください。",
+      voiceMicBusyOtherWindow: "別のアプリウィンドウで音声入力が進行中です。そちらを停止してから再試行してください。",
+      voiceMicOwnershipUnavailable: "録音の所有権を確認できなかったため、開始を中止しました。もう一度お試しください。",
       voiceWrittenBack: "音声を入力ボックスに書き込みました",
       voiceTaskSent: "音声タスクを送信しました",
       voiceEditPreviewReady: "音声編集を確認してください",
@@ -615,13 +621,14 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       fileMediaFilterName: "画像と動画",
       kbPickFolderTitle: "知識ベースにインポートするフォルダーを選択",
       rebindPickFolderTitle: "このプロジェクトの再バインド先フォルダーを選択",
+      manageAddFolderTitle: "プロジェクトに追加するフォルダーを選択",
+      workspacePickFolderTitle: "ワークスペースフォルダーを選択",
       memoryWriteFailed: "メモリの書き込みに失敗: ", memoryIgnoreFailed: "メモリの無視に失敗: ", memoryNeverFailed: "「今後表示しない」の設定に失敗: ",
-      attachNeedSession: "⚠️ 添付ファイルを追加する前に新しいチャットを開始してください", attachEmptyFile: "空のファイルは追加できません", attachAddCancelled: "添付ファイルの追加はキャンセルされました", attachInvalidResult: "添付ファイルの追加で有効な結果が返されませんでした", deviceUploadFailed: "⚠️ アップロードに失敗: ",
+      attachEmptyFile: "空のファイルは追加できません", attachAddCancelled: "添付ファイルの追加はキャンセルされました", attachInvalidResult: "添付ファイルの追加で有効な結果が返されませんでした", deviceUploadFailed: "⚠️ アップロードに失敗: ",
       planTicketInvalid: "⚠️ プランの資格情報が無効になりました。プランを再生成してから実行してください。",
       remoteTurnSyncing: "⚠️ このセッションは別の端末で完了したターンを同期中です。しばらくしてから再試行してください。",
       mountCollectionFailed: "ナレッジセットのマウントに失敗: ",
-      metricNotApplicable: "対象外", metricUnavailable: "未提供",
-      targetKindRemote: "リモートモデル", targetKindLocal: "ローカルモデル", targetKindInvalid: "設定エラー",
+      metricUnavailable: "未提供",
       betaVersionSuffix: " (ベータ版)",
       depsInstallManual: "不足している項目はワンクリックでインストールできません。各不足項目の上にある説明に従ってインストールしてから、再検出してください。",
       remoteCmdNotAllowed: cmd => "リモートコントロールではこのコマンドを呼び出せません: " + cmd,
@@ -646,8 +653,16 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       imageUnknown: "当前模型的图片输入能力未知。如果它支持图片，请在模型设置中将图片输入能力设为“支持图片”后重试；也可以配置视觉模型。",
       sessionModelStale: id => `当前会话选择的模型配置已失效（缺失配置：${id}），请在对话中重新选择模型。`,
       turnAlreadyInProgress: "⚠️ 当前会话已有一轮正在处理，本次重复发送未执行。",
-      steerDropped: "排队消息未送达（回合中断），已取消",
+      steerDropped: "排队消息未送达（回合中断），内容已恢复到输入框",
+      steerFailedTimedOut: "插队失败（引擎未及时响应），内容已恢复到输入框",
+      steerFailedQueuedTimedOut: "插队失败（引擎未及时响应），内容保留在队列中，将按顺序发送",
+      steerDroppedQueued: "排队消息未送达（回合中断），已保留在队列中，将按顺序发送",
       steerFailed: "插队失败（会话不可用或引擎未运行），内容已恢复到输入框",
+      steerFailedLost: "插队失败（回合中断），消息未送达且无法恢复；请重新发送",
+      steerFailedQueued: "插队失败（会话不可用或引擎未运行），内容保留在队列中，将按顺序发送",
+      steerDroppedDuringEdit: "编辑未能应用（回合中断），排队消息保持不变，将按顺序发送",
+      steerEditRestored: "编辑未能应用（回合中断），原消息未送达，内容已恢复到输入框；请重新编辑",
+      steerFailedUnconfirmed: "插队失败（送达结果未能确认），队列消息未重新排队；请查看会话记录后再决定是否重发",
       interruptQueuedFailed: "插队发送失败，消息已恢复到排队区",
       interruptBusy: "已有打断正在进行，消息保留在排队区，请稍后重试",
       compactStart: "⏳ 正在压缩上下文", compactDone: "✓ 上下文压缩完成", compactFail: "⚠️ 压缩失败", compactCancel: "已取消上下文压缩", compactAuto: "（自动）",
@@ -655,7 +670,6 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       compactPruneMerged: "自动压缩：已整理工具结果，消息数不变",
       compactInactive: "会话引擎尚未运行。请先发送一条消息，再压缩上下文",
       gpuUnavailable: "GPU 信息不可用",
-      cpuUnavailable: "CPU 信息不可用",
       superOn: "⚠️ 超级权限已开启", superOff: "超级权限已关闭",
       approved: "✅ 已批准", echoGo: "✅ 就这么干",
       acceptPlanFailed: "⚠️ accept_plan 失败: ",
@@ -663,7 +677,7 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       replanRequested: "📋 让 AI 重出方案…",
       openFailed: "⚠️ 打开失败: ", pasteImageFailed: "⚠️ 粘贴图片失败: ",
       filePickUnavailable: "⚠️ 文件选择不可用", filePickFailed: "⚠️ 选择文件失败: ",
-      equipNoSession: "⚠️ 请先打开或新建一个对话再加持专家", equipFailed: "⚠️ 加持失败: ",
+      equipFailed: "⚠️ 加持失败: ",
       shellOutputOmitted: kind => `[中间${kind === "stderr" ? "错误" : "标准"}输出已省略]`, shellUnknownExit: "未知",
       shellTaskFinished: code => `[任务已结束，退出码: ${code}]`,
       skillContentHidden: "（技能已加载，内容不展示）",
@@ -688,12 +702,13 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       voiceTranscribing: "正在识别语音…",
       voicePostprocessing: "正在整理语音文本…",
       voiceTaskPostprocessing: "正在整理语音任务…",
-      voiceStructuredPostprocessing: "正在整理成条目…",
       voiceEditPostprocessing: "正在编辑当前输入…",
       voiceRecordingTooShort: "录音时间过短，请重试。",
       voiceRecordingTooLong: "录音过长，请缩短后重试。",
       voiceAudioInvalid: "录音数据无效，请重新录制。",
       voiceMicUnavailable: "麦克风被其他应用占用，请关闭占用它的应用或更换麦克风后重试。",
+      voiceMicBusyOtherWindow: "另一个应用窗口正在进行语音输入，请先在那里停止后再试。",
+      voiceMicOwnershipUnavailable: "无法确认录音所有权，为避免冲突已停止本次启动，请重试。",
       voiceWrittenBack: "语音已写入输入框",
       voiceTaskSent: "语音任务已发送",
       voiceEditPreviewReady: "语音编辑待确认",
@@ -716,13 +731,14 @@ function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedtauriMain().
       fileMediaFilterName: "图片和视频",
       kbPickFolderTitle: "选择要导入知识库的文件夹",
       rebindPickFolderTitle: "选择重绑定项目的新文件夹",
+      manageAddFolderTitle: "选择要添加到项目的文件夹",
+      workspacePickFolderTitle: "选择工作区文件夹",
       memoryWriteFailed: "记忆写入失败：", memoryIgnoreFailed: "忽略记忆失败：", memoryNeverFailed: "设置不再提示失败：",
-      attachNeedSession: "⚠️ 请先新建会话再添加附件", attachEmptyFile: "空文件无法添加", attachAddCancelled: "附件添加已取消", attachInvalidResult: "附件添加未返回有效结果", deviceUploadFailed: "⚠️ 上传失败: ",
+      attachEmptyFile: "空文件无法添加", attachAddCancelled: "附件添加已取消", attachInvalidResult: "附件添加未返回有效结果", deviceUploadFailed: "⚠️ 上传失败: ",
       planTicketInvalid: "⚠️ 方案凭证已失效，请重新生成方案后再执行",
       remoteTurnSyncing: "⚠️ 该会话仍在同步另一端完成的回合，请稍后重试",
       mountCollectionFailed: "挂载知识集失败: ",
-      metricNotApplicable: "不适用", metricUnavailable: "未提供",
-      targetKindRemote: "远端模型", targetKindLocal: "本地模型", targetKindInvalid: "配置异常",
+      metricUnavailable: "未提供",
       betaVersionSuffix: " (内测版)",
       depsInstallManual: "当前缺失项无法一键安装，请按上方各缺失项的说明手动安装后重新检测。",
       remoteCmdNotAllowed: cmd => "远程控制不允许调用该命令：" + cmd,
@@ -735,7 +751,6 @@ function bt(key) { return pinvouSharedtauriMain().bt(key); }
   // Transfer badges are restored from message text, but messages persist in the
   // UI language used at send time; replay must match all three variants instead
   // of only the current language. Used for the review/plan wording keys.
-function textMatchesBtKey(text, key) { return pinvouSharedtauriMain().textMatchesBtKey(text, key); }
   // 默认会话标题哨兵:三语兜底标题都视为占位(自动改名/显示映射的依据),
   // 与 web 桥和 main.jsx 的同款判断保持一致。
 function isDefaultChatTitle(title) { return pinvouSharedtauriMain().isDefaultChatTitle(title); }
@@ -769,29 +784,48 @@ function pinvouSceneStorageKey(sid) { return pinvouSharedtauriMain().pinvouScene
 function normalizePinvouSceneEvents(events) { return pinvouSharedtauriMain().normalizePinvouSceneEvents(events); }
 function loadPinvouSceneEventsForSession(sid) { return pinvouSharedtauriMain().loadPinvouSceneEventsForSession(sid); }
 
+  // A missing sidecar is a normal empty result (the backend returns []); only
+  // unreadable/malformed/schema-invalid durable data reaches the catch. Scene tags
+  // are decorative metadata, so a bad sidecar must not make the session unopenable —
+  // but it must not be silent either, or a durable-data defect looks like "no tags".
+  // Report it, then degrade to the local migration cache.
+  // The same holds for the one-time localStorage→backend migration write: the session
+  // switch path awaits this function bare, so letting a write error escape would abort
+  // the switch over decorative metadata.
+  function reportSidecarReadFailure(kind, sid, error) {
+    console.warn(`[sidecar] ${kind} read failed for session ${sid}; falling back to the local cache`, error);
+  }
+  function reportSidecarWriteFailure(kind, sid, error) {
+    console.warn(`[sidecar] ${kind} migration write failed for session ${sid}; keeping the local cache`, error);
+  }
   async function syncPinvouSceneEventsForSession(sid) {
     const cached = loadPinvouSceneEventsForSession(sid);
     if (!sid) return cached;
+    let remote;
     try {
-      const remote = normalizePinvouSceneEvents(
+      remote = normalizePinvouSceneEvents(
         await invoke("get_session_pinvou_scene_events", { sessionId: sid })
       );
-      if (remote.length) {
-        try {
-          window.localStorage.setItem(pinvouSceneStorageKey(sid), JSON.stringify(remote));
-        } catch { /* fall back to the remote data when the localStorage write fails */ }
-        return remote;
-      }
-      if (cached.length) {
-        await invoke("save_session_pinvou_scene_events", { sessionId: sid, events: cached });
-      }
-      return cached;
-    } catch {
+    } catch (error) {
+      reportSidecarReadFailure("pinvou scene", sid, error);
       return cached;
     }
+    if (remote.length) {
+      try {
+        window.localStorage.setItem(pinvouSceneStorageKey(sid), JSON.stringify(remote));
+      } catch { /* fall back to the remote data when the localStorage write fails */ }
+      return remote;
+    }
+    if (cached.length) {
+      try {
+        await invoke("save_session_pinvou_scene_events", { sessionId: sid, events: cached });
+      } catch (error) {
+        reportSidecarWriteFailure("pinvou scene", sid, error);
+      }
+    }
+    return cached;
   }
 function recordPinvouSceneForMessage(sid, pos, scene) { return pinvouSharedtauriMain().recordPinvouSceneForMessage(sid, pos, scene); }
-function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSceneForMessagePos(pos); }
   // ── Steered-message sidecar（mid-turn steer 位置标记）──────────────
   // steer 落盘与普通 admission 对齐、不含 <turn_meta> 块（Rust sanitize 统一
   // 剥离），重载投影无法再借信封反推"非 turn admission"，因此结算时把
@@ -841,23 +875,29 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
   async function syncSteeredMessagesForSession(sid) {
     const cached = loadSteeredMessagesForSession(sid);
     if (!sid) return cached;
+    let remote;
     try {
-      const remote = normalizeSteeredMessages(
+      remote = normalizeSteeredMessages(
         await invoke("get_session_steered_messages", { sessionId: sid })
       );
-      if (remote.length) {
-        try {
-          window.localStorage.setItem(steeredMessagesStorageKey(sid), JSON.stringify(remote));
-        } catch { /* fall back to the remote data when the localStorage write fails */ }
-        return remote;
-      }
-      if (cached.length) {
-        await invoke("save_session_steered_messages", { sessionId: sid, events: cached });
-      }
-      return cached;
-    } catch {
+    } catch (error) {
+      reportSidecarReadFailure("steered messages", sid, error);
       return cached;
     }
+    if (remote.length) {
+      try {
+        window.localStorage.setItem(steeredMessagesStorageKey(sid), JSON.stringify(remote));
+      } catch { /* fall back to the remote data when the localStorage write fails */ }
+      return remote;
+    }
+    if (cached.length) {
+      try {
+        await invoke("save_session_steered_messages", { sessionId: sid, events: cached });
+      } catch (error) {
+        reportSidecarWriteFailure("steered messages", sid, error);
+      }
+    }
+    return cached;
   }
   // 合并写入一批 {pos, text}（同 pos 后写覆盖），并同步当前内存态（活动
   // session 写 state，后台 session 写其 buffer）。返回归一化后的完整列表。
@@ -898,7 +938,6 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
   const updatePresentedArtifact = artifactTrackerFeature.updatePresentedArtifact;
   const reconcileArtifacts = artifactTrackerFeature.reconcileArtifacts;
   const extractArtifactPaths = artifactTrackerFeature.extractArtifactPaths;
-  const extractArtifactPath = artifactTrackerFeature.extractArtifactPath;
   const fileMutationAction = artifactTrackerFeature.fileMutationAction;
   const isPresentArtifactTool = artifactTrackerFeature.isPresentArtifactTool;
   const artifactPathFromToolOutput = artifactTrackerFeature.artifactPathFromToolOutput;
@@ -914,12 +953,17 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
     authoritySyncBufferSnapshot, bt,
     isDefaultChatTitle,
     notify,
+    // Lazy accessor: chat is installed before the voice feature below, so the
+    // function resolves the voice feature lazily; it is only ever called at
+    // runtime, well after both features exist.
+    voice: function () { return voiceFeature; },
     runSyncOnSession: function (...args) { return runSyncOnSession(...args); },
     startThinking: function (...args) { return startThinking(...args); },
     stopThinking: function (...args) { return stopThinking(...args); },
     ensureSessionBufferLoaded: function (...args) { return ensureSessionBufferLoaded(...args); },
     ensureSession: function (...args) { return ensureSession(...args); },
     getBuffer: function (...args) { return getBuffer(...args); },
+    touchSessionBuffer: function (...args) { return touchSessionBuffer(...args); },
     recordPinvouSceneForMessage,
     recordSteeredMessages,
     reconcileRemoteTurn: function (...args) { return reconcileRemoteTurn(...args); },
@@ -1049,6 +1093,7 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
     bt, userMessageDisplayText,
     loadPinvouSceneEventsForSession,
     syncPinvouSceneEventsForSession,
+    reportSidecarReadFailure,
     loadSteeredMessagesForSession,
     syncSteeredMessagesForSession,
     loadMemoryOverview: function (...args) { return loadMemoryOverview(...args); },
@@ -1081,6 +1126,7 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
   const createNewSession = sessionsFeature.createNewSession;
   const setDraftWorkspace = sessionsFeature.setDraftWorkspace;
   const pickDraftWorkspace = sessionsFeature.pickDraftWorkspace;
+  const rememberDraftWorkspaceRecent = sessionsFeature.rememberDraftWorkspaceRecent;
   const getSessionWorkspaceBinding = sessionsFeature.getSessionWorkspaceBinding;
   const ensureSession = sessionsFeature.ensureSession;
   const hydratedMessageKey = sessionsFeature.hydratedMessageKey;
@@ -1095,6 +1141,7 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
   const archiveSession = sessionsFeature.archiveSession;
   const restoreArchivedSession = sessionsFeature.restoreArchivedSession;
   const exportSessionArchive = sessionsFeature.exportSessionArchive;
+  const onSessionDeleted = sessionsFeature.onSessionDeleted;
   function runSyncOnSession(sid, fn) {
     if (!sid || sid === state.activeSessionId) { fn(); return; }
     const bg = sessionStates[sid]; if (!bg) return;
@@ -1119,6 +1166,17 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
       loadWorkingSetFrom(restoreBuffer);
     }
   }
+  // Aux chat domain: reuses the injected pieces from chat/sessions (isBusyFor,
+  // the getBuffer family, ensureSessionBufferLoaded, purgeSessionBuffer,
+  // touchSessionBuffer); it does not build its own state or event listeners.
+  const auxChatFeature = installBridgeFeature("auxChat", {
+    state, invoke, bt, sessionStates,
+    ensureSessionBufferLoaded,
+    purgeSessionBuffer,
+    touchSessionBuffer,
+    isBusyFor,
+  });
+
   // ── modeState 权威写回收敛点（评审 P1）────────────────────────────
   // 任何「invoke 返回 / 事件负载」带来的权威 modeState 更新都必须走
   // applyAuthoritativeModeState：内部统一 bump per-session epoch（作废
@@ -1153,45 +1211,25 @@ function pinvouSceneForMessagePos(pos) { return pinvouSharedtauriMain().pinvouSc
     return { mode: d || (boundDraft ? "plan" : "yolo"), multiAgent: false };
   }
 
+  // The mode a chat draft WILL run once a workspace pick binds it (review
+  // #484 round-11 M6): grant-notice surfaces must describe the post-binding
+  // posture — bound drafts align with the code lane's safety posture
+  // (currentDraftModeState's bound arm), so the composer chip and the
+  // pre-grant notice must agree instead of the notice reading the unbound
+  // snapshot while the chip flips to plan.
+  function boundDraftMode() {
+    const d = state.modeDefaults && state.modeDefaults.code;
+    return d || "plan";
+  }
+
   // 事件监听器统一入口:按 payload.session_id 路由同步逻辑;后台变更后补一次 notify 刷新列表。
 function markRemoteTurn(sid, buf, preserveCommittedRevision, cause) { return pinvouSharedtauriMain().markRemoteTurn(sid, buf, preserveCommittedRevision, cause); }
-function onSessionEvent(e, fn) { return pinvouSharedtauriMain().onSessionEvent(e, fn); }
+function onSessionEvent(e, fn, options) { return pinvouSharedtauriMain().onSessionEvent(e, fn, options); }
 function isScheduledRunSession(sid) { return pinvouSharedtauriMain().isScheduledRunSession(sid); }
 
   // Transcript persistence is authoritative in Rust. The UI only persists the
   // presentation-side artifact index and derives the optional auto-title.
-  async function persistMessagesFor(sid) {
-    if (!sid) return;
-    if (isScheduledRunSession(sid)) return;
-    // 代码会话（品悟原生/ACP）不在 list_sessions 里：它不是桥接聊天会话——
-    // 消息由后端 persist_chat_engine_state 持久化、标题由后端自动命名管理。
-    // 跳过产物索引与自动重命名：meta 缺失时 msgs 会错读 active 聊天 state 的
-    // 首条用户消息，把别的会话文本命名到代码会话上。正常聊天会话经
-    // ensureSession 创建后即 refreshHistoryList 入列，!meta 只会命中非桥接会话。
-    const meta = state.sessions.find(function (s) { return s.id === sid; });
-    if (!meta) return;
-    const buf = sid === state.activeSessionId ? null : sessionStates[sid];
-    const msgs = buf ? buf.messages : state.messages;
-    const arts = filterSessionArtifacts(buf ? buf.artifacts : state.artifacts, sid);
-    if (buf) buf.artifacts = arts;
-    else state.artifacts = arts;
-    try {
-      try { await invoke("save_session_artifacts", { id: sid, paths: arts.map(function (a) { return a.path; }) }); } catch { /* disk-write failure must not block session switching */ }
-      if (isDefaultChatTitle(meta.title) || personaPlaceholderTitles[sid]) {
-        const firstUser = msgs.find(function (m) { return m.role === "user"; });
-        // 自动标题复用展示层过滤（与 web 侧一致）：内部信封/子智能体交接不参与
-        // 命名；hideInternalEnvelope=true 同时剥离 turn_meta/system-reminder 元数据
-        // 块，避免 XML 痕迹进 sidebar 标题。
-        const titleText = firstUser ? userMessageDisplayText(firstUser.content || [], true) : "";
-        if (titleText) {
-          const newTitle = titleText.slice(0, 20);
-          await invoke("rename_session", { id: sid, title: newTitle });
-          meta.title = newTitle;
-          delete personaPlaceholderTitles[sid]; // 已被对话内容命名,卸下占位标记
-        }
-      }
-    } catch (e) { console.warn("persist failed", e); }
-  }
+  async function persistMessagesFor(sid) { return pinvouSharedtauriMain().persistMessagesFor(sid); }
 
 function planCardHydrationKey(item) { return pinvouSharedtauriMain().planCardHydrationKey(item); }
 
@@ -1319,16 +1357,7 @@ function planCardHydrationKey(item) { return pinvouSharedtauriMain().planCardHyd
               if (!resolvedPlanTickets[key]) resolvedPlanTickets[key] = [];
               resolvedPlanTickets[key].push(String(item.planId));
             });
-            const liveChatItems = rawLiveChatItems.filter(function (item) {
-              if (!item || item.type === "user") return false;
-              if (item.type === "assistant") return item.interruptedDisplayOnly === true;
-              if (item.turnErrorNotice && !item.legacyConversationOnly) return false;
-              // 后台 Shell 在 chat:done 后仍继续运行；持久化 transcript 只有工具结果文本，
-              // 没有 taskId/background/liveOutput，权威重载时必须保留实时卡片并按 toolId 合并。
-              if (item.type === "tool") return item.background === true && item.state === "running";
-              if (item.type === "plan_card") return false;
-              return true;
-            });
+            const liveChatItems = rawLiveChatItems.filter(function (item) { return pinvouSharedtauriMain().liveChatItemKeptForHydration(item); });
             state.messages = saved.messages;
             state.artifacts = filterSessionArtifacts(
               mergeHydratedArtifacts(saved.artifacts, state.artifacts),
@@ -1417,29 +1446,9 @@ function planCardHydrationKey(item) { return pinvouSharedtauriMain().planCardHyd
   // ── Pub/Sub ──────────────────────────────────────────────────────
   // let (not const): unsubscribe removes a subscriber by replacing the whole array.
   let subscribers = [];
-  const STATE_SLICE_FIELDS = {
-    platform: ["appVersion", "backendOnline", "platformCapabilities"],
-    sessions: ["sessions", "archivedSessions", "activeSessionId", "sessionBusy", "draftEpoch", "draftWorkspacePath"],
-    chat: ["activeSkill", "artifacts", "artifactChange", "attachments", "busy", "chatItems", "composerDraft", "composerPrefill", "messages", "modeState", "planSnapshot", "queued", "thinking", "tokens", "turnDirtyArtifacts", "turnPresentedArtifacts", "turnTimeline"],
-    voice: ["voiceInput", "voiceAsrSetup"],
-    knowledge: ["kbModelSetup", "mountedCollection", "mountedCollections", "mountedRemoteCollections", "mountedCollectionsRevision"],
-    scheduled: ["scheduledRunContext", "scheduledTaskAutoOpenId", "scheduledTaskBusyAction", "scheduledTaskCreationSessionId", "scheduledTaskDetail", "scheduledTaskError", "scheduledTaskErrorKind", "scheduledTaskLoading", "scheduledTaskPendingGuide", "scheduledTaskRecentRuns", "scheduledTaskRuns", "scheduledTasks", "scheduledTaskSelectionGeneration", "selectedScheduledTaskId"],
-    monitor: ["monitor", "monitorError"],
-    settings: ["settings", "selectedPet"],
-    models: ["activeModelId", "currentSessionModelId", "effectiveModelConfig", "savedModels"],
-    vllm: ["vllmBootstrapDone", "vllmBootstrapError", "vllmBootstrapping", "vllmSetup", "vllmSetupAttempt", "vllmSetupDismissed", "vllmSetupPhase"],
-    interaction: ["pinvouModal", "pinvouReviews", "pinvouSummoning", "superPermEnabled"],
-    computerUse: ["computerUse"],
-    personas: ["activePersona", "personaEvents", "personaPool"],
-    memory: ["memory"],
-    remoteControl: ["webAccess"],
-    updater: ["updateCancelling", "updateCheckError", "updateChecking", "updateDownloading", "updateError", "updateInfo", "updateProgress", "updateReady"],
-    dependencies: ["deps", "depsChecking", "depsInstallError", "depsInstallProgress", "depsInstalling"],
-    // Registered by the projects feature (bridge/projects.js). Must stay in
-    // sync with APP_BRIDGE_STATE_DOMAINS in main.jsx — locked by
-    // tests/bridge_state_domains.test.mjs.
-    projects: ["projectsList"],
-  };
+  // FE14 wave 5：切片字段注册表统一在 shared/bridge-shared-helpers.js（两 lane 一份）；
+  // 与 main.jsx 的 APP_BRIDGE_STATE_DOMAINS 的同步由 tests/bridge_state_domains.test.mjs 锁定。
+  const STATE_SLICE_FIELDS = window.PinvouBridgeShared.STATE_SLICE_FIELDS;
   function snapshotStateSlice(domain) {
     const fields = STATE_SLICE_FIELDS[domain];
     if (!fields) throw new Error("Unknown Tauri bridge state slice: " + domain);
@@ -1463,75 +1472,7 @@ function planCardHydrationKey(item) { return pinvouSharedtauriMain().planCardHyd
   // and allocate only changed paths. Long transcripts therefore stay shared
   // between snapshots while an in-place streaming item mutation still produces
   // a stable new item for subscribers. get/getMany retain their deep-copy API.
-function defineSubscriptionStateProperty(target, key, value) { return pinvouSharedtauriMain().defineSubscriptionStateProperty(target, key, value); }
-function copySubscriptionStateObject(source) { return pinvouSharedtauriMain().copySubscriptionStateObject(source); }
-  // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy bridge; refactor tracked separately
-  function subscriptionStateValue(value, previous, ancestors) {
-    const valueType = typeof value;
-    if (!value || valueType !== "object") {
-      if (["function", "symbol", "bigint"].includes(valueType)) {
-        throw new TypeError("Subscription state only supports JSON-like scalar values");
-      }
-      return value;
-    }
-    const isArray = Array.isArray(value);
-    if (!isArray) {
-      const prototype = Object.getPrototypeOf(value);
-      const isPlainObject = prototype === null || (
-        Object.getPrototypeOf(prototype) === null &&
-        // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 floor; Object.hasOwn is unavailable and this call is already the safe form
-        Object.prototype.hasOwnProperty.call(prototype, "constructor") &&
-        prototype.constructor && prototype.constructor.name === "Object"
-      );
-      if (!isPlainObject) {
-        throw new TypeError("Subscription state only supports arrays and plain objects");
-      }
-    }
-    ancestors = ancestors || new WeakSet();
-    if (ancestors.has(value)) throw new TypeError("Subscription state must not contain cycles");
-    ancestors.add(value);
-    try {
-      if (isArray) {
-        const previousArray = Array.isArray(previous) ? previous : null;
-        if (!previousArray) {
-          return Object.freeze(value.map(function (item) {
-            return subscriptionStateValue(item, undefined, ancestors);
-          }));
-        }
-        let nextArray = value.length === previousArray.length ? null : previousArray.slice(0, value.length);
-        for (let arrayIndex = 0; arrayIndex < value.length; arrayIndex++) {
-          const nextItem = subscriptionStateValue(value[arrayIndex], previousArray[arrayIndex], ancestors);
-          if (!Object.is(nextItem, previousArray[arrayIndex])) {
-            if (!nextArray) nextArray = [...previousArray];
-            nextArray[arrayIndex] = nextItem;
-          }
-        }
-        return nextArray ? Object.freeze(nextArray) : previousArray;
-      }
-
-      const keys = Object.keys(value);
-      const previousObject = previous && typeof previous === "object" && !Array.isArray(previous)
-        ? previous
-        : null;
-      const previousKeys = previousObject ? Object.keys(previousObject) : [];
-      const sameShape = !!previousObject && keys.length === previousKeys.length && keys.every(function (key) {
-        // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 floor; Object.hasOwn is unavailable and this call is already the safe form
-        return Object.prototype.hasOwnProperty.call(previousObject, key);
-      });
-      let nextObject = sameShape ? null : {};
-      for (let objectIndex = 0; objectIndex < keys.length; objectIndex++) {
-        const key = keys[objectIndex];
-        const nextValue = subscriptionStateValue(value[key], previousObject && previousObject[key], ancestors);
-        if (!sameShape || !Object.is(nextValue, previousObject[key])) {
-          if (!nextObject) nextObject = copySubscriptionStateObject(previousObject);
-          defineSubscriptionStateProperty(nextObject, key, nextValue);
-        }
-      }
-      return nextObject ? Object.freeze(nextObject) : previousObject;
-    } finally {
-      ancestors.delete(value);
-    }
-  }
+function subscriptionStateValue(value, previous, ancestors) { return pinvouSharedtauriMain().subscriptionStateValue(value, previous, ancestors); }
   let subscriptionSliceRevision = 0;
   const subscriptionSliceCache = Object.create(null);
   function subscriptionStateSlice(domain) {
@@ -1547,6 +1488,14 @@ function copySubscriptionStateObject(source) { return pinvouSharedtauriMain().co
     subscriptionSliceCache[domain] = { revision: subscriptionSliceRevision, snapshot };
     return snapshot;
   }
+  // Multi-domain reads go through the same per-domain slice cache as
+  // single-domain reads; the combined object is frozen fresh per call. This
+  // function runs once per subscription (the warm-up below) — the
+  // per-notification snapshot is the closure's own lastSlices/lastResult
+  // identity cache, so no per-call memoization belongs here. (A keyed
+  // multi-domain cache stood here briefly and was removed: it is cold-path
+  // code, and the identity contract it pinned is already enforced by the
+  // closure and pinned in tauri_bridge_state_identity.test.mjs.)
   function subscriptionStateSlices(domains) {
     if (!Array.isArray(domains) || domains.length === 0) {
       throw new Error("Tauri bridge state.subscribeMany requires at least one domain");
@@ -1564,8 +1513,15 @@ function copySubscriptionStateObject(source) { return pinvouSharedtauriMain().co
 
   let notificationQueue = [];
   let notificationDispatching = false;
+  // React subscribes before lifecycle.init() finishes. The independent startup
+  // loaders therefore used to expose a succession of partial snapshots and
+  // re-render the root once per completed IPC. Keep their state ownership and
+  // parallelism, but publish the initialized state as one coherent revision.
+  let startupNotificationBatching = false;
+  let refreshActiveStreamRender = null;
   function notify() {
-    if (suppressNotify) return;
+    if (suppressNotify || startupNotificationBatching) return;
+    if (refreshActiveStreamRender) refreshActiveStreamRender();
     // 会话列表「工作中」指示:active 取活动工作集 state.busy,其余取各自 buffer.busy
     state.sessionBusy = {};
     for (const id in sessionStates) state.sessionBusy[id] = !!sessionStates[id].busy;
@@ -1607,7 +1563,33 @@ function copySubscriptionStateObject(source) { return pinvouSharedtauriMain().co
   }
   function subscribeStateSlices(domains, fn) {
     subscriptionStateSlices(domains);
-    return subscribe(function () { return subscriptionStateSlices(domains); }, fn);
+    // Re-read every domain slice on each round: subscriptionStateValue's
+    // structural comparison guarantees slice identity (same content <=> same
+    // reference), so the combined object only needs rebuilding when one of the
+    // subscribed slices changes identity. Publications for unrelated domains
+    // reuse the previous combined object so React's Object.is check skips the
+    // render; the callback still fires on every notification, matching the
+    // single-domain subscription contract. Mirrors the web domain adapter's
+    // stablePick semantics.
+    let lastSlices = [];
+    let lastResult = null;
+    return subscribe(function () {
+      let changed = !lastResult;
+      const slices = [];
+      for (let i = 0; i < domains.length; i++) {
+        slices[i] = subscriptionStateSlice(domains[i]);
+        if (slices[i] !== lastSlices[i]) changed = true;
+      }
+      if (changed) {
+        const result = {};
+        for (let j = 0; j < slices.length; j++) {
+          Object.assign(result, slices[j]);
+        }
+        lastSlices = slices;
+        lastResult = Object.freeze(result);
+      }
+      return lastResult;
+    }, fn);
   }
 
   const scheduledFeature = installBridgeFeature("scheduled", { state, notify, invoke, bt, runSyncOnSession, addSystemItem, rememberScheduledRunOwner, isScheduledRunTerminal, purgeSessionBuffer, createNewSession, prefillComposer, sessionStates });
@@ -1635,27 +1617,19 @@ function copySubscriptionStateObject(source) { return pinvouSharedtauriMain().co
   const PLAN_TOOLS = new Set(["update_plan", "checklist_write", "todo_write"]);
 
   // tool_result.content 可能是 string 或 Anthropic content blocks 数组，归一成纯文本。
-function toolResultText(content) { return pinvouSharedtauriMain().toolResultText(content); }
 
 
 
 function toolResultDisplayContent(content) { return pinvouSharedtauriMain().toolResultDisplayContent(content); }
 
   // plan 类工具结果格式："...updated:\n{json}"——切第一个换行后 parse（与 engine.rs 一致）。
-function parsePlanSnapshot(content) { return pinvouSharedtauriMain().parsePlanSnapshot(content); }
 
   // request_user_input 结果是纯 JSON {answers:[{id,label,value}]}（turn_loop.rs ToolResult::json）。
   // 按 question.id 匹配，还原成 UserInputCard 的 answers 数组（顺序对齐 questions）。
   // multi_select 多选保留全部同 id 答案、不塌缩（与 code-native-lane parseNativeUserAnswers 对齐）。
-function parseUserAnswers(content, questions) { return pinvouSharedtauriMain().parseUserAnswers(content, questions); }
 
   // careful hook 拦截结果(shell.rs BLOCKED 固定格式)→ 反解出 careful_blocked 卡所需 metadata。
   // metadata 不进持久化 messages,session 重载只能从 tool_result 文本识别,否则 🛑 红卡重启即丢。
-function parseCarefulBlocked(text) { return pinvouSharedtauriMain().parseCarefulBlocked(text); }
-
-function userMessageInputProvenance(blocks) { return pinvouSharedtauriMain().userMessageInputProvenance(blocks); }
-
-function isInternalUserMessageProvenance(provenance) { return pinvouSharedtauriMain().isInternalUserMessageProvenance(provenance); }
 
   function isInternalRuntimeEnvelopeText(value) {
     return window.PinvouBridgeMessages.isInternalRuntimeUserMessage(value);
@@ -1665,24 +1639,7 @@ function isInternalUserMessageProvenance(provenance) { return pinvouSharedtauriM
   // 子智能体完成交接同理：结果必须留在父模型上下文，但不能冒充用户消息上屏。
   // 原始 blocks 必须保留给模型续聊；展示层只隐藏该内部消息，避免伪装成用户气泡/新 Turn。
   // 定时会话还会过滤送模 envelope，只投影真实任务正文。
-  function userMessageDisplayText(blocks, hideInternalEnvelope) {
-    const textParts = (Array.isArray(blocks) ? blocks : [])
-      .filter(function (block) { return block && block.type === "text"; })
-      .map(function (block) { return String(block.text || ""); });
-    if (textParts.some(isInternalRuntimeEnvelopeText)) return "";
-    if (isInternalUserMessageProvenance(userMessageInputProvenance(blocks))) return "";
-    if (!hideInternalEnvelope) return textParts.join("");
-
-    return textParts.filter(function (text) {
-      const trimmed = text.trim();
-      return !(
-        (trimmed.indexOf("<turn_meta>") === 0 && trimmed.endsWith("</turn_meta>")) ||
-        trimmed === "<turn_meta_unchanged />"
-      );
-    }).map(function (text) {
-      return text.replace(/^\s*<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "");
-    }).join("");
-  }
+  function userMessageDisplayText(blocks, hideInternalEnvelope) { return pinvouSharedtauriMain().userMessageDisplayText(blocks, hideInternalEnvelope); }
 
   // ── Rerender from messages (session restore) ─────────────────────
   // opts.keepLiveToolMeta: passed when hydrating a live session
@@ -1690,7 +1647,6 @@ function isInternalUserMessageProvenance(provenance) { return pinvouSharedtauriM
   // in-flight tools (tool_use not yet in messages), and clearing it would
   // leave the later chat:tool_end without its meta (stuck selection
   // card / degraded artifact card).
-  // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy bridge; refactor tracked separately
   function rerenderFromMessages(opts) {let pinvouSharedtauriMainN99856Cache = null;
 function pinvouSharedtauriMainN99856() {
   if (!pinvouSharedtauriMainN99856Cache) pinvouSharedtauriMainN99856Cache = window.PinvouBridgeShared.create("tauriMain:99856", { pe, addChatItem, bt });
@@ -1698,277 +1654,74 @@ function pinvouSharedtauriMainN99856() {
 }
 
 
-    state.chatItems = [];
-    itemIdSeq = 0;
-    // Replay rebuilds toolMeta only for historical tool_uses that still have a
-    // matching tool_result to backfill (write/patch's large args otherwise
-    // duplicate the whole transcript inside the 32-entry all-session LRU).
-    // Durable replay clears first (when not live hydrating), reclaiming only
-    // orphan entries left by interrupted turns (the live event path itself
-    // stays insert/delete balanced); entries are deleted again right after
-    // their tool_result backfill lookup — nothing reads them afterwards.
-    if (!(opts && opts.keepLiveToolMeta)) toolMeta = {};
     // 卡牌事件按 pos 插回原位(pos=事件发生时的 messages 数)。让重载历史不割裂。
     const pe = Array.isArray(state.personaEvents) ? state.personaEvents : [];
 function emitPersonaAt(atOrAfter, isTail) { return pinvouSharedtauriMainN99856().emitPersonaAt(atOrAfter, isTail); }
-    // 预扫 tool_result：tool_use 在 assistant 消息、result 在后续 user 消息，需提前建映射
-    // 才能在还原选择卡/方案卡时拿到结果（选项/快照）。
-    const resultById = {};
-    for (let ri = 0; ri < state.messages.length; ri++) {
-      const rc = state.messages[ri].content;
-      if (!Array.isArray(rc)) continue;
-      for (let rj = 0; rj < rc.length; rj++) {
-        if (rc[rj].type === "tool_result") {
-          resultById[rc[rj].tool_use_id] = { content: rc[rj].content, is_error: !!rc[rj].is_error };
+    // 重放主体在 shared/bridge-shared-helpers.js 的 rerenderFromMessagesCore；
+    // 以下为 desktop lane 的差异 hooks（steer 标记 / toolMeta 重建-清理策略 /
+    // careful_blocked 卡形状 / 未决工具卡终态 sweep）。
+    return pinvouSharedtauriMain().rerenderFromMessagesCore({
+      itemIdSeq: { get value() { return itemIdSeq; }, set value(v) { itemIdSeq = v; } },
+      toolMeta: { get value() { return toolMeta; }, set value(v) { toolMeta = v; } },
+      emitPersonaAt,
+      userMessageDisplayText,
+      updateToolItem,
+      PLAN_TOOLS,
+      renderMarkdown,
+      // A mid-turn steer injection is no admission (no timing record):
+      // the conversation projection must not let it consume a lifecycle
+      // record (phantom "interrupted"). New sessions mark it via the
+      // steered-messages sidecar (pos + text verified); the envelope
+      // check stays as the fallback for pre-alignment persisted sessions.
+      markSteered: function (uitem2, mi, utext, blocks) {
+        if (isSteeredMessagePos(mi, utext) || (Array.isArray(blocks) ? blocks : []).some(function (b) {
+          const t = String(b && b.type === "text" ? b.text : "").trim();
+          return (t.indexOf("<turn_meta>") === 0 && t.endsWith("</turn_meta>")) || t === "<turn_meta_unchanged />";
+        })) uitem2.steeredMidTurn = true;
+      },
+      carefulBlockedItem: function (c, tm, blockedMd) {
+        return { type: "careful_blocked", args: tm.args, metadata: blockedMd, time: "" };
+      },
+      // Delete after backfill: the meta serves exactly this one
+      // tool_result restoration (a late duplicate tool_end exits early
+      // via toolCallAlreadyFinished); leftovers would keep historical
+      // args resident in the session buffer.
+      afterToolResultBackfill: function (toolUseId) { delete toolMeta[toolUseId]; },
+      // Rebuild meta only for historical tool_use entries that still
+      // have a tool_result pending backfill (the backfill loop above
+      // deletes them right after consuming); leftovers from interrupted
+      // turns with no result have no consumer and are no longer inserted.
+      // live hydration exception (keepLiveToolMeta): the tool_end event
+      // of an in-flight tool still needs the meta.
+      rebuildToolMeta: function (b, resultById, coreOpts) {
+        if (resultById[b.id] || (coreOpts && coreOpts.keepLiveToolMeta)) {
+          toolMeta[b.id] = { name: b.name, args: b.input };
         }
-      }
-    }
-    // 预扫:每个产物最后一次被 write/append/edit 改的 tool_use id → rerender 只在最后一次
-    // 续一张成品卡(与实时 chat:done 的一张对齐,不刷一堆)。
-    const lastDirtyArtifactId = {};
-    const writtenArtifacts = {}; // write/append 写过的 path=产物;没 present 时兜底补首卡
-    const presentedArtifacts = {}; // 整篇 present_artifact 过的 path → 别再兜底补首卡(present 会出卡,否则重复)
-    const presentedArtifactNames = {}; // path 可能一边相对一边绝对,basename 去重防重复卡
-    for (let di = 0; di < state.messages.length; di++) {
-      const dc = state.messages[di].content;
-      if (!Array.isArray(dc)) continue;
-      for (let dj = 0; dj < dc.length; dj++) {
-        const db = dc[dj];
-        const dbMutation = db.type === "tool_use" && fileMutationAction(db.name, db.input);
-        if (dbMutation) {
-          extractArtifactPaths(db.input).forEach(function (dap) {
-            lastDirtyArtifactId[dap] = db.id;
-            // 与实时 tool_end 同一门控:tmp/ 中间文件、非成品扩展名不记账,
-            // 否则实时不进面板的文件切 session 重放后反而兜底冒出成品卡。
-            if (dbMutation !== "edit" && isDeliverable(dap)) writtenArtifacts[dap] = true;
-          });
-        } else if (db.type === "tool_use" && isPresentArtifactTool(db.name)) {
-          const pap = extractArtifactPath(db.input);
-          const pres = resultById[db.id];
-          const pp = presentArtifactAbsPath(pres && pres.content, pap);
-          if (pp) {
-            presentedArtifacts[pp] = true;
-            presentedArtifactNames[basename(pp)] = true;
-          }
-        } else if (db.type === "tool_use" && shouldUseToolOutputAsArtifact(db.name)) {
-          const gres = resultById[db.id];
-          if (!(gres && gres.is_error)) {
-            const gp = artifactPathFromToolOutput(gres && gres.content);
-            if (gp && isDeliverable(gp)) {
-              lastDirtyArtifactId[gp] = db.id;
-              writtenArtifacts[gp] = true;
-            }
-          }
-        }
-      }
-    }
-    for (let mi = 0; mi < state.messages.length; mi++) {
-      emitPersonaAt(mi, false); // 该消息之前发生的卡牌事件先插
-      const m = state.messages[mi];
-      const blocks = Array.isArray(m.content) ? m.content : [];
-      if (m.role === "user") {
-        // Always strip exact internal envelopes: sessions saved before the
-        // persistence alignment still carry the engine-baked <turn_meta>
-        // block on mid-turn steered messages, and without the filter the
-        // hydrated bubble rendered the raw envelope after a restart.
-        const utext = userMessageDisplayText(blocks, true);
-        if (utext) {
-          // pinvouTransfer 是展示层标记、不在 messages → rerender 从转交固定措辞还原品/悟样式
-          const uitem2 = { type: "user", text: utext, time: "", messageIndex: mi };
-          // A mid-turn steer injection is no admission (no timing record):
-          // the conversation projection must not let it consume a lifecycle
-          // record (phantom "interrupted"). New sessions mark it via the
-          // steered-messages sidecar (pos + text verified); the envelope
-          // check stays as the fallback for pre-alignment persisted sessions.
-          if (isSteeredMessagePos(mi, utext) || (Array.isArray(blocks) ? blocks : []).some(function (b) {
-            const t = String(b && b.type === "text" ? b.text : "").trim();
-            return (t.indexOf("<turn_meta>") === 0 && t.endsWith("</turn_meta>")) || t === "<turn_meta_unchanged />";
-          })) uitem2.steeredMidTurn = true;
-          const scene = pinvouSceneForMessagePos(mi);
-          if (scene) uitem2.pinvouScene = scene;
-          if (textMatchesBtKey(utext, "reviewFillHeader")) uitem2.pinvouTransfer = "悟";
-          else if (textMatchesBtKey(utext, "reviewFixHeader") || textMatchesBtKey(utext, "reviewAdoptHeader") || textMatchesBtKey(utext, "reviewAskHeader")) uitem2.pinvouTransfer = "品";
-          addChatItem(uitem2);
-        }
-        // tool_result（只回填普通工具卡；选择卡/方案卡的结果已在 tool_use 处还原）
-        for (let ci = 0; ci < blocks.length; ci++) {
-          const c = blocks[ci];
-          if (c.type !== "tool_result") continue;
-          const tm = toolMeta[c.tool_use_id];
-          if (tm) {
-            // careful hook 拦截 → 还原 🛑 红卡(实时由 tool_end metadata 插,重载从文本反解)
-            const blockedMd = parseCarefulBlocked(toolResultText(c.content));
-            if (blockedMd) {
-              updateToolItem(c.tool_use_id, toolResultDisplayContent(c.content), false); // 被拦=失败态,与实时一致
-              addChatItem({ type: "careful_blocked", args: tm.args, metadata: blockedMd, time: "" });
-            } else {
-              // load_skill 同样脱敏：重载历史时也不还原 SKILL.md 全文，展开只见占位。
-              const contentForCard = (tm.name === "load_skill")
-                ? bt("skillContentHidden")
-                : toolResultDisplayContent(c.content);
-              updateToolItem(c.tool_use_id, contentForCard, !c.is_error);
-            }
-          }
-          // Delete after backfill: the meta serves exactly this one
-          // tool_result restoration (a late duplicate tool_end exits early
-          // via toolCallAlreadyFinished); leftovers would keep historical
-          // args resident in the session buffer.
-          delete toolMeta[c.tool_use_id];
-        }
-        continue;
-      }
-      if (m.role !== "assistant") continue;
-      let textBuf = "";
-      let planSnap = null, todosSnap = null, sawPlanTool = false;
-      for (let bi = 0; bi < blocks.length; bi++) {
-        const b = blocks[bi];
-        if (b.type === "text") {
-          textBuf += b.text;
-        } else if (b.type === "thinking") {
-          if (textBuf) {
-            addChatItem({ type: "assistant", text: textBuf, html: renderMarkdown(textBuf), time: "", streaming: false });
-            textBuf = "";
-          }
-          const reasoningText = String(b.thinking || b.text || "");
-          if (reasoningText) {
-            addChatItem({
-              type: "reasoning", text: reasoningText, time: "", streaming: false,
-              startedAt: null, completedAt: null,
-            });
-          }
-        } else if (b.type === "tool_use") {
-          if (textBuf) {
-            addChatItem({ type: "assistant", text: textBuf, html: renderMarkdown(textBuf), time: "", streaming: false });
-            textBuf = "";
-          }
-          // Rebuild meta only for historical tool_use entries that still
-          // have a tool_result pending backfill (the backfill loop above
-          // deletes them right after consuming); leftovers from interrupted
-          // turns with no result have no consumer and are no longer inserted.
-          // live hydration exception (keepLiveToolMeta): the tool_end event
-          // of an in-flight tool still needs the meta.
-          if (resultById[b.id] || (opts && opts.keepLiveToolMeta)) {
-            toolMeta[b.id] = { name: b.name, args: b.input };
-          }
-          // request_user_input → 还原只读选择卡（问题来自 input，选项高亮来自 result）
-          if (b.name === "request_user_input") {
-            const qs = (b.input && b.input.questions) || [];
-            if (Array.isArray(qs) && qs.length) {
-              const res = resultById[b.id];
-              // 快照可能落在 turn 进行中（底座每次落盘）：tool_use 尚无对应
-              // tool_result，不能按历史恢复为 submitted。跳过，等
-              // chat:user_input_required 事件渲染可交互的 active 卡。
-              if (!res) continue;
-              addChatItem({
-                type: "user_input", toolCallId: b.id, questions: qs,
-                resolved: true, cardState: res.is_error ? "cancelled" : "submitted",
-                restoredAnswers: parseUserAnswers(res.content, qs), time: "",
-              });
-            }
-            continue;
-          }
-          // present_artifact → 还原成品卡(切会话不丢)。仅当工具成功时还原:
-          // 失败的调用回退成普通工具卡(下方 default addChatItem)。
-          if (isPresentArtifactTool(b.name)) {
-            const pares = resultById[b.id];
-            if (!(pares && pares.is_error)) {
-              const rpp = presentArtifactAbsPath(pares && pares.content, b.input && b.input.path);
-              const restoredCard = {
-                type: "artifact_card",
-                path: rpp,
-                title: (b.input && b.input.title) || "",
-                description: (b.input && b.input.description) || "",
-                time: "",
-                sessionId: state.activeSessionId,
-              };
-              if (!updatePresentedArtifact(restoredCard)) addChatItem(restoredCard);
-              continue;
-            }
-          }
-          // update_plan / checklist_write / todo_write → 收集快照，本条消息末尾还原方案卡
-          if (PLAN_TOOLS.has(b.name)) {
-            const snap = parsePlanSnapshot(resultById[b.id] && resultById[b.id].content);
-            if (snap) {
-              if (b.name === "update_plan") planSnap = snap; else todosSnap = snap;
-            }
-            sawPlanTool = true;
-            continue;
-          }
-          addChatItem({ type: "tool", toolId: b.id, name: b.name, args: b.input, output: null, success: null, state: "pending" });
-          if (shouldUseToolOutputAsArtifact(b.name)) {
-            const gres2 = resultById[b.id];
-            const gap = artifactPathFromToolOutput(gres2 && gres2.content);
-            if (!(gres2 && gres2.is_error) && gap && isDeliverable(gap) && lastDirtyArtifactId[gap] === b.id && !presentedArtifacts[gap] && !presentedArtifactNames[basename(gap)]) {
-              const gprev = findPresentedArtifact(gap);
-              if (gprev) {
-                const gcard = {
-                  type: "artifact_card", path: gprev.path, title: gprev.title,
-                  description: gprev.description, time: "", sessionId: state.activeSessionId,
-                };
-                if (!updatePresentedArtifact(gcard)) addChatItem(gcard);
-              } else if (writtenArtifacts[gap]) {
-                addChatItem({ type: "artifact_card", path: gap, title: basename(gap), description: "", time: "", sessionId: state.activeSessionId });
-              }
-            }
-          }
-          // 还原"自动续卡":File.write/File.edit 改的文件之前 present 过 → 续一张
-          // 成品卡(与实时 tool_end 的自动续逻辑对齐,切会话不丢)。present 的卡按
-          // 顺序在前(必须先 present 才进集合),此处 findPresentedArtifact 能命中。
-          if (fileMutationAction(b.name, b.input)) {
-            const wres = resultById[b.id];
-            extractArtifactPaths(b.input).forEach(function (wap) {
-              // 去重:同产物只在最后一次修改处补一张卡(与实时对齐)。
-              if ((wres && wres.is_error) || lastDirtyArtifactId[wap] !== b.id) return;
-              const wprev = findPresentedArtifact(wap);
-              if (wprev) {
-                const wcard = {
-                  type: "artifact_card", path: wprev.path, title: wprev.title,
-                  description: wprev.description, time: "", sessionId: state.activeSessionId,
-                };
-                if (!updatePresentedArtifact(wcard)) addChatItem(wcard);
-              } else if (writtenArtifacts[wap] && !presentedArtifacts[wap] && !presentedArtifactNames[basename(wap)]) {
-                // AI 写了产物但全程没 present_artifact → 兜底补首卡(与实时 chat:done 对齐)
-                addChatItem({ type: "artifact_card", path: wap, title: basename(wap), description: "", time: "", sessionId: state.activeSessionId });
-              }
-            });
+      },
+      // Replay-time terminal ratchet (parity with the codex native lane): a
+      // tool_use that never got a matching tool_result in the persisted
+      // transcript is an interrupted in-flight call — it can never complete
+      // after reload, so settle it as failed instead of leaving an eternal
+      // "running" card (a live spawn row would then pulse forever through the
+      // swarm aggregation). Skipped while the session is mid-turn: pending
+      // cards then belong to the live turn and are settled by its own events;
+      // background shells keep running across turns and are excluded; so are
+      // synthetic shell-snapshot cards ("shell-task:" ids never pair with a
+      // tool_use id, and their job may still be running — the terminal poll
+      // settles them itself from the snapshot).
+      sweepUnsettledTools: function (resultById) {
+        if (!state.busy) {
+          for (const item of state.chatItems) {
+            const unsettled = item && item.type === "tool" && item.toolId && item.background !== true
+              && item.shellSnapshot !== true
+              && (item.state === "pending" || item.state === "running") && !resultById[item.toolId];
+            if (!unsettled) continue;
+            item.success = false;
+            item.state = "failed";
           }
         }
-      }
-      if (textBuf) {
-        addChatItem({ type: "assistant", text: textBuf, html: renderMarkdown(textBuf), time: "", streaming: false });
-      }
-      // 本条 assistant 消息用过 plan 工具 → 还原一张只读历史方案卡
-      if (sawPlanTool && (planSnap || todosSnap)) {
-        const snaps = { plan: planSnap, todos: todosSnap };
-        addChatItem({
-          type: "plan_card", plan: planSnap, todos: todosSnap,
-          planMarkdown: composePlanMarkdown(snaps),
-          cardState: "frozen", resolved: true, statusLabel: bt("planHistorical"), time: "",
-        });
-      }
-    }
-    // Replay-time terminal ratchet (parity with the codex native lane): a
-    // tool_use that never got a matching tool_result in the persisted
-    // transcript is an interrupted in-flight call — it can never complete
-    // after reload, so settle it as failed instead of leaving an eternal
-    // "running" card (a live spawn row would then pulse forever through the
-    // swarm aggregation). Skipped while the session is mid-turn: pending
-    // cards then belong to the live turn and are settled by its own events;
-    // background shells keep running across turns and are excluded; so are
-    // synthetic shell-snapshot cards ("shell-task:" ids never pair with a
-    // tool_use id, and their job may still be running — the terminal poll
-    // settles them itself from the snapshot).
-    if (!state.busy) {
-      for (const item of state.chatItems) {
-        const unsettled = item && item.type === "tool" && item.toolId && item.background !== true
-          && item.shellSnapshot !== true
-          && (item.state === "pending" || item.state === "running") && !resultById[item.toolId];
-        if (!unsettled) continue;
-        item.success = false;
-        item.state = "failed";
-      }
-    }
-    emitPersonaAt(state.messages.length, true); // 最后一条消息之后发生的卡牌事件(末尾加持/卸下)
+      },
+    }, opts);
   }
 
   const terminalFeature = installBridgeFeature("terminal", { state, notify, invoke, bt, runSyncOnSession, addChatItem });
@@ -1990,19 +1743,28 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
 
   async function cancelShellTask(sessionId, taskId) {
     if (!sessionId || !taskId) throw new Error("Missing shell task identity");
-    return invoke("cancel_shell_task", { sessionId, taskId });
+    try {
+      await invoke("cancel_shell_task", { sessionId, taskId });
+    } finally {
+      scheduleShellPoll(sessionId, true);
+    }
   }
 
   const chatEventsFeature = installBridgeFeature("chat-events", {
     state, listen, invoke, turnUsageDirty,
     sessionStates, renderMarkdown, bt,
     notify, onSessionEvent, runSyncOnSession,
+    // Live suppression probe for scheduleStreamNotify: inside a background
+    // working set the immediate first-delta notify is suppressed, so the
+    // stream scheduler must fall through to its bounded frame instead.
+    isNotifySuppressed: function () { return suppressNotify; },
     recordAuthoritySyncDiagnostic,
     authoritySyncBufferSnapshot,
     // 与历史重载路径共用同一信封判定（userMessageDisplayText 的 isInternalRuntimeEnvelopeText），
     // 避免 live/restore 两处守卫实现漂移。
     isInternalRuntimeUserMessage: isInternalRuntimeEnvelopeText,
     applyAuthoritativeModeState,
+    autoCreateScheduledTaskDraft: function (...args) { return autoCreateScheduledTaskDraft(...args); },
     addChatItem, addSystemItem,
     addAuthoritySyncNotice, timeStr,
     toolCallAlreadyStarted,
@@ -2070,6 +1832,7 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     get toolMeta() { return toolMeta; },
     set toolMeta(value) { toolMeta = value; },
   });
+  refreshActiveStreamRender = chatEventsFeature.refreshActiveStreamRender;
 
   const monitorFeature = installBridgeFeature("monitor", { state, notify, invoke, bt, safeConsoleInfo, sessionStates });
   const startMonitorPolling = monitorFeature.startMonitorPolling;
@@ -2086,10 +1849,6 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const saveSearchSettingsAndRestart = settingsFeature.saveSearchSettingsAndRestart;
   const submitFeedback = settingsFeature.submitFeedback;
   const discoverLocalVllm = settingsFeature.discoverLocalVllm;
-  const detectLocalVllmSetup = settingsFeature.detectLocalVllmSetup;
-  const bootstrapLocalVllm = settingsFeature.bootstrapLocalVllm;
-  const dismissVllmSetup = settingsFeature.dismissVllmSetup;
-  const declineVllmSetup = settingsFeature.declineVllmSetup;
   const loadModels = settingsFeature.loadModels; // startup loader (init); not on the facade
   const saveModel = settingsFeature.saveModel;
   const revealModelApiKey = settingsFeature.revealModelApiKey;
@@ -2101,6 +1860,13 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const getImageInputCapability = settingsFeature.getImageInputCapability;
   const testImageInputCapability = settingsFeature.testImageInputCapability;
   const probeLocalServerKind = settingsFeature.probeLocalServerKind;
+  // Dedicated global-shortcut command (update_settings is never used);
+  // Rust exclusively owns persistence and registration.
+  const setGlobalShortcutConfig = settingsFeature.setGlobalShortcutConfig;
+  // Builtin feature switches (contract hook point): desktop Rust command
+  // channel only — the web lane has no such backend.
+  const listBuiltinFeatures = settingsFeature.listBuiltinFeatures;
+  const setBuiltinFeatureEnabled = settingsFeature.setBuiltinFeatureEnabled;
 
   const interactionFeature = installBridgeFeature("interaction", {
     state, invoke, notify, bt,
@@ -2155,7 +1921,7 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const cancelUserInput = interactionFeature.cancelUserInput;
   const editLastTurn = interactionFeature.editLastTurn;
 
-  const memoryFeature = installBridgeFeature("memory", { state, notify, invoke, bt, addSystemItem, runSyncOnSession, patchItemById, patchItemByIdFor, runOnSession, addChatItem, timeStr });
+  const memoryFeature = installBridgeFeature("memory", { state, notify, invoke, bt, addSystemItem, runSyncOnSession, patchItemById, patchItemByIdFor, runOnSession, addChatItem, timeStr, get itemIdSeq() { return itemIdSeq; }, set itemIdSeq(value) { itemIdSeq = value; } });
   const handleMemoryWrite = memoryFeature.handleMemoryWrite;
   const loadMemoryOverview = memoryFeature.loadMemoryOverview;
   const saveMemoryProfilePatch = memoryFeature.saveMemoryProfilePatch;
@@ -2182,6 +1948,7 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const openUserExternalUrl = artifactsFeature.openUserExternalUrl;
   const addAttachmentByPath = artifactsFeature.addAttachmentByPath;
   const addPasteImage = artifactsFeature.addPasteImage;
+  const addPasteImageFromClipboard = artifactsFeature.addPasteImageFromClipboard;
   const removeAttachment = artifactsFeature.removeAttachment;
   const pickAndAttach = artifactsFeature.pickAndAttach;
   const uploadDeviceFiles = artifactsFeature.uploadDeviceFiles;
@@ -2189,7 +1956,7 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const resolveConversationAttachment = artifactsFeature.resolveConversationAttachment;
   const openConversationAttachment = artifactsFeature.openConversationAttachment;
   const revealConversationAttachment = artifactsFeature.revealConversationAttachment;
-  const personasFeature = installBridgeFeature("personas", { state, sessionStates, notify, invoke, listen, bt, isDefaultChatTitle, addSystemItem, addChatItem, timeStr, ensureSession, runOnSession, personaPlaceholderTitles });
+  const personasFeature = installBridgeFeature("personas", { state, sessionStates, notify, invoke, listen, bt, isDefaultChatTitle, addSystemItem, addChatItem, timeStr, ensureSession, runOnSession, personaPlaceholderTitles, get itemIdSeq() { return itemIdSeq; }, set itemIdSeq(value) { itemIdSeq = value; } });
   const loadPersonas = personasFeature.loadPersonas;
   const getPersonas = personasFeature.getPersonas;
   const createPersona = personasFeature.createPersona;
@@ -2255,6 +2022,11 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const deleteProject = projectsFeature.deleteProject;
   const moveSessionToProject = projectsFeature.moveSessionToProject;
   const rebindWorkspaceRoot = projectsFeature.rebindWorkspaceRoot;
+  const ensureFolderProjects = projectsFeature.ensureFolderProjects;
+  const updateProjectRoots = projectsFeature.updateProjectRoots;
+  const setPrimaryRoot = projectsFeature.setPrimaryRoot;
+  const setNeverMaterialize = projectsFeature.setNeverMaterialize;
+  const alignSessionToProject = projectsFeature.alignSessionToProject;
 
   const multiAgentFeature = installBridgeFeature("multiagent", { state, notify, invoke, listen });
   const listMultiAgentSubagents = multiAgentFeature.listSubagentTranscripts;
@@ -2288,6 +2060,23 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     if (!selected) return null;
     return Array.isArray(selected) ? (selected[0] || null) : selected;
   }
+  // Round-35 M4: the two workspace channels used pickFolders — the
+  // knowledge-base MULTI-select import dialog — and kept picked[0] only,
+  // silently discarding the rest of a multi-selection (#463 Minor-6's
+  // defect class reintroduced). Dedicated single-select pickers with
+  // channel-matching titles.
+  async function pickManageFolder() {
+    if (!dialogOpen) return null;
+    const selected = await dialogOpen({ directory: true, multiple: false, title: bt("manageAddFolderTitle") });
+    if (!selected) return null;
+    return Array.isArray(selected) ? (selected[0] || null) : selected;
+  }
+  async function pickWorkspaceFolder() {
+    if (!dialogOpen) return null;
+    const selected = await dialogOpen({ directory: true, multiple: false, title: bt("workspacePickFolderTitle") });
+    if (!selected) return null;
+    return Array.isArray(selected) ? (selected[0] || null) : selected;
+  }
   async function pickFeedbackFiles() {
     if (!dialogOpen) return [];
     const selected = await dialogOpen({
@@ -2302,6 +2091,9 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     if (initPromise) return initPromise;
     initPromise = (async function () {
     startupMark("bridge:init_start");
+    startupNotificationBatching = true;
+    let initFailure;
+    try {
     // Populate the global Scheduled unread summary without requiring the user
     // to visit the Scheduled page first. This stays off the startup critical path.
     if (!isDetachedWindow) {
@@ -2357,7 +2149,23 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     }
     startupMark("bridge:background_checks_started");
     if (!isDetachedWindow) refreshRemoteControlStatus(); // 权威主窗口独占桌面 Web 代理状态
-    notify();
+    } catch (initError) {
+      initFailure = initError;
+    } finally {
+      startupNotificationBatching = false;
+    }
+    // Publish the coherent startup snapshot outside the finally: notify()
+    // rethrows subscriber-callback errors, and a throw from inside a finally
+    // would replace the in-flight init error. The failure path still gets its
+    // publish, but only the real init error propagates; on the success path a
+    // publish failure fails init exactly as before. This sync section cannot
+    // interleave with other notifies between the flag reset and the publish.
+    try {
+      notify();
+    } catch (notifyError) {
+      if (!initFailure) throw notifyError;
+    }
+    if (initFailure) throw initFailure;
     startupMark("bridge:init_done");
     if (window.__PINVOU_STARTUP__) window.__PINVOU_STARTUP__.flush();
     })();
@@ -2384,12 +2192,19 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       setComposerDraft,
       retryFirstTurn,
       prefillComposer,
+      restoreTaskDraft: chatFeature.restoreTaskDraft,
       removeQueued,
       prioritizeQueued,
       editQueued,
       interruptAndSendQueued,
       cancelGeneration,
       cancelShellTask,
+    },
+    auxChat: {
+      ensure: auxChatFeature.ensure,
+      send: auxChatFeature.send,
+      snapshot: auxChatFeature.snapshot,
+      reset: auxChatFeature.reset,
     },
     voice: {
       startVoiceInput,
@@ -2398,6 +2213,12 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       closeVoiceAsrSetup,
       cancelVoiceInput,
       clearVoiceInput,
+      abandonVoiceResult: voiceFeature.abandonVoiceResult,
+      getVoiceOperationId: voiceFeature.getVoiceOperationId,
+      beginVoiceSubmission: voiceFeature.beginVoiceSubmission,
+      completeVoiceSubmission: voiceFeature.completeVoiceSubmission,
+      dismissVoiceInput: voiceFeature.dismissVoiceInput,
+      hasVoiceSubmissionPending: voiceFeature.hasVoiceSubmissionPending,
       setVoiceShortcutEnabled,
       syncVoiceShortcutRecording,
       appendVoiceText,
@@ -2440,11 +2261,22 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       archiveSession,
       restoreArchivedSession,
       exportSessionArchive,
+      // session:deleted subscription (see applyDeletedSession): the one
+      // deletion path feature code can observe per id — list_sessions
+      // excludes code-mode sessions, so slice-diffing alone misses them.
+      onSessionDeleted,
       // Draft-state working directory selection (desktop only: system directory
       // dialog + the create_session workspacePath parameter; the web side has no
       // such channel, the UI guards on method existence).
       setDraftWorkspace,
       pickDraftWorkspace,
+      // Recents-list recorder for the single-entry picker path (the system
+      // dialog lane records inside pickDraftWorkspace itself; review #484
+      // round-18 M3).
+      rememberDraftWorkspaceRecent,
+      // Pre-grant notice mode for the chat lane's workspace surfaces (the
+      // posture the draft takes once the pick binds; review #484 round-11 M6).
+      boundDraftMode,
       // Working directory binding query for materialized sessions (bound
       // sessions share the code mode's safety posture; web/remote sessions have
       // no binding concept, stub returns null).
@@ -2457,6 +2289,11 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       deleteProject,
       moveSessionToProject,
       rebindWorkspaceRoot,
+      ensureFolderProjects,
+      updateProjectRoots,
+      setPrimaryRoot,
+      setNeverMaterialize,
+      alignSessionToProject,
     },
     monitor: {
       startMonitorPolling,
@@ -2468,14 +2305,13 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       saveSettings,
       saveSearchSettings,
       saveSearchSettingsAndRestart,
+      setGlobalShortcutConfig,
+      listBuiltinFeatures,
+      setBuiltinFeatureEnabled,
     },
     feedback: { submitFeedback },
     vllm: {
       discoverLocalVllm,
-      detectLocalVllmSetup,
-      bootstrapLocalVllm,
-      dismissVllmSetup,
-      declineVllmSetup,
     },
     models: {
       saveModel,
@@ -2522,8 +2358,6 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       startRemoteControl,
       stopRemoteControl,
       refreshRemoteControlQr,
-      getWebRelaySettings: remoteControlFeature.getWebRelaySettings,
-      setWebRelayAddress: remoteControlFeature.setWebRelayAddress,
     },
     artifacts: {
       artifactInfo,
@@ -2543,6 +2377,7 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
     attachments: {
       addAttachmentByPath,
       addPasteImage,
+      addPasteImageFromClipboard,
       removeAttachment,
       pickAndAttach,
       uploadDeviceFiles,
@@ -2555,7 +2390,6 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       readSubagentTranscript: readMultiAgentSubagent,
     },
     computerUse: {
-      getStatus: computerUseFeature.getStatus,
       refreshStatus: computerUseFeature.refreshStatus,
       grant: computerUseFeature.grant,
       revoke: computerUseFeature.revoke,
@@ -2564,10 +2398,13 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
       deny: computerUseFeature.deny,
       setEnabled: computerUseFeature.setEnabled,
       requestPermissions: computerUseFeature.requestPermissions,
+      permissionStatus: computerUseFeature.permissionStatus,
     },
     files: {
       pickFiles,
       pickFolders,
+      pickManageFolder,
+      pickWorkspaceFolder,
       pickRebindFolder,
       pickFeedbackFiles,
     },

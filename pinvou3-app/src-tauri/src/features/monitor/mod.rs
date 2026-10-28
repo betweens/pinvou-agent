@@ -10,8 +10,8 @@
 //! 而不是 panic 或让上层崩。pinvou3 用户可能没装 nvidia-smi，可能没启 vLLM。
 //!
 //! 模块拆分（保持原 pub 面不变）：
-//! - [`self_metrics`]：app 侧自测推理指标累加器（TTFT/TPS/tokens/KV）。
-//! - [`model_probe`]：当前模型健康探测 + 本地 vLLM Prometheus metrics 解析
+//! - `self_metrics`：app 侧自测推理指标累加器（TTFT/TPS/tokens/KV）。
+//! - `model_probe`：当前模型健康探测 + 本地 vLLM Prometheus metrics 解析
 //!   （`VllmSnapshot` / `snapshot_for_model_config`）。
 //! - 本 facade：系统资源采集（GPU/CPU/RAM）+ `sample_all` 聚合 + `MonitorState`。
 
@@ -22,13 +22,13 @@ mod self_metrics;
 
 // re-export 子模块 pub 面，保持 `crate::features::monitor::Foo` 调用路径不变。
 pub use model_probe::{
-    VllmSnapshot, VllmStatus, active_model_snapshot, adopts_probed_facts, probe_vllm_model_info,
-    resolve_served_model, vllm_base_url, vllm_configured_model, vllm_snapshot,
+    HealthStatus, MonitorDiagnostic, VllmSnapshot, VllmStatus, active_model_snapshot,
+    adopts_probed_facts, resolve_served_model,
 };
 pub use self_metrics::{SelfMetrics, SelfPerfSnapshot};
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -36,7 +36,6 @@ use serde::Serialize;
 /// 单次完整采样结果。所有字段 `Option`——采集失败就为 None。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MonitorSnapshot {
-    pub generated_at_ms: u64, // unix epoch ms
     pub gpu: Option<GpuSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuSnapshot>,
@@ -109,30 +108,11 @@ impl MonitorState {
     }
 }
 
-pub async fn sample_all(
-    state: &MonitorState,
-    vllm_upstream: &str,
-    configured_model: Option<String>,
-) -> MonitorSnapshot {
-    sample_all_with_cpu(
-        state,
-        vllm_upstream,
-        configured_model,
-        platform::cpu_snapshot(),
-    )
-    .await
+pub async fn sample_all(state: &MonitorState) -> MonitorSnapshot {
+    sample_all_with_cpu(state, platform::cpu_snapshot()).await
 }
 
-async fn sample_all_with_cpu(
-    state: &MonitorState,
-    vllm_upstream: &str,
-    configured_model: Option<String>,
-    cpu: Option<CpuSnapshot>,
-) -> MonitorSnapshot {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+async fn sample_all_with_cpu(state: &MonitorState, cpu: Option<CpuSnapshot>) -> MonitorSnapshot {
     // GPU 采样可能拉起 nvidia-smi 子进程（已带 GPU_PROBE_TIMEOUT 兜底），放到
     // blocking 池，避免 1s 一次的监控轮询占住 async worker；与 ram/vllm 并发
     // 采样，探测挂起时其余指标不再排队等它。预算是**单个候选进程**的：
@@ -141,12 +121,18 @@ async fn sample_all_with_cpu(
     // 拿到的是新采样而非缓存旧值。
     let gpu_task = tokio::task::spawn_blocking(gpu_snapshot);
     let ram = platform::ram_snapshot();
-    let vllm = match active_model_snapshot().await {
-        Some(snapshot) => Some(snapshot),
-        None => vllm_snapshot(vllm_upstream, configured_model).await,
-    };
+    // Active-model snapshot only. The removed `None` fallback re-probed through
+    // `vllm_snapshot`, which hardcodes LocalVllm and therefore forces the "local"
+    // target kind: whenever the active model is a remote/cloud entry whose probe
+    // fails on a transport or non-success HTTP error, `active_model_snapshot`
+    // returned `None` but the fallback returned `Some(Offline)` — a bogus "local
+    // vLLM" card carrying the cloud model name (a missing key or 401/403 yields
+    // an honest card instead; only a reachable keyless endpoint could look green).
+    // Dropping it makes the monitor page agree with `get_backend_status` (the
+    // chat live-dot), which already used `active_model_snapshot` alone, and
+    // saves two `UserPrefs::load()` reads per poll.
+    let vllm = active_model_snapshot().await;
     MonitorSnapshot {
-        generated_at_ms: now_ms,
         gpu: gpu_task.await.unwrap_or(None),
         cpu,
         ram,
@@ -159,35 +145,54 @@ async fn sample_all_with_cpu(
     }
 }
 
-/// Return GPU telemetry: NVIDIA probe (nvidia-smi) first, then the platform
-/// sampler (Windows performance counters / macOS ioreg IOAccelerator).
-fn gpu_snapshot() -> Option<GpuSnapshot> {
-    static GPU_CACHE: OnceLock<Mutex<GpuSnapshotCache>> = OnceLock::new();
-    let cache = GPU_CACHE.get_or_init(|| Mutex::new(GpuSnapshotCache::default()));
-    let mut guard = cache.lock();
-    if guard
-        .sampled_at
-        .is_some_and(|sampled_at| sampled_at.elapsed() < Duration::from_secs(3))
-    {
-        return guard.value.clone();
-    }
-    let value = nvidia_gpu_snapshot().or_else(platform::gpu_snapshot);
-    guard.sampled_at = Some(Instant::now());
-    if let Some(snapshot) = value {
-        guard.value = Some(snapshot.clone());
-        Some(snapshot)
-    } else {
-        // Windows performance counters occasionally time out or return no samples.
-        // Keep the last good local compute snapshot so the UI does not flicker
-        // between valid data and "unavailable" during normal polling.
-        guard.value.clone()
+/// 3 秒 TTL 的「保留上次好值」采样缓存，`OnceLock<Mutex<…>>` 模式下由
+/// `gpu_snapshot` 与 macOS `ram_snapshot` 共用。TTL 窗口内直接返回缓存值；
+/// 过期则调 `sample` 重采样并刷新时间戳。采样失败时保留上次成功值——避免
+/// 监控页在「有效数据」与「不可用」之间闪烁（Windows 性能计数器偶发超时/
+/// 无样本、vm_stat 偶发卡顿时 UI 不丢数据）。
+struct TtlSnapshotCache<T> {
+    sampled_at: Option<Instant>,
+    value: Option<T>,
+}
+
+impl<T> Default for TtlSnapshotCache<T> {
+    fn default() -> Self {
+        Self {
+            sampled_at: None,
+            value: None,
+        }
     }
 }
 
-#[derive(Default)]
-struct GpuSnapshotCache {
-    sampled_at: Option<Instant>,
-    value: Option<GpuSnapshot>,
+impl<T: Clone> TtlSnapshotCache<T> {
+    fn get_or_sample(&mut self, sample: impl FnOnce() -> Option<T>) -> Option<T> {
+        if self
+            .sampled_at
+            .is_some_and(|sampled_at| sampled_at.elapsed() < Duration::from_secs(3))
+        {
+            return self.value.clone();
+        }
+        let value = sample();
+        self.sampled_at = Some(Instant::now());
+        if let Some(snapshot) = value {
+            self.value = Some(snapshot.clone());
+            Some(snapshot)
+        } else {
+            self.value.clone()
+        }
+    }
+}
+
+/// Return GPU telemetry: NVIDIA probe (nvidia-smi) first, then the platform
+/// sampler (Windows performance counters / macOS ioreg IOAccelerator). The
+/// probe may pull up a subprocess (bounded by `GPU_PROBE_TIMEOUT`), so the
+/// result goes through the shared 3s TTL cache; a failed re-sample keeps the
+/// last good snapshot (see [`TtlSnapshotCache`]).
+fn gpu_snapshot() -> Option<GpuSnapshot> {
+    static GPU_CACHE: OnceLock<Mutex<TtlSnapshotCache<GpuSnapshot>>> = OnceLock::new();
+    let cache = GPU_CACHE.get_or_init(|| Mutex::new(TtlSnapshotCache::default()));
+    let mut guard = cache.lock();
+    guard.get_or_sample(|| nvidia_gpu_snapshot().or_else(platform::gpu_snapshot))
 }
 
 /// 子进程 GPU 探测的统一兜底预算（nvidia-smi / macOS ioreg / Windows 性能
@@ -256,8 +261,7 @@ mod tests {
         unsafe { std::env::set_var("PINVOU3_HOME", &temp_home) };
 
         let state = MonitorState::new();
-        let snapshot = sample_all_with_cpu(&state, "not-a-url", None, None).await;
-        assert!(snapshot.generated_at_ms > 0);
+        let snapshot = sample_all_with_cpu(&state, None).await;
         assert!(snapshot.cpu.is_none());
         assert_eq!(snapshot.self_perf.gen_tokens_total, 0);
         assert_eq!(snapshot.app.pinvou3_version, env!("CARGO_PKG_VERSION"));

@@ -1,6 +1,6 @@
 # Linux 本地语音识别搭建方案
 
-> **状态注记**：Linux 本地语音识别已内置进 main（#474，commit `40f27a543`）——应用内一键安装（`features/voice/platform/linux.rs` 的 `install_asr_runtime` 自动装 ffmpeg 并从 modelscope 下载模型）、引擎随包分发（`pinvou3-app/src-tauri/resources/platforms/linux/asr/`，npm script `test:linux-asr-runtime` 覆盖）、转码与清洗已固化进 `features/voice/voice_asr.rs`。本文保留为手动搭建 / 开发调试（POC 过程）路径。
+> **状态注记**：Linux 本地语音识别已内置进 main（#474，commit `40f27a543`）——应用内一键安装（`features/voice/platform/linux.rs` 的 `install_asr_runtime` 自动装 ffmpeg 并从 modelscope 下载模型）、引擎在打包期按架构映射进包内 `runtime/asr/`（共享源码目录 `pinvou3-app/src-tauri/resources/platforms/linux/asr/` 只放 shim 与 license，映射由 `config/platforms/linux/*/tauri.conf.json` 声明，npm script `test:linux-asr-runtime` 覆盖）、转码与清洗已固化进 `features/voice/voice_asr.rs`。本文保留为手动搭建 / 开发调试（POC 过程）路径。
 
 pinvou3 的语音输入原本是为 Windows 写的（bundle 的 `llama-funasr-sensevoice.exe`），
 迁到 Linux 没适配。本文记录 Linux 端打通的全过程 + 一键搭建脚本，并给出生产化建议。
@@ -27,7 +27,7 @@ Linux 上语音输入要过三关，前两关是代码、第三关是引擎：
 开源前的内置 ASR 中间层（未随开源仓库发布）期望的后端是 `-m -a --vad`，与 SenseVoice.cpp 的 `-m -f`
 **参数不同**（是两个引擎），所以这里走 **shim** 适配，而非直接让该中间层调它。
 
-### shim 做的三件事（`scripts/asr/pinvou3-asr-shim.py`）
+### shim 做的三件事（`pinvou3-app/src-tauri/resources/platforms/linux/asr/pinvou3-asr-shim.py`）
 pinvou3 后端通过 `PINVOU3_ASR_CMD` 按 `asr --model X --lang zh --input wav` 调用 shim，shim：
 1. **ffmpeg 转码**：浏览器录音多为 48k/立体声，统一转 16k 单声道（不转会加载失败）。
 2. **调引擎**识别。
@@ -74,6 +74,11 @@ PINVOU3_ASR_CMD=~/.pinvou3/asr/pinvou3-asr-shim.py SV_MODEL=~/.pinvou3/asr/sense
 
 - 引擎需在 arm64 上重新构建（`uname -m` 自动取架构，setup 脚本已处理 cmake 下载）。
 - GB10 有 GPU，用 `GGML_CUDA=ON` 构建走 GPU 加速（CPU 也能跑，x86 实测 5.5s 音频 ~0.2s）。
+
+## 五·二、loongarch64 注意
+
+- release CI 已为 loongarch64 交叉构建 SenseVoice 引擎（ggml 启用 LASX），随 loong64 安装包分发，无需用户自行构建。
+- 从源码构建引擎时，仍按 `uname -m` 取本机架构的原生构建口径操作（同上节 arm64 的做法）；区别是 loongarch64 不在 setup 脚本的 cmake 自动下载范围内，机器上需自备系统 cmake（`apt install cmake`）。
 
 ## 六、生产化待办
 

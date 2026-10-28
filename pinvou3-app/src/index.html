@@ -5,6 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <base href="%BASE_URL%">
   <title>PINVOU 智能助手（内测版）</title>
+  <style>
+    /* Pre-hydration canvas: matches the app shell's light/dark background so a
+       dark-mode cold boot never paints a white frame before React applies the
+       theme class (the inline script below sets it before first paint). */
+    html { background: #ffffff; }
+    html.dark { background: #131314; }
+  </style>
+  <script>
+    // Pre-paint theme class (mirrors src/shared/color-scheme.js rules):
+    // 'light'/'dark' win ('pinvou.web.theme' is the authoritative store on web
+    // and a boot-time cache of the resolved scheme on desktop), anything else
+    // follows the OS preference. main.jsx's activeTheme effect reconciles the
+    // class once real settings arrive.
+    (function () {
+      var dark = false;
+      try {
+        var stored = window.localStorage.getItem('pinvou.web.theme');
+        if (stored === 'light' || stored === 'dark') dark = stored === 'dark';
+        else dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      } catch (_) {
+        dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      }
+      if (dark) document.documentElement.classList.add('dark');
+    })();
+  </script>
   <script>
     // Collect startup timing before any vendor or application module loads.
     // Batches are forwarded to Rust so release builds retain the timeline.
@@ -179,11 +204,8 @@
       }
     })();
   </script>
-  <!-- Tailwind 仍使用本地离线 runtime；后续单独迁移预编译样式。 -->
   <script>__PINVOU_STARTUP__.mark('html:startup_observers_ready');</script>
   <script src="%BASE_URL%shared/legacy-polyfills.js"></script>
-  <script src="%BASE_URL%vendor/tailwind.js" onload="__PINVOU_STARTUP__.mark('vendor:tailwind_loaded')" onerror="__PINVOU_STARTUP__.mark('vendor:tailwind_error')"></script>
-  <script>tailwind.config = { darkMode: 'class' };</script>
   <script>__PINVOU_STARTUP__.mark('html:head_end');</script>
 </head>
 <body class="m-0 p-0">
@@ -199,6 +221,8 @@
   <script src="%BASE_URL%shared/bridge-messages.js"></script>
   <script src="%BASE_URL%shared/chunked-file-upload.js"></script>
   <!-- web/tauri 两条 bridge 共用的工具函数集；必须先于两份 bridge 加载（见文件头注释）。 -->
+  <!-- 工具/技能跨层 DOM 信号（FFE4-1）；必须先于两条 bridge 加载。 -->
+  <script src="%BASE_URL%shared/tool-store-events.js"></script>
   <script src="%BASE_URL%shared/bridge-shared-helpers.js"></script>
   <script src="%BASE_URL%shared/markdown-bridge-fallback.js"></script>
   <script src="%BASE_URL%shared/format-utils.js"></script>
@@ -223,6 +247,7 @@
   <script src="%BASE_URL%platform/tauri/bridge/knowledge-model.js"></script>
   <script src="%BASE_URL%platform/tauri/bridge/interaction.js"></script>
   <script src="%BASE_URL%platform/tauri/bridge/multiagent.js"></script>
+  <script src="%BASE_URL%platform/tauri/bridge/aux-chat.js"></script>
   <script src="%BASE_URL%platform/tauri/bridge/projects.js"></script>
   <script src="%BASE_URL%platform/tauri/bridge/computer_use.js"></script>
   <script src="%BASE_URL%platform/tauri/bridge.js" onload="__PINVOU_STARTUP__.mark('app:tauri_bridge_loaded')" onerror="__PINVOU_STARTUP__.mark('app:tauri_bridge_error')"></script>

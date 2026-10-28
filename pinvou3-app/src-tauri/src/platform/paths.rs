@@ -136,7 +136,11 @@ fn bundled_connector_runtime_paths_for(
 ) -> Option<(PathBuf, PathBuf)> {
     let root = resource_dir.join("runtime/codex-bridge/node");
     let node = match (os, arch) {
-        ("linux", "aarch64" | "x86_64") => root.join("bin/node"),
+        // linux/loongarch64 ships the same unified Node runtime layout as the
+        // other Linux arches (packaged by the deb); the connector CLI
+        // platform dir (connector_platform_dir) deliberately keeps returning
+        // None there because no connector artifacts exist upstream.
+        ("linux", "aarch64" | "x86_64" | "loongarch64") => root.join("bin/node"),
         ("macos", "aarch64") => root.join("darwin-arm64/bin/node"),
         ("macos", "x86_64") => root.join("darwin-x64/bin/node"),
         _ => return None,
@@ -226,10 +230,29 @@ pub fn browser_session_mcp_json(session_id: &str) -> PathBuf {
     browser_session_mcp_dir().join(format!("{}.json", browser_session_token(session_id)))
 }
 
+/// Per-aux scoped MCP configuration directory (ADR-0024): holds the
+/// token-named session-reader configs that pin an auxiliary engine to its
+/// parent task's session id. Sibling layout of the browser `mcp-sessions`
+/// directory, but directly under the Pinvou home — it never contains user
+/// servers, only app-written single-entry configs.
+pub fn aux_mcp_sessions_dir() -> PathBuf {
+    pinvou3_home().join("mcp-sessions")
+}
+/// Conversation-scoped aux MCP config path. Mirrors
+/// [`browser_session_mcp_json`]: the filename is the stable session token
+/// (the shared fnv1a digest behind `browser_session_token`), so the raw
+/// session id never appears in the path — no invalid path characters, no
+/// traversal, no id disclosure in directory listings.
+pub fn aux_session_mcp_json(session_id: &str) -> PathBuf {
+    aux_mcp_sessions_dir().join(format!("{}.json", browser_session_token(session_id)))
+}
+
 /// Stable FNV-1a 64-bit digest over raw bytes. Shared building block for
 /// stable local identifiers derived from session IDs; callers format the
 /// returned value (e.g. `{value:016x}`) for their own file/label needs.
-pub(crate) fn fnv1a64(data: &[u8]) -> u64 {
+/// `pub` (round-41 review): the CLI's plugin-id fallback derives the same
+/// stable stem hash the GUI does, from the shared digest.
+pub fn fnv1a64(data: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in data {
         hash ^= u64::from(*byte);
@@ -414,6 +437,23 @@ fn sanitize_memory_runtime_id(raw: &str) -> String {
     }
 }
 
+/// `~/.pinvou3/feedback/`.
+fn feedback_root() -> PathBuf {
+    pinvou3_home().join("feedback")
+}
+
+/// `~/.pinvou3/feedback/pending/` — where the headless CLI stages a feedback
+/// request while its submission is in flight.
+pub fn feedback_pending_dir() -> PathBuf {
+    feedback_root().join("pending")
+}
+
+/// `~/.pinvou3/feedback/receipts/` — the local receipt the headless CLI
+/// writes for each submission.
+pub fn feedback_receipts_dir() -> PathBuf {
+    feedback_root().join("receipts")
+}
+
 /// `~/.pinvou3/sessions/<session_id>/artifacts/` —— AI 默认产物落地目录。
 /// `$PINVOU3_SESSION_ARTIFACTS` 环境变量注入这个值给 engine + LLM。
 pub fn session_artifacts_dir(session_id: &str) -> PathBuf {
@@ -518,42 +558,7 @@ pub(crate) mod tests {
     /// through a single isolation layer.
     pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Panic-safe restore for process env vars a test overwrites: capture
-    /// each key's current value as `Option<OsString>`, and `Drop` puts back
-    /// exactly that state (re-set, or removed if it was absent) on every exit
-    /// path, including panics. `var_os`, not `var`: POSIX allows non-UTF-8
-    /// values and `var` panics on them (the lib.rs EnvSnapshot lesson).
-    /// Like the bridge tests' private EnvGuard, the guard does not acquire
-    /// ENV_LOCK itself — the caller must hold it from before `capture` until
-    /// after the guard drops.
-    pub(crate) struct EnvVarGuard {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvVarGuard {
-        pub(crate) fn capture(vars: &[&'static str]) -> Self {
-            Self {
-                saved: vars
-                    .iter()
-                    .map(|&name| (name, std::env::var_os(name)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.saved {
-                match value {
-                    // SAFETY: the caller holds ENV_LOCK from before capture
-                    // until after this drop; env writes are serialized.
-                    Some(value) => unsafe { std::env::set_var(name, value) },
-                    // SAFETY: same as above; removal serialized under ENV_LOCK.
-                    None => unsafe { std::env::remove_var(name) },
-                }
-            }
-        }
-    }
+    pub(crate) use crate::platform::test_support::EnvRestore as EnvVarGuard;
 
     #[test]
     fn env_var_guard_restores_preexisting_absent_and_panic_paths() {
@@ -622,6 +627,19 @@ pub(crate) mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Plant a FIFO at `path` for the hardening fixtures: a planted FIFO must
+    /// be refused by the regular-file-gated reads instead of blocking the
+    /// caller (mkfifo is POSIX-only, so callers gate themselves with
+    /// `#[cfg(unix)]`).
+    #[cfg(test)]
+    #[cfg(unix)]
+    pub(crate) fn plant_fifo(path: &std::path::Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo on a fresh temp path; no other thread touches it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "fixture: mkfifo must succeed");
     }
 
     #[test]
@@ -734,6 +752,8 @@ pub(crate) mod tests {
             managed_connector_bin_dir_for("linux", "x86_64"),
             expected("linux-x64")
         );
+        // 连接器无 loongarch64 上游制品：平台目录保持 None（显式降级）。
+        assert_eq!(managed_connector_bin_dir_for("linux", "loongarch64"), None);
         assert_eq!(
             managed_connector_bin_dir_for("macos", "aarch64"),
             expected("darwin-arm64")
@@ -762,6 +782,14 @@ pub(crate) mod tests {
         let npm = resource.join("runtime/codex-bridge/node/lib/node_modules/npm/bin/npm-cli.js");
         assert_eq!(
             bundled_connector_runtime_paths_for(&resource, "linux", "x86_64"),
+            Some((
+                resource.join("runtime/codex-bridge/node/bin/node"),
+                npm.clone()
+            ))
+        );
+        // loongarch64 的 deb 会带同一份统一 Node runtime（bin/node）。
+        assert_eq!(
+            bundled_connector_runtime_paths_for(&resource, "linux", "loongarch64"),
             Some((
                 resource.join("runtime/codex-bridge/node/bin/node"),
                 npm.clone()

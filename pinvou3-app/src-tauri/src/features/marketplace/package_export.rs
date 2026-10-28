@@ -37,7 +37,8 @@ use crate::platform::paths;
 /// `import_lock_for`——导入/恢复/回收站导出等同锁持有方互斥；但卸载与启动修复
 /// 只在市场事务锁下搬移 `bundles/<id>`、不持本锁，本锁不能阻止并发搬移：彼时
 /// 按路径的遍历/打开会失败，导出报错且原子写不动原目标，不会产出「成功」的
-/// 不完整 zip（回收站导出由其自身 `file_lock()` 串行化，同口径）。
+/// 不完整 zip（回收站导出由 recycle-bin.json 的跨进程文件锁串行化，同口径，
+/// 见 `recycle_bin.rs`/#521）。
 pub fn export_installed_plugin(pkg_id: &str, dest_zip: &Path) -> Result<(), String> {
     if !super::skill_marketplace::is_safe_skill_name(pkg_id) {
         return Err(format!("非法包 id '{pkg_id}'"));
@@ -45,7 +46,7 @@ pub fn export_installed_plugin(pkg_id: &str, dest_zip: &Path) -> Result<(), Stri
     // 预置目录包不导出：预置 id 受导入管线冲突保护（`plugin_import` 拒绝与
     // `mcp_catalog` 冲突的包），导出的 zip 无法重新导入；预置可从市场重新安装，
     // 导出无重导价值。迁移登记为 Preset 的手写自定义 MCP 不在目录内，不受此限。
-    if crate::features::marketplace::mcp_catalog::spec_for(pkg_id).is_some() {
+    if crate::features::marketplace::mcp_catalog::spec_for_builtin_probe(pkg_id).is_some() {
         return Err(format!(
             "包 '{pkg_id}' 属于市场预置，可从市场重新安装，无需导出（预置 id 受导入管线冲突保护，导出的 zip 无法重新导入）"
         ));
@@ -338,7 +339,7 @@ mod tests {
             let archive_file = std::fs::File::open(&dest).unwrap();
             let mut archive = zip::ZipArchive::new(archive_file).unwrap();
             let mut names: Vec<String> = (0..archive.len())
-                .map(|i| archive.by_index(i).unwrap().name().to_string())
+                .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
                 .collect();
             names.sort();
             assert_eq!(
@@ -551,7 +552,7 @@ mod tests {
         let archive_file = std::fs::File::open(&dest).unwrap();
         let mut archive = zip::ZipArchive::new(archive_file).unwrap();
         let mut names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         names.sort();
         assert_eq!(

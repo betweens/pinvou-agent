@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use agent_backend_api::{
     AgentBackendError, PrivateInputHandle, PrivateInputResolver, ResolvedPrivateInput, SecretText,
 };
+use async_trait::async_trait;
 use benchmark_core::{
     BenchmarkAdapter, BenchmarkDescriptor, BenchmarkError, BenchmarkId, BenchmarkPlan,
     BenchmarkTask, CompletedRun, ExecutionKind, ExecutionRequest, OfficialScoreReport,
@@ -16,6 +15,11 @@ use benchmark_core::{
 use serde::{Deserialize, Serialize};
 
 pub const PRODUCT_SCORE_VERSION: &str = "pinvou-product-score/v1";
+
+/// Upper bound of every per-case deadline in [`smoke_cases`]. The adapter's
+/// descriptor records it so the harness-deadline mode is machine-readable,
+/// and the runner enforces each case's own (never larger) deadline.
+pub const SMOKE_HARNESS_DEADLINE_SECS: u64 = 60;
 
 /// Canonical id of the smoke tool policy: the headless read-only-web face
 /// (the same six tools as the GAIA public-web policy), deliberately not
@@ -62,12 +66,13 @@ impl SmokeCase {
     pub fn to_benchmark_task(&self) -> BenchmarkTask {
         BenchmarkTask::new(
             self.id,
-            Some("smoke".to_string()),
             None,
+            // The smoke suite is an internal determinism check, so it keeps
+            // its own per-case harness deadlines (unlike GAIA).
             ExecutionRequest::native_turn(
                 PrivateInputHandle::new(format!("smoke:{}", self.id)),
                 vec![],
-                self.timeout,
+                Some(self.timeout),
                 ToolPolicyId::new(SMOKE_TOOL_POLICY_ID),
                 OutputContract::new("smoke-private-output/v1"),
             ),
@@ -86,7 +91,7 @@ pub fn smoke_cases() -> Vec<SmokeCase> {
         SmokeCase {
             id: "plep_smoke_weather",
             prompt: "广州今天天气怎么样",
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(SMOKE_HARNESS_DEADLINE_SECS),
             tool_expectation: ToolExpectation::Required,
         },
         SmokeCase {
@@ -98,7 +103,7 @@ pub fn smoke_cases() -> Vec<SmokeCase> {
         SmokeCase {
             id: "plep_smoke_poem",
             prompt: "帮我写一首关于春天的诗",
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(SMOKE_HARNESS_DEADLINE_SECS),
             tool_expectation: ToolExpectation::Forbidden,
         },
         SmokeCase {
@@ -143,23 +148,13 @@ impl fmt::Debug for SmokePrivateInputs {
     }
 }
 
+#[async_trait]
 impl PrivateInputResolver for SmokePrivateInputs {
-    fn resolve<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        handle: &'life1 PrivateInputHandle,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<ResolvedPrivateInput, AgentBackendError>>
-                + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(async move { self.resolve_handle(handle) })
+    async fn resolve(
+        &self,
+        handle: &PrivateInputHandle,
+    ) -> Result<ResolvedPrivateInput, AgentBackendError> {
+        self.resolve_handle(handle)
     }
 }
 
@@ -177,7 +172,10 @@ impl SmokeAdapter {
                 PRODUCT_SCORE_VERSION,
                 vec![Split::new("smoke")],
                 ExecutionKind::NativeTurn,
-            ),
+            )
+            // Per-case deadlines are 30/60s; the manifest records the upper
+            // bound so the harness-deadline mode is machine-readable.
+            .with_harness_deadline_secs(Some(SMOKE_HARNESS_DEADLINE_SECS)),
         }
     }
 }
@@ -274,36 +272,13 @@ impl SmokeUsage {
 
 #[derive(Clone, Default)]
 pub struct SmokeAnalysisMaterial {
-    tool_names: Vec<String>,
     tool_events: Vec<SmokeToolEvent>,
     usage: Option<SmokeUsage>,
 }
 
 impl SmokeAnalysisMaterial {
-    pub fn new(tool_names: Vec<String>) -> Self {
-        let tool_events = tool_names
-            .iter()
-            .cloned()
-            .map(|name| SmokeToolEvent::new(name, false))
-            .collect();
-        Self {
-            tool_names,
-            tool_events,
-            usage: None,
-        }
-    }
-
     pub fn with_details(tool_events: Vec<SmokeToolEvent>, usage: Option<SmokeUsage>) -> Self {
-        let tool_names = tool_events.iter().map(|event| event.name.clone()).collect();
-        Self {
-            tool_names,
-            tool_events,
-            usage,
-        }
-    }
-
-    pub fn tool_names(&self) -> &[String] {
-        &self.tool_names
+        Self { tool_events, usage }
     }
 
     pub fn tool_events(&self) -> &[SmokeToolEvent] {
@@ -399,12 +374,6 @@ impl SmokeFinding {
     pub fn case_id(&self) -> Option<&str> {
         self.case_id.as_deref()
     }
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-    pub fn recommendation(&self) -> &str {
-        &self.recommendation
-    }
     pub fn source(&self) -> FindingSource {
         self.source
     }
@@ -419,9 +388,6 @@ pub struct RuleAnalysis {
 impl RuleAnalysis {
     pub fn findings(&self) -> &[SmokeFinding] {
         &self.findings
-    }
-    pub fn limitations(&self) -> &[String] {
-        &self.limitations
     }
 }
 
@@ -765,9 +731,6 @@ impl ProductScore {
     }
     pub fn diagnoses(&self) -> &[ProductDiagnosis] {
         &self.diagnoses
-    }
-    pub fn is_official_score(&self) -> bool {
-        false
     }
 }
 

@@ -27,7 +27,18 @@ function isVoiceShortcutEventForThisWindow(payload) {
   return !ownLabel || ownLabel === eventLabel;
 }
 
-function VoiceShortcutRouter({ enabled = true }) {
+// 快捷键统一触发入口:录音中再次按下 = 以当前模式停止(preserveMode);
+// 其余情况按动作模式(默认听写)启动。键盘手势通道与 Tauri 原生路由共用。
+function triggerVoiceShortcutTarget(target, actionMode, status, activeMode) {
+  if (!target || typeof target.trigger !== 'function') return;
+  if (status === 'recording') {
+    target.trigger(activeMode || 'dictation', { source: 'shortcut-stop', preserveMode: true });
+    return;
+  }
+  target.trigger(actionMode || 'dictation');
+}
+
+function VoiceShortcutRouter() {
   const pendingRef = useRef(null);
   // Timestamp of the most recent non-plain-Alt keydown: Windows combo passthrough injects a
   // synthetic Alt down in the same event batch as the combo keydown, and the state machine
@@ -36,7 +47,7 @@ function VoiceShortcutRouter({ enabled = true }) {
   const lastNonAltKeyDownAtRef = useRef(null);
 
   useEffect(() => {
-    if (!enabled || isWeb) return;
+    if (isWeb) return;
     function syncNativeShortcutSetting() {
       const bridge = tryGetTauriBridge();
       if (!bridge || !bridge.available || !bridge.voice
@@ -63,10 +74,9 @@ function VoiceShortcutRouter({ enabled = true }) {
       window.removeEventListener(VOICE_SHORTCUT_SETTINGS_EVENT, syncNativeShortcutSetting);
       window.removeEventListener('storage', handleShortcutStorageEvent);
     };
-  }, [enabled]);
+  }, []);
 
   useEffect(() => {
-    if (!enabled) return;
     function setPendingShortcutFlag(flag) {
       pendingRef.current = {
         ...pendingRef.current,
@@ -86,14 +96,6 @@ function VoiceShortcutRouter({ enabled = true }) {
         status: (voiceInput && voiceInput.status) || 'idle',
         mode: (voiceInput && voiceInput.mode) || 'dictation',
       };
-    }
-    function triggerVoiceShortcutTarget(target, actionMode, status, activeMode) {
-      if (!target || typeof target.trigger !== 'function') return;
-      if (status === 'recording') {
-        target.trigger(activeMode || 'dictation', { source: 'shortcut-stop', preserveMode: true });
-        return;
-      }
-      target.trigger(actionMode || 'dictation');
     }
     function handleVoiceShortcutKeyDown(event) {
       if (shouldIgnoreVoiceShortcutEvent(event)) return;
@@ -185,10 +187,10 @@ function VoiceShortcutRouter({ enabled = true }) {
       window.removeEventListener('keyup', handleVoiceShortcutKeyUp, true);
       clearPendingShortcut();
     };
-  }, [enabled]);
+  }, []);
 
   useEffect(() => {
-    if (!enabled || isWeb) return;
+    if (isWeb) return;
     let disposed = false;
     const unlisteners = [];
     function rememberUnlisten(unlisten) {
@@ -214,12 +216,19 @@ function VoiceShortcutRouter({ enabled = true }) {
       // usually a WebView reload/restore rebuilt the JS session while the native registration
       // stayed (native clears it only on window destroy). Clear the stale registration and
       // drop this gesture; the next press routes by focused window again. Never ghost-open
-      // the mic in the background.
-      if (payload && payload.route === 'recording' && !recording) {
+      // the mic in the background. A recording-routed event whose claim token does not
+      // match this window's ACTIVE recording is stale the same way: drop it. The check is
+      // gated on `recording` so an idle window always falls through to the purge below —
+      // with a token held from an earlier recording, an ungated drop would dead-end on a
+      // stale native registration that only that purge can release.
+      if (payload && payload.route === 'recording' && recording
+        && voiceInput.ownershipToken && voiceInput.ownershipToken !== payload.recording_token) return;
+      if (payload && payload.route === 'recording' && !recording
+        && status !== 'requesting_permission') {
         const bridge = tryGetTauriBridge();
         if (bridge && bridge.available
           && typeof bridge.voice.syncVoiceShortcutRecording === 'function') {
-          bridge.voice.syncVoiceShortcutRecording(null);
+          bridge.voice.syncVoiceShortcutRecording(null, payload.recording_token);
         }
         return;
       }
@@ -229,11 +238,7 @@ function VoiceShortcutRouter({ enabled = true }) {
       // storage is cleared the mirror defaults to false, and stacking the check would let a
       // natively enabled shortcut be swallowed by native and then dropped by the frontend,
       // failing silently. The mirror only serves the in-window key gesture channel above.
-      if (recording) {
-        target.trigger(mode, { source: 'shortcut-stop', preserveMode: true });
-        return;
-      }
-      target.trigger('dictation');
+      triggerVoiceShortcutTarget(target, 'dictation', status, mode);
     }).then(rememberUnlisten).catch(() => {});
     return () => {
       disposed = true;
@@ -241,7 +246,7 @@ function VoiceShortcutRouter({ enabled = true }) {
         try { unlisten(); } catch { /* listener already gone */ }
       });
     };
-  }, [enabled]);
+  }, []);
 
   return null;
 }

@@ -31,28 +31,28 @@ pub use persistence::RelaySettingsInfo;
 
 // Persistent config / RPC ledger / pending revocation / relay settings helpers
 // are pure and stateless; the facade calls them by name.
+#[cfg(test)]
+use persistence::atomic_write_private_json;
 use persistence::{
     acknowledge_pending_revocation, acquire_process_lock, apply_runtime_relay_override,
-    atomic_write_private_json, eligible_pending_revocations, fresh_config, load_config,
-    load_or_initialize_rpc_ledger, load_pending_revocations, load_relay_settings, new_stream_epoch,
-    normalize_relay_address, pairing_info, pending_revocation_ack, pending_revocation_key,
-    persist_config, persist_rpc_ledger, process_lock_path, public_url, queue_pending_revocation,
-    relay_settings_path, remote_public_base_url, remote_relay_ws_url, remove_config,
+    eligible_pending_revocations, fresh_config, load_config, load_or_initialize_rpc_ledger,
+    load_pending_revocations, load_relay_settings, new_stream_epoch, pairing_info,
+    pending_revocation_key, persist_config, persist_rpc_ledger, process_lock_path, public_url,
+    queue_pending_revocation, remote_public_base_url, remote_relay_ws_url, remove_config,
     remove_rpc_ledger, validate_config,
 };
 
 // RPC admission, response shaping, scope validation, and the stream/event
 // protocol message builders live in `rpc`. The facade dispatches against the
-// enums (`RpcRequestAction`, `RpcReadyAction`, `EventSource`, ...) and calls
+// enums (`RpcRequestAction`, `EventSource`, ...) and calls
 // the pure helpers, so the whole surface is imported by name.
 use rpc::{
-    EventSource, NewRpcAdmission, ReplayMessageContext, RpcReadyAction, RpcRequestAction,
-    bounded_rpc_completion, enqueue_stream_reset, event_message, prepare_bridge_generation,
-    prepare_new_rpc_admission, prune_rpc_cache, request_conflict_completion,
-    rpc_admission_rejection, rpc_error_completion, rpc_fingerprint, rpc_in_flight_expired,
-    rpc_response, snapshot_message, stream_reset_message, subscription_filtered_replay_messages,
-    tombstone_completion, try_enqueue_message_batch, validate_bridge_generation,
-    validate_rpc_command, validate_web_rpc_scope,
+    EventSource, NewRpcAdmission, ReplayMessageContext, RpcRequestAction, bounded_rpc_completion,
+    enqueue_stream_reset, event_message, prepare_bridge_generation, prepare_new_rpc_admission,
+    prune_rpc_cache, request_conflict_completion, rpc_admission_rejection, rpc_error_completion,
+    rpc_fingerprint, rpc_in_flight_expired, rpc_response, snapshot_message, stream_reset_message,
+    subscription_filtered_replay_messages, tombstone_completion, try_enqueue_message_batch,
+    validate_bridge_generation, validate_rpc_command, validate_web_rpc_scope,
 };
 
 // The transfer buffer helpers mutate `Inner` through borrowed guards. They are
@@ -61,12 +61,16 @@ use rpc::{
 use transfer::{
     append_web_attachment_upload_chunk, clear_web_attachments, discard_web_attachment_upload,
     ensure_web_session_download_capacity, finish_web_attachment_reservation_inner,
-    is_owned_session_download_id, open_web_session_downloads_base,
-    prune_expired_web_session_transfers, read_web_session_download_chunk,
-    remove_web_attachment_upload_dir, request_web_attachment_discard,
-    sweep_stale_web_session_downloads, take_web_session_download,
+    open_web_session_downloads_base, prune_expired_web_session_transfers,
+    read_web_session_download_chunk, remove_web_attachment_upload_dir,
+    request_web_attachment_discard, sweep_stale_web_session_downloads, take_web_session_download,
 };
-pub(crate) use transfer::{sweep_stale_web_attachment_uploads, web_attachment_uploads_base};
+// The download-id ownership rule is the mint-side contract (`begin_web_session_download`
+// issues ids through it); the command-layer cancel gate re-uses it so the two
+// cannot drift again.
+pub(crate) use transfer::{
+    is_owned_session_download_id, sweep_stale_web_attachment_uploads, web_attachment_uploads_base,
+};
 use workspace_grants::{
     WebWorkspaceGrantReservation, WebWorkspaceGrantStore, WebWorkspaceIdentity,
     require_host_workspace_authorization,
@@ -114,6 +118,31 @@ fn validate_multi_agent_session_web_scope(
     command: &str,
     session_id: &str,
 ) -> Result<(), String> {
+    // Documented exception (round-34 minor 7; comment reworded per the
+    // round-37 review — that reword (commit ef48f0701) was dropped by a
+    // branch rewrite before it could merge, never reaching main in any
+    // form, and is restored here re-keyed on the mechanism, ADR-0024): the
+    // early return keys on the SESSION ARGUMENT being aux-shaped — an
+    // `aux-` id bypasses this denylist scope check for ANY command. That
+    // is exactly what keeps an aux conversation fully usable over the
+    // relay while its MAIN session runs multi-agent. The aux-id carriers
+    // through this validator today are the WebUI aux send (`web_access_chat`,
+    // denylist entry #11) and the aux panel's hydration reads
+    // (`web_access_load_session_chunk`, `get_session_timeline`, the
+    // persona/reviews/scene sidecar reads, `web_access_cancel_session_download`);
+    // the three aux management commands carry the PARENT id (the aux id is
+    // minted server-side and never sent back). The invariant to preserve is
+    // "aux ids are never subject to the multi-agent web execution denylist",
+    // because the aux engine is the isolated pure-Q&A config (at most one
+    // scoped read-only context tool, never an execution surface, no
+    // subagents — the denylist's threat model never applies to it), the
+    // desktop offers the same entry, and blocking it would break the side
+    // chat for exactly the heaviest users. The denylist's "web is read-only"
+    // promise is scoped to the multi-agent EXECUTION surface, not to its
+    // side chat.
+    if crate::features::sessions::is_aux_session_id(session_id) {
+        return Ok(());
+    }
     if !MULTI_AGENT_WEB_EXECUTION_DENYLIST.contains(&command) {
         return Ok(());
     }
@@ -199,6 +228,7 @@ const RUST_FORWARDED_EVENTS: &[&str] = &[
     "chat:user_message",
     "chat:user_input_required",
     "multiagent:agent_progress",
+    "remote_control:tools_changed",
     "scheduled_task:run_updated",
     "session:deleted",
     "session:list_changed",
@@ -891,23 +921,10 @@ impl RemoteControlManager {
         }
     }
 
-    /// 设置自定义 Relay 地址（域名/IP，见 `normalize_relay_address`）。
-    /// 已有 endpoint 时走完整 refresh：旧 endpoint 的撤销意图先落盘（指向旧
-    /// relay），新凭据注册到新 relay，分享链接与二维码随之更新。
     /// 注入原生代码会话判定闭包；之后带代码会话 id 的事件不再转发到远程 WebUI。
     /// （含已 manage 进 Tauri 的那份）都能读到。
     pub fn set_code_session_predicate(&self, predicate: CodeSessionPredicate) {
         self.inner.lock().code_session_predicate = Some(predicate);
-    }
-
-    pub fn set_relay_address(&self, input: &str) -> Result<RelaySettingsInfo, String> {
-        let settings = normalize_relay_address(input)?;
-        atomic_write_private_json(&relay_settings_path(), &settings, "Web relay settings")?;
-        let has_endpoint = self.inner.lock().endpoint.is_some();
-        if has_endpoint || load_config()?.is_some() {
-            self.refresh()?;
-        }
-        Ok(self.relay_settings())
     }
 
     pub fn stop_current(&self) -> Result<(), String> {
@@ -1001,7 +1018,12 @@ impl RemoteControlManager {
                 while let Some(inbound) = receiver.recv().await {
                     if let RelayInbound::Message(text) = inbound {
                         match serde_json::from_str::<Value>(&text) {
-                            Ok(value) if pending_revocation_ack(&value, &pending.endpoint_id) => {
+                            Ok(value)
+                                if relay_client::terminal_relay_message(
+                                    &value,
+                                    &pending.endpoint_id,
+                                ) =>
+                            {
                                 acknowledged = true;
                                 break;
                             }
@@ -1578,17 +1600,19 @@ impl RemoteControlManager {
         let mut first_error = None;
         for action in actions {
             match action {
-                RpcReadyAction::Dispatch(dispatch) => {
+                RpcRequestAction::Dispatch(dispatch) => {
                     if let Err(error) = self.emit_rpc_dispatch(dispatch) {
                         first_error.get_or_insert(error);
                     }
                 }
-                RpcReadyAction::Respond(sender, response) => {
+                RpcRequestAction::Respond(sender, response) => {
                     if sender.try_send(RelayOutbound::Message(response)).is_err() {
                         first_error
                             .get_or_insert_with(|| "Web access relay task has stopped".to_string());
                     }
                 }
+                // `prepare_bridge_generation` never emits the None variant.
+                RpcRequestAction::None => {}
             }
         }
         // The browser may reconnect and subscribe before a restarted desktop
@@ -2046,6 +2070,48 @@ impl RemoteControlManager {
         prune_rpc_cache(inner);
     }
 
+    /// Shared admission tail of the two Pending branches in `handle_rpc_request`
+    /// (reconstructed-tombstone and fresh-durable): insert the Pending cache
+    /// entry, queue the request id, prune, then map the bridge generation to the
+    /// dispatch action. Both arms were token-identical; this is the single home
+    /// of the idempotency bookkeeping (`settle_complete` is the Complete-insert
+    /// analogue). The cache entry clones `command`/`args`; the dispatch consumes
+    /// the originals — exactly the pre-extraction sharing.
+    fn admit_pending_rpc(
+        inner: &mut Inner,
+        request_id: &str,
+        lease_id: String,
+        command: String,
+        args: Value,
+        fingerprint: String,
+        bridge_generation: Option<String>,
+    ) -> RpcRequestAction {
+        inner.rpc_cache.insert(
+            request_id.to_string(),
+            RpcCacheEntry::Pending(PendingRpc {
+                lease_id,
+                command: command.clone(),
+                args: args.clone(),
+                fingerprint,
+                dispatched_generation: bridge_generation.clone(),
+                acknowledged_generation: None,
+                dispatched_at: Instant::now(),
+            }),
+        );
+        inner.rpc_order.push_back(request_id.to_string());
+        prune_rpc_cache(inner);
+        if let Some(bridge_generation) = bridge_generation {
+            RpcRequestAction::Dispatch(RpcDispatch {
+                request_id: request_id.to_string(),
+                command,
+                args,
+                bridge_generation,
+            })
+        } else {
+            RpcRequestAction::None
+        }
+    }
+
     fn handle_rpc_request(&self, value: &Value) {
         let request_id = value
             .get("client_request_id")
@@ -2228,30 +2294,15 @@ impl RemoteControlManager {
                                     rpc_response(&endpoint_id, &lease_id, &request_id, &completion),
                                 )
                             } else {
-                                inner.rpc_cache.insert(
-                                    request_id.clone(),
-                                    RpcCacheEntry::Pending(PendingRpc {
-                                        lease_id,
-                                        command: command.clone(),
-                                        args: args.clone(),
-                                        fingerprint,
-                                        dispatched_generation: bridge_generation.clone(),
-                                        acknowledged_generation: None,
-                                        dispatched_at: Instant::now(),
-                                    }),
-                                );
-                                inner.rpc_order.push_back(request_id.clone());
-                                prune_rpc_cache(&mut inner);
-                                if let Some(bridge_generation) = bridge_generation {
-                                    RpcRequestAction::Dispatch(RpcDispatch {
-                                        request_id: request_id.clone(),
-                                        command,
-                                        args,
-                                        bridge_generation,
-                                    })
-                                } else {
-                                    RpcRequestAction::None
-                                }
+                                Self::admit_pending_rpc(
+                                    &mut inner,
+                                    &request_id,
+                                    lease_id,
+                                    command,
+                                    args,
+                                    fingerprint,
+                                    bridge_generation,
+                                )
                             }
                         }
                     } else {
@@ -2298,30 +2349,15 @@ impl RemoteControlManager {
                                     )
                                 } else {
                                     inner.rpc_ledger = next_ledger;
-                                    inner.rpc_cache.insert(
-                                        request_id.clone(),
-                                        RpcCacheEntry::Pending(PendingRpc {
-                                            lease_id,
-                                            command: command.clone(),
-                                            args: args.clone(),
-                                            fingerprint,
-                                            dispatched_generation: bridge_generation.clone(),
-                                            acknowledged_generation: None,
-                                            dispatched_at: Instant::now(),
-                                        }),
-                                    );
-                                    inner.rpc_order.push_back(request_id.clone());
-                                    prune_rpc_cache(&mut inner);
-                                    if let Some(bridge_generation) = bridge_generation {
-                                        RpcRequestAction::Dispatch(RpcDispatch {
-                                            request_id: request_id.clone(),
-                                            command,
-                                            args,
-                                            bridge_generation,
-                                        })
-                                    } else {
-                                        RpcRequestAction::None
-                                    }
+                                    Self::admit_pending_rpc(
+                                        &mut inner,
+                                        &request_id,
+                                        lease_id,
+                                        command,
+                                        args,
+                                        fingerprint,
+                                        bridge_generation,
+                                    )
                                 }
                             }
                             Err(error) => {
@@ -3207,78 +3243,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_relay_address_accepts_bare_domain_as_tls() {
-        let settings = normalize_relay_address("relay.example.com").expect("bare domain");
-        assert_eq!(
-            settings.relay_url,
-            "wss://relay.example.com/pinvou3/remote/ws"
-        );
-        assert_eq!(
-            settings.public_base_url,
-            "https://relay.example.com/pinvou3/remote"
-        );
-    }
-
-    #[test]
-    fn normalize_relay_address_accepts_ip_with_port_and_explicit_ws() {
-        let settings = normalize_relay_address("ws://192.168.1.20:8080").expect("plain ip");
-        assert_eq!(
-            settings.relay_url,
-            "ws://192.168.1.20:8080/pinvou3/remote/ws"
-        );
-        assert_eq!(
-            settings.public_base_url,
-            "http://192.168.1.20:8080/pinvou3/remote"
-        );
-    }
-
-    #[test]
-    fn normalize_relay_address_bare_ip_defaults_to_tls_without_downgrade() {
-        let settings = normalize_relay_address("203.0.113.7").expect("bare ip");
-        assert_eq!(settings.relay_url, "wss://203.0.113.7/pinvou3/remote/ws");
-    }
-
-    #[test]
-    fn normalize_relay_address_roundtrips_pasted_full_ws_url() {
-        let settings = normalize_relay_address("wss://relay.example.com/pinvou3/remote/ws")
-            .expect("full ws url");
-        assert_eq!(
-            settings.relay_url,
-            "wss://relay.example.com/pinvou3/remote/ws"
-        );
-        assert_eq!(
-            settings.public_base_url,
-            "https://relay.example.com/pinvou3/remote"
-        );
-    }
-
-    #[test]
-    fn normalize_relay_address_respects_custom_path_and_trailing_slash() {
-        let settings = normalize_relay_address("https://cdn.example.com/proxy/").expect("custom");
-        assert_eq!(settings.relay_url, "wss://cdn.example.com/proxy/ws");
-        assert_eq!(settings.public_base_url, "https://cdn.example.com/proxy");
-    }
-
-    #[test]
-    fn normalize_relay_address_rejects_garbage() {
-        for input in [
-            "",
-            "   ",
-            "ftp://x.example.com",
-            "wss://",
-            "https://user:pw@host/x",
-            "host/path?query=1",
-            "host/#frag",
-            "has space.example.com",
-        ] {
-            assert!(
-                normalize_relay_address(input).is_err(),
-                "should reject {input:?}"
-            );
-        }
-    }
-
     fn record_stream_event(stream: &mut StreamState, event: &str, payload: Value) {
         stream
             .record(TEST_ENDPOINT_ID, TEST_LEASE_ID, event.to_string(), payload)
@@ -3302,7 +3266,6 @@ mod tests {
             "uninstall_marketplace_skill",
             "uninstall_marketplace_tool",
             "install_voice_asr",
-            "save_settings_and_restart",
             "artifact_info",
             "read_artifact_text",
             "write_artifact_text",
@@ -3375,12 +3338,30 @@ mod tests {
                 "{command} must be Web-scoped"
             );
         }
+        // The auxiliary conversation (aux session) commands: the WebUI
+        // auxChat domain (bridge.js auxChatEnsure/auxChatReset)
+        // depends on them directly; once allowed, the central validator's
+        // Required("sessionId") scope constraint pins them to an explicit
+        // session.
+        for command in ["get_or_create_aux_session", "reset_aux_session"] {
+            assert!(
+                policy.commands.contains(command),
+                "{command} must be allowed on Web (aux chat)"
+            );
+        }
         assert!(!policy.commands.contains("list_sessions"));
         assert!(!policy.commands.contains("list_archived_sessions"));
+        // The native clipboard fallback must stay desktop-only: a browser relay
+        // session must never be able to read the host clipboard.
+        assert!(!policy.commands.contains("paste_clipboard_image"));
         assert!(policy.events.contains("chat:delta"));
         assert!(policy.events.contains("chat:reasoning_start"));
         assert!(policy.events.contains("chat:reasoning_delta"));
         assert!(policy.events.contains("chat:reasoning_done"));
+        assert!(
+            RUST_FORWARDED_EVENTS.contains(&"remote_control:tools_changed"),
+            "the tools_changed broadcast must be relayed (web hot refresh) but deduped against the app.emit leg"
+        );
         assert!(RUST_FORWARDED_EVENTS.contains(&"chat:reasoning_start"));
         assert!(RUST_FORWARDED_EVENTS.contains(&"chat:reasoning_delta"));
         assert!(RUST_FORWARDED_EVENTS.contains(&"chat:reasoning_done"));
@@ -3489,7 +3470,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(matches!(
             &first[0],
-            RpcReadyAction::Dispatch(dispatch)
+            RpcRequestAction::Dispatch(dispatch)
                 if dispatch.request_id == "queued"
                     && dispatch.command == "chat"
                     && dispatch.bridge_generation == "generation-new"
@@ -3681,12 +3662,16 @@ mod tests {
             ("cancel_user_input", "sessionId"),
             ("cancel_generation", "sessionId"),
             ("web_access_chat", "sessionId"),
+            ("get_or_create_aux_session", "sessionId"),
+            ("reset_aux_session", "sessionId"),
             ("delete_session", "id"),
             ("rename_session", "id"),
             ("set_session_model", "sessionId"),
             ("set_session_archived", "id"),
             ("set_session_pinned", "id"),
             ("save_session_artifacts", "id"),
+            ("get_session_pinvou_scene_events", "sessionId"),
+            ("save_session_pinvou_scene_events", "sessionId"),
             ("web_access_write_artifact_text", "sessionId"),
             ("web_access_render_artifact_visual", "sessionId"),
         ];
@@ -4112,25 +4097,25 @@ mod tests {
 
     #[test]
     fn only_explicit_terminal_relay_messages_acknowledge_a_revocation() {
-        assert!(pending_revocation_ack(
+        assert!(relay_client::terminal_relay_message(
             &json!({
                 "type": "desktop_endpoint_revoked",
                 "endpoint_id": "ep_retired"
             }),
             "ep_retired"
         ));
-        assert!(pending_revocation_ack(
+        assert!(relay_client::terminal_relay_message(
             &json!({
                 "type": "desktop_endpoint_replaced",
                 "endpoint_id": "ep_retired"
             }),
             "ep_retired"
         ));
-        assert!(pending_revocation_ack(
+        assert!(relay_client::terminal_relay_message(
             &json!({ "type": "error", "code": "endpoint_not_found" }),
             "ep_retired"
         ));
-        assert!(!pending_revocation_ack(
+        assert!(!relay_client::terminal_relay_message(
             &json!({
                 "type": "desktop_endpoint_revoked",
                 "endpoint_id": "ep_other"

@@ -105,18 +105,22 @@ fn reserve_unique_staged_file(
     None
 }
 
-fn staged_reserved_target_is_unchanged(file: &std::fs::File, path: &std::path::Path) -> bool {
-    crate::platform::filesystem::reserved_target_is_unchanged(file, path)
-}
-
 fn staged_target_is_safe(
     file: &std::fs::File,
     path: &std::path::Path,
     canonical_workspace: &std::path::Path,
 ) -> bool {
-    staged_reserved_target_is_unchanged(file, path)
+    crate::platform::filesystem::reserved_target_is_unchanged(file, path)
         && std::fs::canonicalize(path)
             .is_ok_and(|resolved| resolved.starts_with(canonical_workspace))
+}
+
+/// Discard a rejected/partial staged file: close the destination FIRST
+/// (Windows cannot unlink an open handle), then remove it. Best-effort —
+/// a failed unlink must not fail the staging rejection.
+fn discard_staged_partial(destination: std::fs::File, path: &std::path::Path) {
+    drop(destination);
+    let _ = std::fs::remove_file(path);
 }
 
 pub(crate) fn stage_file_in_workspace_with_copier<F>(
@@ -140,38 +144,105 @@ where
     let (mut destination, path, candidate) =
         reserve_unique_staged_file(&directory, basename.to_string(), &stem, &suffix)?;
     if !staged_target_is_safe(&destination, &path, &canonical_workspace) {
+        // The reservation created a zero-byte file; a rejected target must
+        // not leave it behind (the same cleanup the copier-error arm below
+        // runs — the doc contract covers every error return, not just the
+        // copy itself).
+        discard_staged_partial(destination, &path);
         return None;
     }
-    if copier(&mut source, &mut destination).is_err() {
-        drop(destination);
-        let _ = std::fs::remove_file(&path);
+    if let Err(error) = copier(&mut source, &mut destination) {
+        discard_staged_partial(destination, &path);
+        // The Option contract degrades every consumer to a generic failure
+        // (the GUI silently drops the attachment, headless reports a staging
+        // error); log the cause so a refused cap or an IO fault — both
+        // indistinguishable from "no file" downstream — stays diagnosable
+        // through the log plugin, which survives the builds where stderr is
+        // lost (windowed Windows) or never watched. The name is
+        // Debug-escaped: a crafted basename cannot forge log lines into the
+        // diagnostic stream.
+        log::warn!("[pinvou3-app] staging {basename:?} failed: {error}");
         return None;
     }
     if !staged_target_is_safe(&destination, &path, &canonical_workspace) {
+        // The same litter rule as the arms above: a rejected target must
+        // not leave the staged file (here fully written) behind.
+        discard_staged_partial(destination, &path);
         return None;
     }
     Some(format!("{attachment_dir}/{candidate}"))
 }
 
+/// The single source of the headless attachment staging cap. Round-51
+/// review: this used to be a second `20 * 1024 * 1024` literal over in
+/// `headless_bridge`, pinned equal to `file_ingest::MAX_FILE_BYTES` by a
+/// compile-time assert that could only compile under `benchmark-hooks` —
+/// a default GUI build carried no pin at all, so raising one side silently
+/// diverged the other. The constant now lives HERE (an unconditionally
+/// compiled module, `pub` for the CLI's `agent_task` pre-boot total via the
+/// `headless_bridge` re-export below), and `headless_bridge` re-exports
+/// this one definition: there is nothing left to drift, so the assert is
+/// gone with the second literal.
+pub const MAX_STAGED_ATTACHMENT_BYTES: u64 = crate::features::files::file_ingest::MAX_FILE_BYTES;
+
 /// Stages an attachment into a workspace subdirectory under a controlled file
 /// name; shared by the GUI attachment commands and the headless eval
 /// attachment staging path.
+///
+/// The copy is bounded by `features::files::file_ingest::MAX_FILE_BYTES`
+/// (the cap `file_ingest::ingest` enforces), which by value equals
+/// [`MAX_STAGED_ATTACHMENT_BYTES`] (the cap `validate_attachments`
+/// hard-fails on) — now one single definition instead of two constants
+/// pinned equal, so the staging copy can never be bounded tighter or looser
+/// than the validate gate. The bound exists because a
+/// caller-owned source can be swapped or grown between the size check and
+/// this copy (TOCTOU), and the oversized content must not land in the
+/// workspace.
 pub fn stage_file_in_workspace(
     src: &str,
     basename: &str,
     workspace: &std::path::Path,
     attachment_dir: &str,
 ) -> Option<String> {
-    stage_file_in_workspace_with_copier(src, basename, workspace, attachment_dir, std::io::copy)
+    stage_file_in_workspace_with_copier(
+        src,
+        basename,
+        workspace,
+        attachment_dir,
+        |source, destination| {
+            copy_bounded(
+                source,
+                destination,
+                crate::features::files::file_ingest::MAX_FILE_BYTES,
+            )
+        },
+    )
 }
 
-pub(crate) fn stage_image_in_workspace(
-    src: &str,
-    basename: &str,
-    workspace: &std::path::Path,
-    attachment_dir: &str,
-) -> Option<String> {
-    stage_file_in_workspace(src, basename, workspace, attachment_dir)
+/// The one bounded copier for staged attachments, shared by every staging call
+/// site (this module's `stage_file_in_workspace` — the agentic task's per-file
+/// cap included — and the eval pipeline): it caps the STAGED bytes even when a
+/// caller-owned source is swapped or grows while the copy streams — the
+/// pre-copy re-stat in the staging loop cannot close that window.
+/// `take(max + 1)` reads exactly one byte past the cap, which is what lets the
+/// over-check distinguish "at the cap" from "over it";
+/// `stage_file_in_workspace_with_copier` deletes the partially written
+/// destination when this returns an error.
+pub(crate) fn copy_bounded(
+    source: impl std::io::Read,
+    mut destination: impl std::io::Write,
+    max_bytes: u64,
+) -> std::io::Result<u64> {
+    let copied = std::io::copy(&mut source.take(max_bytes + 1), &mut destination)?;
+    if copied > max_bytes {
+        // "Exceeded", not "grew": the source may have been over the cap from
+        // the start (the TOCTOU swap being the caller-visible case), not
+        // necessarily mid-copy.
+        return Err(std::io::Error::other(
+            "attachment exceeded the per-file cap during staging",
+        ));
+    }
+    Ok(copied)
 }
 
 /// Reuse a session-owned attachment that is already inside the execution
@@ -208,7 +279,7 @@ pub(crate) fn stage_remote_attachment_source(
     workspace: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let relative =
-        stage_image_in_workspace(src, basename, workspace, ".pinvou3/remote-attachments")?;
+        stage_file_in_workspace(src, basename, workspace, ".pinvou3/remote-attachments")?;
     Some(workspace.join(relative))
 }
 
@@ -234,16 +305,21 @@ pub(crate) fn stage_text_in_workspace(
     attachment_dir: &str,
 ) -> Option<String> {
     use std::io::Write as _;
-    stage_text_in_workspace_with_writer(
+    stage_text_in_workspace_inner(
         basename,
         ext,
         workspace,
         attachment_dir,
-        |destination, _path| destination.write_all(content.as_bytes()),
+        |destination, _| destination.write_all(content.as_bytes()),
     )
 }
 
-pub(crate) fn stage_text_in_workspace_with_writer<F>(
+/// Single body of the text staging lane — the same injection idiom the file
+/// lane uses ([`stage_file_in_workspace_with_copier`]): the writer is a
+/// parameter so tests can fault the write or swap the reserved path and pin
+/// the litter rules directly, while the production lane passes the plain
+/// `write_all` closure (it ignores the reserved path argument).
+pub(crate) fn stage_text_in_workspace_inner<F>(
     basename: &str,
     ext: &str,
     workspace: &std::path::Path,
@@ -261,6 +337,10 @@ where
     let (mut destination, path, candidate) =
         reserve_unique_staged_file(&directory, format!("{stem}{suffix}"), stem, &suffix)?;
     if !staged_target_is_safe(&destination, &path, &canonical_workspace) {
+        // The reservation created a zero-byte file; a rejected target must
+        // not leave it behind (the same litter rule the file lane's
+        // identical arm applies — round-37 review).
+        discard_staged_partial(destination, &path);
         return None;
     }
     if writer(&mut destination, &path).is_err() {
@@ -270,6 +350,14 @@ where
         return None;
     }
     if !staged_target_is_safe(&destination, &path, &canonical_workspace) {
+        // The same litter rule as the arms above: a rejected target must
+        // not leave the staged file (here fully written) behind. Unlike
+        // the write-error arm, unlinking here is safe: the re-check passed
+        // through THIS handle's reservation, so the path still names a file
+        // this call owns (round-48 review: reconcile with the rationale
+        // above — that arm's orphan belongs to nobody anymore; this one is
+        // still ours).
+        discard_staged_partial(destination, &path);
         return None;
     }
     Some(format!("{attachment_dir}/{candidate}"))
@@ -401,8 +489,8 @@ fn push_text_attachment_section(
             } else {
                 out.push_str(
                     "**以下代码块是文件完整内容,可直接使用,不需要再调 `read` 或 `file_search` 重新读取。**\
-                     如需保存修改版本,用 `write` 写到 \
-                     PINVOU3_WORKSPACE 下;单个文件过大时拆分为多个有明确用途的文件。\n",
+                     如需保存修改版本,用 `write` 以相对路径写到当前工作区(即每轮元信息的 \
+                     `Current workspace` 目录);单个文件过大时拆分为多个有明确用途的文件。\n",
                 );
             }
             out.push_str("```\n");
@@ -449,6 +537,8 @@ fn push_attachment_header(out: &mut String, a: &crate::features::files::file_ing
 /// 图片拷进 workspace 后引导 LLM 调 image_analyze 读图(Qwen3.6 有视觉能力);
 /// 文本类附件按 token 预算分流:小→全量内联,大→落盘+路径+预览(见常量注释)。
 /// `reference_absolute` 见 `staged_reference`；普通对话与 scheduled 传 false。
+/// `image_tools_allowed=false`(如 GAIA offline 策略禁 `image_analyze`)时,图片段
+/// 改为如实告知无法读图,不得引导模型调用不存在的工具。
 fn build_message_with_attachments_in_dir_with_access(
     text: String,
     attachments: Vec<crate::features::files::file_ingest::IngestResult>,
@@ -456,6 +546,7 @@ fn build_message_with_attachments_in_dir_with_access(
     attachment_dir: &str,
     reference_absolute: bool,
     read_only_tools: bool,
+    image_tools_allowed: bool,
 ) -> String {
     if attachments.is_empty() {
         return text;
@@ -476,20 +567,30 @@ fn build_message_with_attachments_in_dir_with_access(
             // 一无所知,调用前绝不描述",把模糊建议变成具体硬规则(Qwen3.6 对具体
             // 硬规则遵循好、对抽象意图无效)。
             match existing_workspace_relative_file(&a.path, workspace).or_else(|| {
-                stage_image_in_workspace(&a.path, &a.basename, workspace, attachment_dir)
+                stage_file_in_workspace(&a.path, &a.basename, workspace, attachment_dir)
             }) {
                 Some(rel) => {
                     let rel = staged_reference(workspace, &rel, reference_absolute);
-                    out.push_str(&format!(
-                        "🖼 用户附了一张图片,存在 workspace 的 `{rel}`。\n\
-                        ⚠️ 你现在**看不到这张图的任何内容**,对图里有什么**一无所知**。\
-                        在调用 image_analyze 工具并拿到返回结果之前,你**绝对不能**描述、\
-                        猜测或编造图里有什么——包括「这是什么」「帅吗」「什么颜色」「是不是某某文档」\
-                        这类**任何**关于图的问题。凭空作答=幻觉,是严重错误。\n\
-                        要回答**任何**跟这张图有关的问题,**必须先**调用:\n\
-                        `image_analyze(image_path=\"{rel}\", prompt=\"<按用户问题要看的,如:描述这张图/读出文字/这是什么>\")`\n\
-                        拿到工具返回的描述后,再据此如实回答用户。\n",
-                    ));
+                    if image_tools_allowed {
+                        out.push_str(&format!(
+                            "🖼 用户附了一张图片,存在 workspace 的 `{rel}`。\n\
+                            ⚠️ 你现在**看不到这张图的任何内容**,对图里有什么**一无所知**。\
+                            在调用 image_analyze 工具并拿到返回结果之前,你**绝对不能**描述、\
+                            猜测或编造图里有什么——包括「这是什么」「帅吗」「什么颜色」「是不是某某文档」\
+                            这类**任何**关于图的问题。凭空作答=幻觉,是严重错误。\n\
+                            要回答**任何**跟这张图有关的问题,**必须先**调用:\n\
+                            `image_analyze(image_path=\"{rel}\", prompt=\"<按用户问题要看的,如:描述这张图/读出文字/这是什么>\")`\n\
+                            拿到工具返回的描述后,再据此如实回答用户。\n",
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "🖼 用户附了一张图片(已存到 `{rel}`)。\n\
+                            ⚠️ 本任务的工具策略没有图片查看工具(`image_analyze` 不可用),\
+                            你**无法获知**这张图的内容。基于消息里的其他文本证据作答;\
+                            若答案必须看图,请如实说明本次无法处理。\
+                            **绝对不要**描述、猜测或编造图里有什么。凭空作答=幻觉,是严重错误。\n",
+                        ));
+                    }
                 }
                 None => {
                     out.push_str(
@@ -532,6 +633,7 @@ pub(crate) fn build_message_with_attachments_in_dir(
         attachment_dir,
         reference_absolute,
         false,
+        true,
     )
 }
 
@@ -550,10 +652,14 @@ pub(crate) fn build_message_with_attachments(
 /// Restricted evaluation entry point. Attachment evidence is identical to the
 /// product path, but tool guidance never advertises write, shell, or code
 /// execution capabilities that the evaluation policy forbids.
+/// `image_tools_allowed` mirrors the same policy for `image_analyze`: when the
+/// policy excludes it, the image section discloses that instead of commanding
+/// a call the model cannot make.
 pub(crate) fn build_read_only_message_with_attachments(
     text: String,
     attachments: Vec<crate::features::files::file_ingest::IngestResult>,
     workspace: &std::path::Path,
+    image_tools_allowed: bool,
 ) -> String {
     build_message_with_attachments_in_dir_with_access(
         text,
@@ -562,6 +668,7 @@ pub(crate) fn build_read_only_message_with_attachments(
         "attachments",
         false,
         true,
+        image_tools_allowed,
     )
 }
 
@@ -599,14 +706,13 @@ pub(crate) fn prepare_native_user_message_in_dir(
         if a.kind == "image" {
             // 暂存复用现有校验链(basename 白名单/symlink 防逃逸/create_new 防覆盖);
             // 标记路径只来自暂存结果,不接受前端直给路径(设计 §11)。
-            let relative =
-                stage_image_in_workspace(&a.path, &a.basename, workspace, attachment_dir)
-                    .ok_or_else(|| {
-                        format!(
-                            "图片 {} 暂存到 workspace 失败,无法原生发送。请重新选择图片。",
-                            a.basename
-                        )
-                    })?;
+            let relative = stage_file_in_workspace(&a.path, &a.basename, workspace, attachment_dir)
+                .ok_or_else(|| {
+                    format!(
+                        "图片 {} 暂存到 workspace 失败,无法原生发送。请重新选择图片。",
+                        a.basename
+                    )
+                })?;
             let abs = workspace.join(&relative);
             segment.push_str(&format!(
                 "### {} (image, {} bytes)\n",
@@ -657,6 +763,7 @@ mod read_only_prompt_tests {
             "inspect".into(),
             vec![attachment("A | B\n1 | 2".into(), 10)],
             workspace.path(),
+            true,
         );
 
         assert!(prompt.contains("当前会话只有只读工具"));
@@ -672,11 +779,198 @@ mod read_only_prompt_tests {
             "inspect".into(),
             vec![attachment("row\n".repeat(20_000), 50_000)],
             workspace.path(),
+            true,
         );
 
         assert!(prompt.contains("read(path=..., offset=..., limit=...)"));
         assert!(prompt.contains("不要请求 bash、代码执行、write 或 edit"));
         assert!(!prompt.contains("bash(command="));
         assert!(!prompt.contains("`write`"));
+    }
+
+    #[test]
+    fn offline_policy_image_discloses_unavailability_instead_of_commanding_image_analyze() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("attachments")).unwrap();
+        let staged = workspace.path().join("attachments/photo.png");
+        std::fs::write(&staged, b"png").unwrap();
+        let img = IngestResult {
+            kind: "image".into(),
+            basename: "photo.png".into(),
+            path: staged.to_string_lossy().into_owned(),
+            markdown: None,
+            token_estimate: 0,
+            byte_size: 64,
+            warning: None,
+        };
+        let without_tools = build_read_only_message_with_attachments(
+            "inspect".into(),
+            vec![img.clone()],
+            workspace.path(),
+            false,
+        );
+        assert!(without_tools.contains("image_analyze` 不可用"));
+        assert!(!without_tools.contains("必须先**调用"));
+        // 不依赖加粗标记的否定钉：文案改写去掉 `**` 后，命令模板不得随披露一起
+        // 悄悄回来。
+        assert!(!without_tools.contains("image_analyze(image_path="));
+        let with_tools = build_read_only_message_with_attachments(
+            "inspect".into(),
+            vec![img],
+            workspace.path(),
+            true,
+        );
+        assert!(with_tools.contains("**必须先**调用"));
+        assert!(with_tools.contains("image_analyze(image_path="));
+    }
+}
+
+#[cfg(test)]
+mod staged_copy_limit_tests {
+    use super::{copy_bounded, stage_file_in_workspace, stage_file_in_workspace_with_copier};
+
+    /// The cap the assertions below exercise. It is injected instead of using
+    /// the real `MAX_FILE_BYTES`: the copy streams every byte of the source
+    /// into the destination, so pinning a `take()` at the real 20 MiB cap cost
+    /// tens of megabytes of disk I/O per `cargo test` run to prove a bound
+    /// that is the same comparison at 8 bytes. `copy_bounded`'s own staging
+    /// tests in `product_runtime::agentic_task` use the same 8-byte trick.
+    const TEST_LIMIT: u64 = 8;
+
+    /// TOCTOU regression: `validate_attachments` / ingest check
+    /// `metadata.len()` first, then the staging helper copies. A source that
+    /// is swapped or grown between those two steps must not let over-limit
+    /// content through — the copy path enforces the cap itself, and the
+    /// partially written destination is removed.
+    #[test]
+    fn staged_copy_rejects_a_source_swapped_over_the_limit() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("swap.png");
+        std::fs::write(&source, b"x").unwrap();
+
+        // Same-user swap between the metadata check and the copy.
+        std::fs::write(&source, vec![b'x'; TEST_LIMIT as usize + 1]).unwrap();
+
+        let staged = stage_file_in_workspace_with_copier(
+            source.to_str().unwrap(),
+            "swap.png",
+            workspace.path(),
+            "attachments",
+            |source, destination| copy_bounded(source, destination, TEST_LIMIT),
+        );
+
+        assert_eq!(staged, None);
+        assert!(!workspace.path().join("attachments/swap.png").exists());
+    }
+
+    #[test]
+    fn staged_copy_accepts_a_source_exactly_at_the_limit() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("max.png");
+        let contents = vec![b'x'; TEST_LIMIT as usize];
+        std::fs::write(&source, &contents).unwrap();
+
+        let staged = stage_file_in_workspace_with_copier(
+            source.to_str().unwrap(),
+            "max.png",
+            workspace.path(),
+            "attachments",
+            |source, destination| copy_bounded(source, destination, TEST_LIMIT),
+        )
+        .unwrap();
+
+        assert_eq!(staged, "attachments/max.png");
+        assert_eq!(
+            std::fs::read(workspace.path().join(&staged)).unwrap(),
+            contents,
+            "a source exactly at the cap stages byte for byte"
+        );
+    }
+
+    /// The over-check itself: `take(max + 1)` means the destination has one
+    /// byte more than the cap when the copier refuses, which is exactly how
+    /// "at the cap" is told apart from "over it". The staging helper is what
+    /// deletes that partial file (asserted above); the copier only reports.
+    #[test]
+    fn capped_copier_errors_one_byte_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("over.bin");
+        let destination_path = dir.path().join("over.staged");
+        std::fs::write(&source_path, vec![b'x'; TEST_LIMIT as usize + 4]).unwrap();
+        let mut source = std::fs::File::open(&source_path).unwrap();
+        let mut destination = std::fs::File::create(&destination_path).unwrap();
+
+        let error = copy_bounded(&mut source, &mut destination, TEST_LIMIT).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains("per-file cap"),
+            "the copier must name the cap: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&destination_path).unwrap().len(),
+            TEST_LIMIT + 1
+        );
+    }
+
+    /// The production wiring: `stage_file_in_workspace` passes the real
+    /// `MAX_FILE_BYTES`, so an ordinary attachment stages through the bounded
+    /// copier untouched. Kept cheap on purpose — the bound's behaviour is
+    /// pinned above; what this adds is that the default path has a copier at
+    /// all and that its cap is not so low it rejects real files.
+    #[test]
+    fn the_default_staging_copier_passes_an_ordinary_attachment_through() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("note.md");
+        std::fs::write(&source, b"# ordinary attachment\n").unwrap();
+
+        let staged = stage_file_in_workspace(
+            source.to_str().unwrap(),
+            "note.md",
+            workspace.path(),
+            "attachments",
+        )
+        .expect("an ordinary attachment stages through the default bounded copier");
+
+        assert_eq!(staged, "attachments/note.md");
+        assert_eq!(
+            std::fs::read(workspace.path().join(&staged)).unwrap(),
+            b"# ordinary attachment\n"
+        );
+    }
+
+    /// The default path must keep its behavioral pin, not just the injected
+    /// one: the over-cap tests above drive `TEST_LIMIT = 8` through
+    /// `stage_file_in_workspace_with_copier`, which a refactor that unbound
+    /// the DEFAULT closure (or dropped the copier call) would survive with a
+    /// green suite. A sparse file one byte over the real `MAX_FILE_BYTES`
+    /// pins the production wiring through `stage_file_in_workspace` itself.
+    #[test]
+    fn the_default_staging_copier_rejects_over_the_real_cap() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("huge.bin");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len((crate::features::files::file_ingest::MAX_FILE_BYTES as u64) + 1)
+            .unwrap();
+        drop(file);
+
+        let staged = stage_file_in_workspace(
+            source.to_str().unwrap(),
+            "huge.bin",
+            workspace.path(),
+            "attachments",
+        );
+        assert!(
+            staged.is_none(),
+            "an over-cap source must be rejected by the DEFAULT wiring: {staged:?}"
+        );
+        assert!(
+            !workspace.path().join("attachments/huge.bin").exists(),
+            "a rejected staging must not leave the target behind"
+        );
     }
 }

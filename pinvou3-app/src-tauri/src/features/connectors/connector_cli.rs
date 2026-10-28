@@ -1,21 +1,27 @@
+// architecture-guard: allow-target-cfg -- the shared `cli-install.log` must carry
+// 0600 on every append (it can echo npmrc tokens), and creation mode alone leaves
+// the umask default whenever the other surface created the file first; the chmod is
+// unix-scoped like every other 0600 claim, and the helper is unit-pinned below.
 //! 通用 CLI 连接器管道 —— 抽自 `feishu.rs`,供飞书 / 企微等"官方 CLI 连接器"共享。
 //!
 //! 设计(开发方案 C):公共的"起子进程 / 抑黑窗 / 抓授权 URL / 出二维码 / 收发事件 /
 //! 取消"逻辑收口在此;各连接器(`feishu.rs` / `wecom.rs`)只持有自己的 [`CliCtx`]
 //! 薄声明 + 一段连接编排函数,调本模块的公共件。
 //!
-//! **drain 多态性说明**:[`drain_for_url`] 只发 URL(`String`),供飞书/企微共享。
-//! tmeet/dingtalk 有各自的私有 drain(`drain_for_auth_url`/`drain_for_auth_event`),
-//! 因为它们在同一管道里额外抓取安全日志行 / user_code,channel 元素类型分别为
-//! `(Option<String>, Option<String>)` 和 `AuthEvent` enum。这是真实业务差异,
-//! 强行泛型化会增加闭包复杂度而收益有限——三者的 `BufReader::lines` 循环骨架
+//! **drain 多态性说明**:[`drain_for_url`] 每行发 `(URL, 脱敏安全行)` 二元组,
+//! 供飞书/企微/tmeet 共享(URL 出二维码,安全行进失败原因缓冲;tmeet 以
+//! `redact_bare_token=true` 开启 bare-"token" 兜底)。
+//! 仅 dingtalk 有私有 drain(`drain_for_auth_event`),因为它的 channel 元素类型
+//! 是 `AuthEvent` enum(同一管道里额外抓 user_code)。这是真实业务差异,
+//! 强行泛型化会增加闭包复杂度而收益有限——两者的 `BufReader::lines` 循环骨架
 //! 虽同构,但行处理逻辑不可统一。
 //!
 //! 连接状态(长驻子进程 PID + 取消标志)用一个 [`ConnectorConn`] 按连接器 id 复用,
 //! `lib.rs` 里 `.manage(ConnectorConn::default())` 注册一次,飞书 / 企微共用。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -78,10 +84,6 @@ impl CliCtx {
 
 fn connector_cli_command(cli_bin: &str, program: &str) -> Command {
     crate::platform::os::connector_cli_command(cli_bin, program)
-}
-
-pub fn apply_user_npm_prefix(cmd: &mut Command) {
-    crate::platform::os::apply_user_npm_prefix(cmd);
 }
 
 // ─────────────────────────────── 公共执行件 ───────────────────────────────
@@ -231,18 +233,56 @@ pub fn run(cmd: Command) -> Result<(bool, String, String), String> {
 /// 1. **stdin 显式接 null**。app 是无窗口 GUI 进程,继承来的 stdin 是坏句柄,
 ///    CLI 安装器(`@wecom/cli` / `@larksuite/cli` 等)读它会**死等 → 每次卡到超时**
 ///    (终端手动跑却几十秒就成)。给个立即 EOF 的 null stdin,安装器走非交互分支跑通。
-/// 2. **stdout/stderr 落日志文件**(不再 `null` 丢弃),失败可诊断:
-///    `~/.pinvou3/cli-install.log`。写文件不是管道、无写满死锁之虞。
+/// 2. **stdout/stderr are appended to a log file** (no longer discarded to
+///    `null`), so failures are diagnosable: `~/.pinvou3/cli-install.log`.
+///    Writing to a file is not a pipe, so there is no risk of a deadlocked
+///    write on a full buffer. Appending instead of truncating on every run
+///    preserves each stage's output of a multi-stage install (mirror retry
+///    after the default registry fails); stage boundaries are distinguished
+///    by the marker lines of [`append_cli_install_log`].
+/// Opens the shared `cli-install.log` for append and enforces 0600 on the
+/// opened handle (round-46 review: creation mode alone left the umask
+/// default whenever the desktop app created the log before the CLI's npm
+/// lane — or vice versa — and the log can echo npmrc tokens). The chmod is
+/// best-effort: a failure must not fail the install. Returns the handle and
+/// a clone for stdout/stderr redirection, or the open error.
+fn open_install_log_appender(
+    log_path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    harden_log_mode(&file);
+    let clone = file.try_clone()?;
+    Ok((file, clone))
+}
+
+/// Best-effort 0600 on an opened `cli-install.log` handle, shared by the
+/// redirect appender above and the marker appender below (rationale in the
+/// file-top allow-target-cfg note: the log can echo npmrc tokens, and
+/// creation mode alone leaves the umask default whenever the other surface
+/// created the file first). A chmod failure must not fail the install.
+fn harden_log_mode(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+}
+
 pub fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<bool, String> {
     let log_path = crate::platform::paths::pinvou3_home().join("cli-install.log");
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let (out, err) = match std::fs::File::create(&log_path) {
-        Ok(f) => match f.try_clone() {
-            Ok(f2) => (Stdio::from(f), Stdio::from(f2)),
-            Err(_) => (Stdio::null(), Stdio::null()),
-        },
+    rotate_cli_install_log_if_oversized(&log_path);
+    let (out, err) = match open_install_log_appender(&log_path) {
+        Ok((f, f2)) => (Stdio::from(f), Stdio::from(f2)),
         Err(_) => (Stdio::null(), Stdio::null()), // 落不了盘也别卡,回退丢弃
     };
     cmd.stdin(Stdio::null()).stdout(out).stderr(err);
@@ -287,37 +327,73 @@ pub fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<bool, String> {
     }
 }
 
+/// Appends one stage marker line to `cli-install.log`. The log is
+/// append-only (see the module's `run_with_timeout`, which rotates and
+/// drives vendor children under the same budget); each stage's output of a
+/// multi-stage install (mirror retry after the default registry fails) is
+/// attributed via its marker line. Write failures are likewise silently
+/// dropped and never block the install flow.
+pub fn append_cli_install_log(line: &str) {
+    let log_path = crate::platform::paths::pinvou3_home().join("cli-install.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        // Round-47 review: this marker appender is the one `cli-install.log`
+        // writer left that created the file at umask default — the round-46
+        // 0600 tightening covered only the redirect appender above, so a log
+        // first created by a marker line stayed world-readable until a
+        // redirect append happened to tighten it. Same best-effort chmod:
+        // a failure must not fail the install.
+        harden_log_mode(&file);
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// `cli-install.log` is append-only with no natural upper bound (output of
+/// multi-stage installs / repeated retries accumulates, growing for the
+/// application's entire lifetime). Once the size limit is exceeded it is
+/// rotated to `cli-install.log.old` (overwriting the previous copy): disk
+/// usage stays bounded while the latest output of the current install is
+/// still fully preserved.
+const CLI_INSTALL_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Rotates `cli-install.log` to `.old` once it exceeds the 8 MiB budget.
+/// `pub` for the headless CLI's ensure-cli lane, which redirects npm stdio
+/// into the same log directly (`connectors.rs::run_npm_attempt`) and must
+/// enforce the same bound the GUI's `run_with_timeout` enforces here.
+pub fn rotate_cli_install_log_if_oversized(log_path: &Path) {
+    rotate_cli_install_log_if_oversized_with(log_path, CLI_INSTALL_LOG_MAX_BYTES);
+}
+
+fn rotate_cli_install_log_if_oversized_with(log_path: &Path, max_bytes: u64) {
+    let mut rotated = log_path.as_os_str().to_owned();
+    rotated.push(".old");
+    // When two installs trigger rotation concurrently, the later rename
+    // fails: log rotation is not worth a lock, so ignore it.
+    // Relies on std::fs::rename's replace-existing-destination semantics: on
+    // Windows it also replaces (FileRenameInfoEx POSIX semantics, falling
+    // back to MoveFileExW + REPLACE_EXISTING), so the old `.old` is directly
+    // overwritten with no prior delete; failures are ignored only for cases
+    // such as the destination being held by another process, and the next
+    // rotation retries (the test below pins this overwrite semantics).
+    let _ = crate::platform::filesystem::rotate_log_if_oversized(
+        log_path,
+        max_bytes,
+        Some(Path::new(&rotated)),
+    );
+}
+
 /// Bounded reap of a killed connector child with the shared grace budget,
 /// so auth-timeout and cancel paths do not leave zombies behind. The
 /// outcome is deliberately discarded by callers: their user-facing
 /// messages describe the auth result, not process hygiene.
 pub(crate) fn reap_after_kill(child: &mut Child) {
     let _ = reap_killed_child(child, REAP_GRACE);
-}
-
-/// 标准 base64 编码(避免引新依赖)。
-pub fn b64(data: &[u8]) -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(A[((n >> 18) & 63) as usize] as char);
-        out.push(A[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            A[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            A[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// 从一段输出里抓第一个 JSON 对象(CLI `--json` 有时夹带 spinner / 提示行)。
@@ -347,6 +423,7 @@ pub fn parse_semver3(s: &str) -> Option<(u64, u64, u64)> {
 /// 纯 Rust(qrcode crate),不依赖具体 CLI 的 qrcode 子命令——各连接器通用。
 /// 失败返回 `None`(前端回退开浏览器)。
 pub fn make_qr(url: &str) -> Option<String> {
+    use base64::Engine as _;
     use qrcode::QrCode;
     use qrcode::render::svg;
     let code = QrCode::new(url.as_bytes()).ok()?;
@@ -357,7 +434,7 @@ pub fn make_qr(url: &str) -> Option<String> {
         .build();
     Some(format!(
         "data:image/svg+xml;base64,{}",
-        b64(svg_xml.as_bytes())
+        base64::engine::general_purpose::STANDARD.encode(svg_xml.as_bytes())
     ))
 }
 
@@ -366,6 +443,7 @@ pub fn make_qr(url: &str) -> Option<String> {
 /// signature plus the IEND tail; non-PNG / truncated files return `None` (the
 /// caller falls back to [`make_qr`]).
 pub fn png_data_url(bytes: &[u8]) -> Option<String> {
+    use base64::Engine as _;
     const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
     // The IEND chunk is always length(0) + type + CRC: the CRC over the IEND
     // content is fixed, so the whole tail can be compared verbatim. Checking only
@@ -378,14 +456,23 @@ pub fn png_data_url(bytes: &[u8]) -> Option<String> {
     {
         return None;
     }
-    Some(format!("data:image/png;base64,{}", b64(bytes)))
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
-/// 后台线程:逐行排空一个管道(防写满阻塞),抓到首个本连接器 URL 经 channel 送回。
+/// 后台线程:逐行排空一个管道(防写满阻塞),每行经 channel 送回
+/// `(首个本连接器 URL, 脱敏安全行)` 二元组。URL 供二维码;安全行(已按
+/// [`safe_auth_log_line`] 脱敏 + 截断)供连接器收进失败原因环形缓冲。
+/// `redact_bare_token` 透传给 [`safe_auth_log_line`]:飞书/企微传 `false`(CLI 的
+/// 正常输出行可能含含 token 字样的字段名,开启会把非敏感行整体吞成占位符,
+/// 失败原因就没了),tmeet 传 `true`(与 dingtalk 同款取舍)。
 pub fn drain_for_url<R: std::io::Read + Send + 'static>(
     ctx: CliCtx,
+    redact_bare_token: bool,
     r: R,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<(Option<String>, Option<String>)>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         for line in BufReader::new(r).lines() {
@@ -397,11 +484,55 @@ pub fn drain_for_url<R: std::io::Read + Send + 'static>(
                     break;
                 }
             };
-            if let Some(u) = ctx.extract_url(&line) {
-                let _ = tx.send(u);
-            }
+            let safe = safe_auth_log_line(&line, redact_bare_token);
+            let url = ctx.extract_url(&line);
+            let _ = tx.send((url, safe));
         }
     })
+}
+
+/// 失败原因环形缓冲的推送(容量 32,超出丢最旧)。`line` 必须是
+/// [`safe_auth_log_line`] 过滤后的行或 `None`;这里只负责容量与入队。
+pub fn remember_auth_line(
+    auth_lines: &mut std::collections::VecDeque<String>,
+    line: Option<String>,
+) {
+    if let Some(line) = line {
+        if auth_lines.len() >= 32 {
+            auth_lines.pop_front();
+        }
+        auth_lines.push_back(line);
+    }
+}
+
+/// 从排空得到的安全行里挑失败原因拼进 fallback(倒序找 failed/error/timeout/
+/// lock/失败 行,兜底取最后一行;没有任何安全行时原样返回 fallback)。
+/// 卡片只显示本地化类目文案,这里拼出的串走 `*:error` 的 message 字段与
+/// stderr/log 诊断轨迹——没有它,最常见的「CLI 打了原因再退出」在日志里
+/// 只剩应用侧的兜底话术,用户报告后无从诊断(tmeet/dingtalk 各自同款)。
+pub fn auth_failure_reason(
+    auth_lines: &std::collections::VecDeque<String>,
+    fallback: &str,
+) -> String {
+    let last_line = auth_lines
+        .iter()
+        .rev()
+        .find(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("failed")
+                || l.contains("error")
+                || l.contains("timeout")
+                || l.contains("lock")
+                || line.contains("失败")
+        })
+        .cloned()
+        .or_else(|| auth_lines.back().cloned())
+        .unwrap_or_default();
+    if last_line.is_empty() {
+        fallback.to_string()
+    } else {
+        format!("{fallback}：{last_line}")
+    }
 }
 
 /// tree-kill 一个 PID,连其子进程(.cmd 拉起的 node)一起。
@@ -461,14 +592,45 @@ pub struct ConnectorConn {
 struct Slot {
     pid: Option<u32>,
     cancelled: bool,
+    /// Bumped by every connect_begin; lets a flow thread recognize it was
+    /// superseded by a newer round.
+    generation: u64,
 }
 
 impl ConnectorConn {
-    /// 开始一轮连接前清掉该连接器的取消标志。
-    pub fn reset(&self, id: &'static str) {
-        if let Ok(mut m) = self.slots.lock() {
-            m.entry(id).or_default().cancelled = false;
+    /// Clears the connector's cancel flag before a new round and returns the
+    /// new round's generation.
+    pub fn reset(&self, id: &'static str) -> u64 {
+        match self.slots.lock() {
+            Ok(mut m) => {
+                let s = m.entry(id).or_default();
+                s.cancelled = false;
+                s.generation = s.generation.wrapping_add(1);
+                s.generation
+            }
+            Err(_) => {
+                // Poisoned slot mutex: mint generation 0, which flow_stale
+                // always treats as stale (its lock fails there too, so it
+                // defaults to stale), making a poisoned connector fail silent
+                // — no QR/error emits at all — instead of one round's events
+                // landing on another round's card. A live slot never hands
+                // out 0: reset always bumps before returning.
+                0
+            }
         }
+    }
+
+    /// Self-check for a flow thread before emitting: reset() clears the
+    /// cancelled flag, so the flag alone cannot stop a late emit in the
+    /// "cancel then immediately reconnect" window — the old round's failure
+    /// would land on the new round's fresh card. A generation mismatch means
+    /// stale.
+    pub fn flow_stale(&self, id: &str, generation: u64) -> bool {
+        self.slots
+            .lock()
+            .ok()
+            .and_then(|m| m.get(id).map(|s| s.generation != generation))
+            .unwrap_or(true)
     }
 
     /// 置取消标志,返回当前长驻 PID(供 tree-kill)。
@@ -492,6 +654,20 @@ impl ConnectorConn {
     pub fn set_pid(&self, id: &'static str, pid: Option<u32>) {
         if let Ok(mut m) = self.slots.lock() {
             m.entry(id).or_default().pid = pid;
+        }
+    }
+
+    /// Clears the slot's pid only when it still holds `pid`. A superseded flow
+    /// thread finishing its own cleanup must not clear the pid a newer round
+    /// has registered — cancel's tree-kill and kill_all_pids would miss the
+    /// live child.
+    pub fn clear_pid_if(&self, id: &'static str, pid: u32) {
+        if let Ok(mut m) = self.slots.lock() {
+            if let Some(s) = m.get_mut(id) {
+                if s.pid == Some(pid) {
+                    s.pid = None;
+                }
+            }
         }
     }
 
@@ -530,20 +706,57 @@ pub async fn refresh_connector_auth_gates() -> Result<ConnectorAuthGateRefresh, 
         })
         .collect();
 
-    let mut visible_marks = Vec::with_capacity(tasks.len());
+    // Round-32 minor 9 (review #455): the loop must attribute EVERY gate —
+    // the old zip-`??` short-circuited on the first failure, dropping the
+    // remaining gates' `visible=` marks and the whole `done` mark, so one
+    // broken gate blinded startup observability for the other three (this
+    // PR's ledger-gated refresh supplies the loop's first realistic error
+    // source). All four tasks always run to completion; the marks record
+    // every outcome, the `done` mark is always emitted, and the first gate
+    // error is returned after the bookkeeping.
+    let mut outcomes = Vec::with_capacity(tasks.len());
     for (gate, task) in skill_gate::GATES.iter().zip(tasks) {
-        let visible = task
+        let result = task
             .await
-            .map_err(|e| format!("{}鉴权探测任务失败: {e}", gate.display_name))??;
-        visible_marks.push(format!("{}_visible={visible}", gate.id));
+            .map_err(|e| format!("{}鉴权探测任务失败: {e}", gate.display_name));
+        outcomes.push((gate.id.to_string(), result));
     }
+    let (visible_marks, first_error) = collect_refresh_outcomes(outcomes);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     crate::platform::startup::mark_with_detail(
         "rust",
         "connector_auth_refresh:done",
         &format!("elapsed_ms={elapsed_ms} {}", visible_marks.join(" ")),
     );
-    Ok(ConnectorAuthGateRefresh { elapsed_ms })
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(ConnectorAuthGateRefresh { elapsed_ms }),
+    }
+}
+
+/// Round-32 minor 9 (review #455): pure attribution builder for
+/// [`refresh_connector_auth_gates`] — one `visible=` mark per gate (in gate
+/// order, `error` for a failed gate) plus the first gate error, so a broken
+/// gate no longer blinds the rest. Testable without real CLI probes.
+fn collect_refresh_outcomes(
+    outcomes: Vec<(String, Result<Result<bool, String>, String>)>,
+) -> (Vec<String>, Option<String>) {
+    let mut marks = Vec::with_capacity(outcomes.len());
+    let mut first_error: Option<String> = None;
+    for (id, result) in outcomes {
+        match result {
+            Ok(Ok(visible)) => marks.push(format!("{id}_visible={visible}")),
+            Ok(Err(e)) => {
+                marks.push(format!("{id}_visible=error"));
+                first_error.get_or_insert(e);
+            }
+            Err(e) => {
+                marks.push(format!("{id}_visible=error"));
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    (marks, first_error)
 }
 
 // ─────────────── BundleStore 镜像（marketplace-unification Phase 2）───────────────
@@ -554,9 +767,23 @@ pub async fn refresh_connector_auth_gates() -> Result<ConnectorAuthGateRefresh, 
 /// 连接成功（授权就绪）后登记 CLI 包：`source=Builtin`，并清除 `degraded`
 /// （重连即修复，§3.2）。既有记录保留首次登记时间与 extra（见
 /// `BundleStore::upsert_preserving`）。
+///
+/// 与首启旧布局导入共用同一登记口径（store 的 `verified_cli_asset`）：对盘上
+/// 二进制重新计算 SHA-256 并与 lock 表核对，匹配才把版本+哈希登记为
+/// `AssetEntry::Ref`；二进制缺失/不匹配/无 lock 条目（如走 npm 的 tmeet、
+/// 用户自装的 PATH 二进制）一律降级为无 pin 记录，不使连接镜像失败，也不据此
+/// 置 `degraded`。记录里的 sha256 是持久化存证，不得指向未经验证的字节。
+/// `upsert_preserving` 在本写入者不携带 pin 时保留旧 pin。
 pub fn bundle_store_on_connected(id: &str) {
-    use crate::features::marketplace::store::{BundleRecord, BundleSource, BundleStore};
-    let record = BundleRecord::installed_now(id, BundleSource::Builtin);
+    use crate::features::marketplace::store::{
+        AssetEntry, BundleRecord, BundleSource, BundleStore, verified_cli_asset,
+    };
+    let asset =
+        crate::features::marketplace::bundle::cli_bundle_bin(id).and_then(verified_cli_asset);
+    let mut record = BundleRecord::installed_now(id, BundleSource::Builtin);
+    if let Some(asset) = asset {
+        record.assets.push(AssetEntry::Ref(asset));
+    }
     if let Err(e) = BundleStore::new().upsert_preserving(record) {
         log::warn!("[connectors] bundles.json 镜像写入失败（connect {id}）: {e}");
     }
@@ -567,24 +794,198 @@ pub fn bundle_store_on_connected(id: &str) {
 /// 删掉 companion 技能目录，包内容不完整，故按 §3.2 的 Degraded（登记在、资源缺）
 /// 标记；修复动作 = 重新连接（重解包技能），与预置重装/上传重导入同构。
 /// 记录不存在（从未连接成功过）时 mark_degraded 返回 false，天然无操作。
+///
+/// The reason copy written comes from the marketplace side's
+/// `CLI_DISCONNECTED_DEGRADED_REASON` (prefix-match judgment in
+/// `bundle.rs`), eliminating the two-literal drift; the connectors →
+/// marketplace dependency direction matches the standing boundary (see the
+/// comment in `bundle.rs`).
 pub fn bundle_store_on_disconnected(id: &str) {
-    if let Err(e) = crate::features::marketplace::store::BundleStore::new()
-        .mark_degraded(id, "已断开授权：配套技能已随断开移除，重新连接即可恢复")
-    {
+    if let Err(e) = crate::features::marketplace::store::BundleStore::new().mark_degraded(
+        id,
+        crate::features::marketplace::bundle::CLI_DISCONNECTED_DEGRADED_REASON,
+    ) {
         log::warn!("[connectors] bundles.json 镜像写入失败（disconnect {id}）: {e}");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Round-46 review: the appender must enforce 0600 on a PRE-EXISTING
+    /// log file (creation mode alone left the umask default when the other
+    /// surface created the file first) — the scenario the file-top
+    /// allow-target-cfg exception documents.
+    #[cfg(unix)]
+    #[test]
+    fn install_log_appender_tightens_a_pre_existing_log_to_0600() {
+        // Scoped here (not at module top) because the only use of the
+        // helper in tests is this unix-only pin; a module-level import
+        // would be unused — and fail `-D unused-imports` — on Windows.
+        use super::open_install_log_appender;
+        let dir = std::env::temp_dir().join(format!(
+            "pinvou-log-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("cli-install.log");
+        std::fs::write(&log, b"gui wrote first").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (_file, _clone) = open_install_log_appender(&log).unwrap();
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the append must tighten the shared log to 0600"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::*;
     use std::io::{Error, Read};
+
+    /// 连接镜像的存证口径：盘上二进制无法通过 hash 核对（缺失/不匹配/无 lock
+    /// 条目）时必须降级为无 pin 记录，而非携带 lock 表的「应然」pin。
+    #[test]
+    fn connect_mirror_degrades_to_pin_less_record_without_a_verifiable_binary() {
+        use crate::platform::test_support::with_temp_home;
+        with_temp_home("pinvou3-connect-mirror-pin-less", || {
+            super::bundle_store_on_connected("feishu");
+            let record = crate::features::marketplace::store::BundleStore::new()
+                .get("feishu")
+                .unwrap()
+                .expect("connect 必须登记记录");
+            assert!(record.installed);
+            assert_eq!(record.degraded, None);
+            assert!(
+                record.assets.is_empty(),
+                "盘上无可校验二进制时必须写无 pin 记录: {:?}",
+                record.assets
+            );
+        });
+    }
+
+    /// Round-32 minor 9 (review #455): the attribution builder records every
+    /// gate even when one fails — a broken gate must not blind the rest, and
+    /// the first error is only returned after the bookkeeping.
+    #[test]
+    fn refresh_outcomes_attribute_every_gate_on_partial_failure() {
+        let outcomes = vec![
+            ("feishu".to_string(), Ok(Ok(true))),
+            (
+                "wecom".to_string(),
+                Ok(Err("刷新企微技能门控失败: boom".to_string())),
+            ),
+            (
+                "dingtalk".to_string(),
+                Err("钉钉鉴权探测任务失败: join".to_string()),
+            ),
+            ("tmeet".to_string(), Ok(Ok(false))),
+        ];
+        let (marks, first_error) = collect_refresh_outcomes(outcomes);
+        assert_eq!(
+            marks,
+            vec![
+                "feishu_visible=true".to_string(),
+                "wecom_visible=error".to_string(),
+                "dingtalk_visible=error".to_string(),
+                "tmeet_visible=false".to_string(),
+            ],
+            "every gate keeps its attribution mark, failed or not"
+        );
+        assert_eq!(
+            first_error.as_deref(),
+            Some("刷新企微技能门控失败: boom"),
+            "the first gate error wins, after the marks are recorded"
+        );
+    }
 
     const TEST_CTX: CliCtx = CliCtx {
         cli_bin: "test-cli",
         envs: &[],
         auth_domains: &["work.weixin.qq.com", "weixin.qq.com"],
     };
+
+    /// The append-only cli-install.log has no natural upper bound: over the
+    /// limit it must rotate to `.old` (overwriting the previous rotation);
+    /// under the limit it is left untouched.
+    #[test]
+    fn oversized_cli_install_log_rotates_to_old() {
+        let root = std::env::temp_dir().join(format!("pinvou-cli-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("cli-install.log");
+        std::fs::write(&log_path, b"x").unwrap();
+        rotate_cli_install_log_if_oversized_with(&log_path, 1024);
+        assert!(log_path.exists());
+        assert!(!root.join("cli-install.log.old").exists());
+
+        std::fs::write(&log_path, [b'a'; 2048]).unwrap();
+        rotate_cli_install_log_if_oversized_with(&log_path, 1024);
+        assert!(!log_path.exists());
+        assert_eq!(
+            std::fs::read(root.join("cli-install.log.old"))
+                .unwrap()
+                .len(),
+            2048
+        );
+
+        // The second rotation must overwrite the existing `.old` (including
+        // on Windows: std::fs::rename has the same replace semantics there,
+        // covered by the CI Windows leg of this test); if a failed replace
+        // were swallowed, the main log would grow unboundedly from this
+        // point on.
+        std::fs::write(&log_path, [b'b'; 2048]).unwrap();
+        std::fs::write(root.join("cli-install.log.old"), b"stale-old-log").unwrap();
+        rotate_cli_install_log_if_oversized_with(&log_path, 1024);
+        assert!(!log_path.exists());
+        let rotated = std::fs::read(root.join("cli-install.log.old")).unwrap();
+        assert_eq!(rotated.len(), 2048);
+        assert!(rotated.iter().all(|&b| b == b'b'), "{rotated:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every reset bumps the generation: once a new round starts, a flow
+    /// thread holding the old generation is treated as stale while the new
+    /// one passes the self-check — the guarantee that keeps an old round's
+    /// failure off the new round's card.
+    #[test]
+    fn generation_marks_superseded_flows_stale() {
+        let conn = ConnectorConn::default();
+        let gen1 = conn.reset("test-connector");
+        assert!(!conn.flow_stale("test-connector", gen1));
+        let gen2 = conn.reset("test-connector");
+        assert!(conn.flow_stale("test-connector", gen1));
+        assert!(!conn.flow_stale("test-connector", gen2));
+        // Cancel does not bump the generation: post-cancel silence stays the
+        // cancelled flag's job.
+        conn.cancel("test-connector");
+        assert!(!conn.flow_stale("test-connector", gen2));
+        // An unregistered connector is treated as stale (conservative:
+        // silence over a wrong card).
+        assert!(conn.flow_stale("other-connector", gen1));
+    }
+
+    /// clear_pid_if must be a compare-and-set: a superseded thread's cleanup
+    /// drops only its own pid, never the pid a newer round has registered.
+    #[test]
+    fn clear_pid_if_only_clears_its_own_pid() {
+        let conn = ConnectorConn::default();
+        let _ = conn.reset("test-connector");
+        conn.set_pid("test-connector", Some(111));
+        // A different pid (e.g. registered by a newer round) is left alone.
+        conn.clear_pid_if("test-connector", 222);
+        conn.cancel("test-connector"); // cancel returns the still-registered pid
+        assert_eq!(conn.cancel("test-connector"), Some(111));
+        // The owning pid clears.
+        conn.clear_pid_if("test-connector", 111);
+        assert_eq!(conn.cancel("test-connector"), None);
+        // Clearing again is a no-op.
+        conn.clear_pid_if("test-connector", 111);
+        assert_eq!(conn.cancel("test-connector"), None);
+    }
 
     /// extract_url three-branch matrix: whitelisted domain hits truncate at
     /// whitespace (QR-scan URLs often carry `&` query strings that must not be
@@ -626,8 +1027,29 @@ mod tests {
     #[test]
     fn drain_for_url_stops_after_read_error() {
         let (tx, _rx) = mpsc::channel();
-        let handle = drain_for_url(TEST_CTX, ReadErrorThenPanic { failed: false }, tx);
+        let handle = drain_for_url(TEST_CTX, false, ReadErrorThenPanic { failed: false }, tx);
         assert!(handle.join().is_ok(), "读取错误后应退出排空线程");
+    }
+
+    /// The failure trail must prefer a failure-ish captured line over the
+    /// bare fallback, fall back to the last line when nothing matches, and
+    /// return the fallback untouched when nothing was captured — otherwise
+    /// the most common register/auth failures stay undiagnosable from the
+    /// log (the app-authored fallback is all there is).
+    #[test]
+    fn auth_failure_reason_prefers_failure_line_then_last_line() {
+        let mut lines = std::collections::VecDeque::new();
+        assert_eq!(auth_failure_reason(&lines, "fallback"), "fallback");
+        lines.push_back("config init started".to_string());
+        assert_eq!(
+            auth_failure_reason(&lines, "fallback"),
+            "fallback：config init started"
+        );
+        lines.push_back("Error: login endpoint unreachable".to_string());
+        assert_eq!(
+            auth_failure_reason(&lines, "fallback"),
+            "fallback：Error: login endpoint unreachable"
+        );
     }
 
     /// A 30s probe timeout must NOT read as "CLI not installed": the ensure
@@ -729,8 +1151,14 @@ mod tests {
             "应是 SVG data URL"
         );
         // 解码回 SVG,确认是真实矢量二维码。
+        use base64::Engine as _;
         let b64 = qr.trim_start_matches("data:image/svg+xml;base64,");
-        let svg = String::from_utf8(b64_decode(b64)).unwrap();
+        let svg = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap();
         assert!(svg.contains("<svg"), "应含 <svg> 根节点");
     }
 
@@ -741,8 +1169,14 @@ mod tests {
         let data_url = png_data_url(png).expect("bytes with signature and IEND tail should pass");
         assert!(data_url.starts_with("data:image/png;base64,"));
         // Decode back to the original bytes to confirm losslessness.
+        use base64::Engine as _;
         let b64 = data_url.trim_start_matches("data:image/png;base64,");
-        assert_eq!(b64_decode(b64), png.to_vec());
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+            png.to_vec()
+        );
 
         assert!(
             png_data_url(b"").is_none(),
@@ -825,27 +1259,5 @@ mod tests {
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(10),
             "timeout path should return promptly after the kill, took {elapsed:?}"
         );
-    }
-
-    // 测试辅助:标准 base64 解码(生产 b64 的逆运算,仅测试用)。
-    fn b64_decode(s: &str) -> Vec<u8> {
-        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let val = |c: u8| A.iter().position(|&x| x == c).unwrap() as u32;
-        let mut out = Vec::new();
-        let clean: Vec<u8> = s.bytes().filter(|&c| c != b'=').collect();
-        for chunk in clean.chunks(4) {
-            let mut n = 0u32;
-            for (i, &c) in chunk.iter().enumerate() {
-                n |= val(c) << (18 - 6 * i);
-            }
-            out.push((n >> 16) as u8);
-            if chunk.len() > 2 {
-                out.push((n >> 8) as u8);
-            }
-            if chunk.len() > 3 {
-                out.push(n as u8);
-            }
-        }
-        out
     }
 }

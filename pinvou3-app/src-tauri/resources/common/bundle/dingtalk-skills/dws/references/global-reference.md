@@ -6,6 +6,10 @@
 # 首次: OAuth 设备流登录 (钉钉扫码授权)
 dws auth login
 
+# 钉钉国际版 / 海外版（.io）；无头环境追加 --device
+dws auth login --intl
+dws auth login --intl --device
+
 # 查看状态
 dws auth status
 
@@ -21,6 +25,9 @@ dws auth reset
 ```
 
 登录后自动管理 token 刷新，日常使用无需重复登录。
+用户明确国际版、海外版或 `.io` 登录意图时必须加 `--intl`，不得回退到国内 `.com`。
+`--intl` 只用于 `auth login`；后续业务命令根据当前或 `--profile` 指定的账号自动路由。
+`--intl` 登录默认英文文案与英文授权页，无需再设 `DWS_LANG=en`；需要中文时显式设置 `DWS_LANG=zh`。
 
 ### 多账号 profile
 
@@ -43,7 +50,7 @@ dws --profile <corpId:userId> contact user get-self --format json
 30 天内使用一次即自动续期。
 
 ### 认证失败处理
-- 命令返回 `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / "Token验证失败" → 执行 `dws auth login` 重新登录
+- 命令返回 `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / "Token验证失败" → 不要在会话内直接跑 `dws auth login`（阻塞式扫码设备流，会一直等待授权直至超时，用户看不到扫码链接）；把登录命令交给用户在其终端自行执行，完成后再继续
 - macOS 返回 `ciphertext_key_mismatch`，且普通终端仍能登录 → 先用系统 Keychain 模式执行 `auth migrate-keychain --to file-dek --dry-run`，通过后加 `--yes`；禁止直接 `auth reset`
 
 ### Headless 环境 (CI/CD)
@@ -77,6 +84,10 @@ refresh_token 单设备独占，远程刷新后源设备凭证失效。
 | `--profile` | | 单次指定组织或账号；支持 corpId/corpName 与 userId/userName 组合，推荐稳定的 corpId:userId | 当前账号 |
 
 ## 输出格式
+
+### 分页输出契约
+
+分页命令返回 `hasMore`、`nextCursor`、`nextPageToken` 等字段。首次请求不传游标，后续必须原样使用上一页返回的游标，并保持筛选、排序、页大小等查询条件不变。成功空页是合法结果：空页且续页游标非空时继续，空页且续页游标为空时正常完成；只有续页游标为空或命令明确返回 `complete=true` 才表示完整，不能因空列表报错、重试或判定漏查。
 
 ### --format json (机器可读, 默认)
 

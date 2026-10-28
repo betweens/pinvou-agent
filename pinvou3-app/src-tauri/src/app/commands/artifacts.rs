@@ -1,5 +1,5 @@
 use super::prelude::*;
-use crate::features::deliverables::DeliverableItem;
+use crate::features::deliverables::{DeliverableIndex, DeliverableItem};
 use crate::platform::path_policy::validate_user_path;
 use std::sync::OnceLock;
 
@@ -310,12 +310,38 @@ fn cleanup_artifact_recovery_candidates<'a>(
     }
 }
 
-/// 「产出物」跨会话索引:遍历 `~/.pinvou3/sessions/*.json`,把每个会话跟踪的
-/// artifacts 汇成一张扁平表(供「产出物」一级入口用)。只走磁盘真相:
-/// 文件已被删则跳过;mtime/size 现取 fs。
+/// 「产出物」跨会话索引 —— legacy wire shape, kept byte-compatible with the
+/// pre-v2 contract: a bare row array, and a scan failure degrades to an
+/// empty index instead of a rejection (the historical GUI semantics this
+/// command shipped with). The remote-control web dist is deployed
+/// independently of the installed desktop
+/// (docs/remote-control-phase1-architecture.md), so dists older than the
+/// v2 capability still invoke THIS command and index the array directly —
+/// the shape here is a cross-version contract, not an implementation
+/// detail (round-9 review). The rich `{rows, skipped}` result and the
+/// total-failure contract live on [`list_deliverable_index_v2`],
+/// advertised to web clients through the desktop capability snapshot;
+/// both shells share one scan in `features::deliverables`.
 #[tauri::command]
 pub async fn list_deliverable_index() -> Result<Vec<DeliverableItem>, String> {
-    Ok(crate::features::deliverables::list_deliverable_index_impl())
+    Ok(crate::features::deliverables::list_deliverable_index_impl()
+        .map(|index| index.rows)
+        .unwrap_or_default())
+}
+
+/// Rich deliverables index (round-4 review shape): `rows` plus `skipped`
+/// naming the session records the scan could not read, so the view can
+/// surface the incomplete-list notice instead of rendering a partial
+/// result as success. A rejected scan is the TOTAL-failure signal (round-7
+/// review): an undecidable sessions root propagates as a command error for
+/// the Knowledge panel's scan-error banner over the last successful table.
+/// Negotiated separately from the legacy [`list_deliverable_index`] array
+/// via the desktop capability snapshot (round-9 review: mixed-version
+/// web/desktop pairings are supported deployments, so the richer result
+/// must not be welded onto the unversioned command).
+#[tauri::command]
+pub async fn list_deliverable_index_v2() -> Result<DeliverableIndex, String> {
+    crate::features::deliverables::list_deliverable_index_impl()
 }
 
 /// 读 artifact 元数据：大小 / 类型 / 是否存在。
@@ -481,8 +507,12 @@ pub struct VisualResult {
     pub html: Option<String>,
     /// mode=images：图片 data URI 列表（pdf 多页 / 单图）
     pub images: Vec<String>,
-    /// 缺工具 / 转换失败 / 截断 的人话提示
+    /// 缺工具 / 转换失败 / 截断 的原始提示。文案由后端生成(中文),仅供日志排查;
+    /// 前端只按 `warning_code` 渲染三语文案,不得直接展示本字段。
     pub warning: Option<String>,
+    /// warning 的稳定分类码,前端据此取三语文案:
+    /// "truncatedPages"(仅渲染前若干页) | "convertFailed"(缺工具/转换失败/无输出页)。
+    pub warning_code: Option<&'static str>,
 }
 
 impl VisualResult {
@@ -491,6 +521,7 @@ impl VisualResult {
             mode: "unsupported".into(),
             html: None,
             images: vec![],
+            warning_code: warning.as_ref().map(|_| "convertFailed"),
             warning,
         }
     }
@@ -621,6 +652,7 @@ pub async fn render_artifact_visual(path: String) -> Result<VisualResult, String
                         html: None,
                         images: vec![uri],
                         warning: None,
+                        warning_code: None,
                     },
                     Err(e) => VisualResult::unsupported(Some(e)),
                 }
@@ -639,6 +671,8 @@ pub async fn render_artifact_visual(path: String) -> Result<VisualResult, String
                         images: imgs,
                         warning: truncated
                             .then(|| format!("页数较多，仅渲染前 {VISUAL_PDF_MAX_PAGES} 页")),
+                        // 文案里的页数上限与 VISUAL_PDF_MAX_PAGES 一致,两端同改。
+                        warning_code: truncated.then_some("truncatedPages"),
                     },
                     Err(e) => VisualResult::unsupported(Some(e)),
                 }
@@ -651,6 +685,7 @@ pub async fn render_artifact_visual(path: String) -> Result<VisualResult, String
                         html: Some(html),
                         images: vec![],
                         warning: None,
+                        warning_code: None,
                     },
                     Err(e) => VisualResult::unsupported(Some(e)),
                 }
@@ -712,6 +747,8 @@ const EXTERNAL_URL_ALLOWLIST: &[&str] = &[
     "https://meeting.tencent.com/",
     // WeCom scan-to-authorize page (the gen landing page printed by `wecom-cli auth init`); connecting WeCom opens the browser here
     "https://work.weixin.qq.com/",
+    // WeCom official developer docs site (the "view official docs" button in the WeCom Group Bot key dialog links here)
+    "https://developer.work.weixin.qq.com/",
     // DingTalk device authorization login page (the user_code login page printed by `dws auth login --device`); connecting DingTalk opens the browser here
     "https://login.dingtalk.com/",
     // Obsidian 官网:知识库连接器探测到未安装时,引导用户下载
@@ -1036,6 +1073,7 @@ mod visual_cache_tests {
             html: Some("x".repeat(bytes)),
             images: vec![],
             warning: None,
+            warning_code: None,
         }
     }
 

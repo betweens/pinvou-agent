@@ -23,8 +23,7 @@ const CLEANUP_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(50), Duration
 const MAX_KILL_ATTEMPTS: u8 = 3;
 const MAX_FAILED_SCOPE_TOMBSTONES: usize = 16;
 
-pub(crate) type TurnShellScopeId = u64;
-type ScopeId = TurnShellScopeId;
+type ScopeId = u64;
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionShellManagers {
@@ -114,8 +113,12 @@ impl ShellCleanupReport {
     }
 
     fn merge(&mut self, mut other: Self) {
+        // Kills accumulate across retry passes; terminal failures are
+        // deliberately NOT merged — the only caller
+        // (cleanup_scope_with_retries) reconstructs `failed` from
+        // `exhausted_failures` after the ladder, so a merged value could
+        // never escape.
         self.killed.append(&mut other.killed);
-        self.failed = other.failed;
     }
 }
 
@@ -519,9 +522,19 @@ impl TurnShellTaskRegistry {
             let Some(scope_id) = state.agent_scopes.get(parent_id).copied() else {
                 return false;
             };
-            if !state.scopes.contains_key(&scope_id) {
+            // Single scopes lookup under the same lock: a missing scope
+            // rejects registration, like the neighboring branch.
+            let Some(scope) = state.scopes.get_mut(&scope_id) else {
                 return false;
+            };
+            scope.live_agent_ids.insert(child_id.to_string());
+            if scope.cancel_requested {
+                scope.cleanup_settled = false;
             }
+            let cancel_requested = scope.cancel_requested;
+            // Re-parent bookkeeping after the `scope` borrow ends: drop the
+            // child from its previous scope's live set (skipped when the
+            // child was already bound to this scope).
             if let Some(previous_scope_id) =
                 state.agent_scopes.insert(child_id.to_string(), scope_id)
             {
@@ -531,17 +544,7 @@ impl TurnShellTaskRegistry {
                     }
                 }
             }
-            // contains_key checked above under the same lock; return gracefully
-            // like the neighboring branch, keeping the "missing scope rejects
-            // registration" semantics.
-            let Some(scope) = state.scopes.get_mut(&scope_id) else {
-                return false;
-            };
-            scope.live_agent_ids.insert(child_id.to_string());
-            if scope.cancel_requested {
-                scope.cleanup_settled = false;
-            }
-            scope.cancel_requested
+            cancel_requested
         };
         if should_notify {
             self.inner.cleanup_notify.notify_one();

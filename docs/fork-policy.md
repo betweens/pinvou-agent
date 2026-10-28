@@ -1,18 +1,23 @@
 # Pinvou 对 CodeWhale 底座的 fork 维护策略
 
-> 最后更新：2026-09-23（r3 已收口：不可变 tag `pinvou-v0.9.12-r3` 切在 `61cb769be`，gitlink/维护分支/tag 三方相等）
+> 最后更新：2026-10-26。公开维护头 6e1ee88ee 已包含 #118–#122；父仓 gitlink 与公开维护头对齐。
 > 配套：`docs/fork-modifications.md`、`scripts/fork-guard.sh`、`docs/底座升级验收清单.md`
 > English: [`docs/fork-policy.en.md`](fork-policy.en.md)
 
-## 0. 当前基线
+已集成的上游回移及历史溯源见[修改清单](fork-modifications.md#web-jsonpath-upstream-backport-integrated-historical-candidate-evidence-756)。公开维护头门禁及第 6 节的明确授权要求继续生效。
 
-- 上游：`Hmbown/CodeWhale` tag `v0.9.12`，commit `dcd4c200f72f0c1ffd60d8e7f6850313db879fc5`。
-- 当前 fork 基线：`Pinvou/CodeWhale:pinvou3-clean`，head `61cb769be5b33abc64f64da4272f5b39a8b6c1fd`（= 不可变 tag `pinvou-v0.9.12-r3`），共 49 个带 DCO sign-off 的提交；不可变 tag `pinvou-v0.9.12-r1` 钉在 r1 收口 `1fafee7e26b60a59457a43bce50c63aa2ad9dbaf`（15 个提交），其后 34 个提交为 2026-09-10/11 backlog 批次、2026-09-17 批次、2026-09-18 批次、2026-09-20 批次、2026-09-21 批次（#64/#67）与 2026-09-22/23 批次（#63/#65/#68/#69/#70/#71/#72/#73/#76，另含 Windows 编译修复 #77）经 PR squash 合入。
+## 0. 当前维护基线与验证边界
+
+- 当前公开维护头与父仓 gitlink：`6e1ee88ee8f8ea28eec7be3d8add3a591468412a`（2026-10-26）。#118 已合入为 `a96fdec8e`，#119 为 `5861912a3`，#120 为 `f12299e69`，#121 为 `c2fdfd3e2`，#122 为 `6e1ee88ee`；本轮仅更新父仓引用，没有推进维护分支。
+- 实测历史：上游 v0.9.12 `dcd4c200f` 之上 84 个提交，r1 `1fafee7e2` 之上 69 个；82 个带 DCO sign-off。未签名的 squash 为 #107 `f27672935` 与 #116 `e9a7f48da1`，不能继续声称只有一个未签名提交。保留已发布历史，不改写维护分支。
+- 不可变 tag `pinvou-v0.9.12-r3` 仍在 `61cb769be5b33abc64f64da4272f5b39a8b6c1fd`；r1 仍在 `1fafee7e26b60a59457a43bce50c63aa2ad9dbaf`。公开门禁仍要求 gitlink 等于维护头并验证 r3 标签，未放宽任何条件。
+- 实测 drift：520 files, +89901/-39349，净增 50552；253 个独立 `forkguard_*` 行为名（登记下限仍为 64）。原生 Windows 证据仅适用于原记录的执行提交，不扩展为本次集成树已执行；当前父仓 CI 和最终集成树审核仍须独立确认。
+
 - 升级前公开回退点是不可变 tag `pinvou-v0.9.5-r13`，head `f853f8f1566c57e6be40d5439a222a932aa79ef5`；同 SHA 的本地 branch `backup/pre-v0.9.12-sync` 只作便利引用。
 - r1 已成为可消费的受保护基线；rN 收口时父仓 gitlink、维护分支和不可变 tag 指向同一 commit。
 - 过渡期豁免（2026-09-11 起）：两次 rN 收口之间，父仓 gitlink 可沿 `pinvou3-clean` 领先不可变 tag 前进；期间 `scripts/verify-public-submodule.sh` 断言 gitlink 等于公开维护分支头、不可变 tag 仍钉在其收口 commit，rN 收口时在合并头切新不可变 tag 并恢复三方相等。
 - `.gitmodules` 不配置浮动 `branch`；发布后父仓 gitlink、维护分支和不可变标签必须指向同一 commit。
-- 当前维护 4 个长期主题与 2 个追加减量主题：
+- 当前维护 4 个长期主题、3 个追加减量主题与 3 个已合入维护分支的主题：
 
   1. 宿主嵌入与路由边界
   2. 工具兼容与命令执行安全
@@ -20,8 +25,13 @@
   4. 定时任务与运行生命周期
   5. 会话归档导出（T5，追加减量）
   6. 蜂群限流治理（T6，追加减量）
+  7. 压缩检查点角色兼容（T7，已合入维护分支）
+  8. roster 宿主 profiles 呈现（T8，追加减量）
+  9. custom wire 运行时路线（T9，已合入维护分支）
+  10. Tachyon 思考强度方言（T10，已合入维护分支）
 
 精确 commit、文件、理由和验证见 `docs/fork-modifications.md`。新增需求优先归入既有主题；只有形成新的稳定状态、验证和回退边界时才增加主题。
+
 
 ## 1. 核心原则
 

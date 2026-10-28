@@ -17,14 +17,13 @@ import { useOutsidePointerClose } from '../../components/ComposerPopover.jsx';
 
 /**
  * Deliverable/output row record from `list_deliverable_index` (backend wire
- * shape; `session_id` is the legacy snake-case spelling of `sessionId`).
+ * shape).
  * @typedef {object} KnowledgeOutput
  * @property {string} path - Artifact file path.
  * @property {string} name - File name shown in lists and previews.
  * @property {string} [ext] - Lower-cased file extension.
  * @property {string} [category] - Output category key (web | doc | img | ppt).
  * @property {string} [sessionId] - Owning session id.
- * @property {string} [session_id] - Legacy snake-case session id.
  * @property {number} [mtime] - Modification time embedded in preview cache keys.
  * @property {string} [source] - Producer source tag.
  */
@@ -42,7 +41,7 @@ import { useOutsidePointerClose } from '../../components/ComposerPopover.jsx';
  * @property {string} [error] - Failure message for fallback previews.
  */
 
-const kbCache = { scan: null, stats: null, types: [], loaded: false, colls: [], allDocs: [], embedInfo: null, model: null, outputs: [], outputsLoaded: false };
+const kbCache = { scan: null, stats: null, types: [], loaded: false, colls: [], allDocs: [], embedInfo: null, model: null, outputs: [], outputsLoaded: false, outputsSkipped: [] };
 // The full document table (kb_documents limit:0) is unbounded, so the
 // module-level cache keeps only a bounded slice: a remount instantly shows
 // the first rows and loadColls() re-fetches the complete data after mount,
@@ -123,7 +122,7 @@ const FILE_ICON_BY_CAT = { web: '/file-icons/html.svg', doc: '/file-icons/docx.s
  * @param {string} [category] - Output category fallback.
  */
 const fileIconSrc = (ext, category) => resolveAppAssetUrl(
-  FILE_ICON_BY_EXT[String(ext || '').toLowerCase()]
+  FILE_ICON_BY_EXT[(ext || '').toLowerCase()]
     || FILE_ICON_BY_CAT[category ?? '']
     || '/file-icons/genericfile.svg',
 );
@@ -176,7 +175,7 @@ const OutputActions = ({ o, compact, small, stopPropagation, wrapperClassName, t
           </button>
         )}
         {isWeb && canDownloadArtifacts && bridge.artifacts.downloadArtifact && (
-          <button type="button" title={t.uiKnowledge.downloadOutput} onClick={guarded(() => bridge.artifacts.downloadArtifact(o.path, o.sessionId || o.session_id))}
+          <button type="button" title={t.uiKnowledge.downloadOutput} onClick={guarded(() => bridge.artifacts.downloadArtifact(o.path, o.sessionId))}
             className={`grid h-8 w-8 place-items-center rounded-[9px] transition-colors active:opacity-70 text-[#3A3A3C] hover:bg-[#F2F2F7] dark:text-[#C7C7CC] dark:hover:bg-white/[0.08]`}>
             <Download size={15} />
           </button>
@@ -250,11 +249,11 @@ const SortableTimeHeader = ({ t, dir, onToggle, justifySelfStart }) => (
 const KbDialog = ({ onClose, testId, role, ariaModal, width = 'w-[400px]', children }) => (
   // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the in-modal cancel button
   // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
-  <div data-testid={testId} className="absolute inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+  <div data-testid={testId} className="absolute inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
     {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
     {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
     {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-modal follows the prop-provided role (confirmDoc passes role dialog); static analysis cannot see the dynamic role */}
-    <div role={role} aria-modal={ariaModal} onClick={(e) => e.stopPropagation()} className={`${width} rounded-2xl p-6 bg-white dark:bg-[#1E1F20]`}>
+    <div role={role} aria-modal={ariaModal} onClick={(e) => e.stopPropagation()} className={`${width} max-w-full rounded-2xl p-6 bg-white dark:bg-[#1E1F20]`}>
       {children}
     </div>
   </div>
@@ -264,7 +263,7 @@ const hasIntersectionObserver = () => typeof window !== 'undefined' && 'Intersec
 /** @param {{ o: KnowledgeOutput, onOpen?: () => void, outPreviewCache: { current: Record<string, OutputPreview> }, runQueuedPreview: (job: () => Promise<OutputPreview>) => Promise<OutputPreview>, rememberOutPreview: (key: string, preview: OutputPreview) => void, outCatMeta: (category: string | undefined) => { icon?: import('react').ComponentType<{ size?: number }>, color: string } }} props - Output preview inputs and shared cache helpers. */
 const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, rememberOutPreview, outCatMeta }) => {
         const ext = String(o.ext || '').toLowerCase();
-        const outputSessionId = o.sessionId || o.session_id || null;
+        const outputSessionId = o.sessionId || null;
         const cacheKey = `${outputSessionId || ''}|${o.path}|${o.mtime || 0}`;
         const boxRef = useRef(null);
         // Environments without IntersectionObserver count as visible directly (lazy init, equivalent to the old synchronous fallback inside the effect).
@@ -391,11 +390,15 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
       // mode='outputs' 时作为一级「产出物」视图独立渲染:固定 output 段,隐藏段切换,显示自己的标题。
       const outputsOnly = mode === 'outputs';
       const isDark = theme === 'dark';
-      const bs = useBridgeState(['knowledge', 'chat']); // 取知识模型进度和当前产物
+      const bs = useBridgeState(['knowledge', 'chat', 'platform']); // 取知识模型进度、当前产物与平台能力快照
       const canDownloadArtifacts = !isWeb || can('artifactDownload');
       const canPickHostFiles = !isWeb || can('hostFilePicker');
       const canOpenSystemFiles = !isWeb && can('externalSystemOpen');
       const canInstallKbModel = can('localModelSetup') && can('dependencyInstall');
+      // 本地 embedding 平台门控（get_platform_capabilities.localEmbedSupported）：linux/loongarch64
+      // 编译期即无 ort-sys/fastembed 制品，嵌入请求只会得到「平台不支持」。快照未到达前按
+      // false 兜底（fail closed），宁可先隐藏下载入口也不渲染一个必然失败的按钮。
+      const localEmbedSupported = !!(((bs && bs.platformCapabilities) || {}).localEmbedSupported);
 
       const [sub, setSub] = useState(outputsOnly ? 'output' : 'kb'); // 'output' | 'files' | 'kb' | 'remote'；统一知识库入口默认落本地知识库
 
@@ -445,6 +448,18 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
       // ================= 产出物 =================
       const [outputs, setOutputs] = useState(kbCache.outputs);
       const [outputsLoaded, setOutputsLoaded] = useState(kbCache.outputsLoaded);
+      // Session records the backend index could not scan (over the 32 MiB
+      // read cap, unreadable, or unparseable). Their deliverables are absent
+      // from `outputs`, so this partial-result signal must surface — an
+      // oversized record silently shrinking the panel must not read as a
+      // successful empty index (round-4 review).
+      const [outputsSkipped, setOutputsSkipped] = useState(kbCache.outputsSkipped);
+      // True when the last index refresh REJECTED (sessions root unreadable,
+      // transport down) — a total scan failure, distinct from the partial
+      // `outputsSkipped` signal above. The last successful table stays
+      // rendered underneath; a rejection must not read as a clean empty
+      // index (round-7 review P2).
+      const [outputsScanError, setOutputsScanError] = useState(false);
       const [outCat, setOutCat] = useState('all');
       const [outQuery, setOutQuery] = useState('');
       const [outView, setOutView] = useState('list');
@@ -506,6 +521,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
       })), []);
       const outputListSig = (list) => (list || []).map((o) => `${o.path || ''}|${o.mtime || 0}|${o.size || 0}|${o.sessionId || ''}|${o.source || ''}|${o.name || ''}`).join('\n');
       const outputsSigRef = useRef(outputListSig(kbCache.outputs));
+      const outputsSkippedSigRef = useRef((kbCache.outputsSkipped || []).join('\n'));
       const OUTPUT_CATS = [
         { key: 'all', label: t.kbOutCatAll, color: '#6a6a78', icon: GridIcon },
         { key: 'web', label: t.kbOutCatWeb, color: '#2f6beb', icon: AppWindow },
@@ -516,21 +532,42 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
       const outCatMeta = (k) => OUTPUT_CATS.find((c) => c.key === k) || OUTPUT_CATS[0];
       const outputsDisposedRef = useRef(false);
       const refreshOutputs = useCallback(async () => {
-        const list = bridge && bridge.artifacts.listDeliverableIndex
-          ? await bridge.artifacts.listDeliverableIndex().catch(() => [])
-          : await invokeTauri('list_deliverable_index').catch(() => []);
+        const res = bridge && bridge.artifacts.listDeliverableIndex
+          ? await bridge.artifacts.listDeliverableIndex().catch(() => null)
+          // Fallback for a bridge without the facade: v2 carries this
+          // dist's expected {rows, skipped} shape (the facade owns the
+          // legacy-array negotiation for older desktops).
+          : await invokeTauri('list_deliverable_index_v2').catch(() => null);
         // Unmount cleanup already released the big table: an in-flight
         // request started before unmount must not write the index back into
         // the module-level cache once it resolves, or it would undo the
         // cleanup (setOutputs after unmount is a no-op and harmless).
         if (outputsDisposedRef.current) return;
-        const nextList = list || [];
+        // null = the refresh REJECTED (sessions root unreadable, transport
+        // down): a total failure must not read as a clean bill (round-7
+        // review P2). The rejected refresh re-lists the retained cache below
+        // (the sig compare then no-ops, keeping the last successful table)
+        // and raises the scan-error banner with a retry action instead of
+        // silently degrading to an empty/partial list.
+        const scanFailed = !res;
+        // The command returns { rows, skipped }: rows are the listable
+        // deliverables, skipped names the session records the scan could not
+        // read — the "incomplete ≠ empty" disclosure the panel renders.
+        const nextList = scanFailed ? kbCache.outputs : (res && Array.isArray(res.rows) ? res.rows : []);
+        const nextSkipped = scanFailed ? kbCache.outputsSkipped : (res && Array.isArray(res.skipped) ? res.skipped : []);
         const nextSig = outputListSig(nextList);
         if (nextSig !== outputsSigRef.current) {
           outputsSigRef.current = nextSig;
           setOutputs(nextList);
           kbCache.outputs = nextList;
         }
+        const nextSkippedSig = nextSkipped.join('\n');
+        if (nextSkippedSig !== outputsSkippedSigRef.current) {
+          outputsSkippedSigRef.current = nextSkippedSig;
+          setOutputsSkipped(nextSkipped);
+          kbCache.outputsSkipped = nextSkipped;
+        }
+        setOutputsScanError(scanFailed);
         setOutputsLoaded(true);
         kbCache.outputsLoaded = true;
       }, []);
@@ -556,6 +593,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
         outputsDisposedRef.current = true;
         kbCache.outputs = [];
         kbCache.outputsLoaded = false;
+        kbCache.outputsSkipped = [];
       }, []);
       const filteredOutputs = React.useMemo(() => {
         const q = outQuery.trim().toLowerCase();
@@ -769,8 +807,8 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
       // 一级「产出物」只读产出物索引，不应触发任何知识库查询。
       useEffect(() => {
       // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronous setState in this effect is intentional: mirrors into local state right after reading the backend snapshot, avoiding first-frame flicker
-        if (!outputsOnly && (sub === 'files' || sub === 'kb')) loadColls();
-      }, [outputsOnly, sub, loadColls]);
+        if (sub === 'files' || sub === 'kb') loadColls();
+      }, [sub, loadColls]);
 
       const kbm = (bs && bs.kbModelSetup) || {};
       // ── embedding 模型 gate：区分磁盘文件与当前进程真实可用状态。旧后端未返回
@@ -785,9 +823,17 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
       // 语义检索按既有口径退化为全文（embedInfo.enabled=false 徽标已表达）。
       const modelDeferred = !!(effectiveKbModel && effectiveKbModel.deferredNoUsage);
       const modelFailed = modelInstalled && modelReadyKnown && !modelReady && !modelLoading && !modelDeferred;
-      const modelUsable = modelInstalled && (modelReady || modelDeferred);
+      // 后端状态里权威的能力位（与命令层下载/装载闸同一来源）：false = 本设备
+      // 编译期即无本地嵌入（loongarch64），模型永远无法就绪——知识库按既有的
+      // 全文检索降级姿态直接可用（可建库/导入/挂载，kb_search 走 FTS，见
+      // local_collection_mount_allowed），不再把整个库永久锁死在下载门后。
+      // 字段缺失（旧快照/mock/能力未知）按未知处理 → 维持既有模型门。
+      const platformEmbedUnsupported = !!(effectiveKbModel && effectiveKbModel.localEmbedSupported === false);
+      const modelUsable = (modelInstalled && (modelReady || modelDeferred)) || platformEmbedUnsupported;
       const dlProg = kbm.progress || null;
       const downloading = !!kbm.downloading;
+      // 对端（共享知识库宿主等）正在安装模型：本窗口「立即加载」此刻只会撞锁失败。
+      const kbPeerDownloading = !!(effectiveKbModel && effectiveKbModel.downloading);
       const mb = (n) => Math.round((n || 0) / 1048576);
       // 进度百分比:download 阶段用真实累计字节(占 0~95%),校验/准备/完成递进到 100。
       const dlPct = (() => {
@@ -803,7 +849,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
         : t.kbModelStageDownload
         : t.kbModelStageDownload;
       const startModelDownload = async (repair = false) => {
-        if (!canInstallKbModel) return;
+        if (!canInstallKbModel || !localEmbedSupported) return;
         try {
           const st = await bridge.knowledge.downloadKbModel(repair);
           if (st) { setKbModel(st); kbCache.model = st; }
@@ -1005,13 +1051,13 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                     isDark={isDark}
                     segments={[
                       { key: 'files', label: t.kbSubFiles, count: total ? total.toLocaleString() : null },
-                      { key: 'kb', label: t.kbSubKb, count: modelInstalled ? (colls.length || null) : null },
+                      { key: 'kb', label: t.kbSubKb, count: (modelInstalled || platformEmbedUnsupported) ? (colls.length || null) : null },
                       { key: 'remote', label: t.kbSubRemote },
                     ]}
                   />
                 )}
               </div>
-              <div className="flex min-w-0 flex-col gap-3 overflow-hidden lg:ml-8 lg:flex-1 lg:flex-row lg:items-center lg:justify-end">
+              <div className="flex min-w-0 flex-col gap-3 lg:ml-8 lg:flex-1 lg:flex-row lg:flex-wrap lg:items-center lg:justify-end">
                 {sub === 'output' ? (
                   <>
                     <IosSearchField
@@ -1104,7 +1150,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                                   <span className={`hidden md:block text-right text-[12px] ${muted}`}>{fmtSize(f.size)}</span>
                                   <span className={`hidden md:block text-[12px] font-medium tabular-nums ${muted}`}>{fmtDate(f.mtime)}</span>
                                   <div className="flex shrink-0 items-center justify-end gap-1">
-                                    <button type="button" title={t.kbAddToKb} onClick={(e2) => { e2.stopPropagation(); setAddToKb(f.path); if (outputsOnly) loadColls(); }}
+                                    <button type="button" title={t.kbAddToKb} onClick={(e2) => { e2.stopPropagation(); setAddToKb(f.path); }}
                                       className={`grid h-8 w-8 place-items-center rounded-[9px] transition-colors active:opacity-70 text-[#3A3A3C] hover:bg-[#F2F2F7] dark:text-[#C7C7CC] dark:hover:bg-white/[0.08]`}>
                                       <Plus size={15} />
                                     </button>
@@ -1136,7 +1182,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                   // 避免整页空白死等 refreshL0(大库冷读时尤其明显)。loaded 后切真实数据,结构一致很平滑。
                   <div>
                     <div className={`text-[15px] font-bold mb-3 ${ink}`}>{t.kbBrowseByType}</div>
-                    <div className="grid grid-cols-4 lg:grid-cols-7 gap-3 mb-7">
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-7">
                       {CATS.map((c) => { const col = CAT_COLOR[c.key] || '#8a8a9a'; const CatI = CAT_ICON[c.key] || FileText; return (
                         <div key={c.key} className={`flex items-center gap-3 p-3 rounded-xl ${panel}`} style={panelShadow}>
                           <div className="w-9 h-9 rounded-xl grid place-items-center shrink-0" style={{ background: col + (isDark ? '33' : '1f'), color: col }}><CatI size={17} /></div> {/* isDark dynamic-value: 保留 (background 依赖运行时 col) */}
@@ -1157,6 +1203,28 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
             {/* ============ 产出物 ============ */}
             {sub === 'output' && (
               <div className="max-w-[1400px] mx-auto">
+                {/* Partial-result disclosure (round-4 review): records the
+                    backend index could not scan (over the 32 MiB read cap,
+                    unreadable, unparseable) contribute no rows, so their
+                    deliverables are missing from every branch below —
+                    including the "empty" one, which must not read as a
+                    clean bill. */}
+                {/* Total-failure disclosure (round-7 review): a rejected
+                    refresh (unreadable sessions root, transport down) must
+                    not read as a clean empty index. The listing below keeps
+                    the last successful result and the banner offers a
+                    retry. */}
+                {outputsScanError && (
+                  <div className="mb-4 px-4 py-2.5 rounded-[14px] text-[13px] leading-[18px] bg-[rgba(214,69,69,.08)] text-[#9A3B3B] dark:bg-[rgba(214,69,69,.12)] dark:text-[#E08A8A] flex items-center justify-between gap-3">
+                    <span>{t.kbOutScanError}</span>
+                    <button type="button" onClick={() => refreshOutputs()} className={`px-3 py-1 rounded-full text-[12px] font-bold shrink-0 ${soft}`}>{t.kbOutRetry}</button>
+                  </div>
+                )}
+                {outputsLoaded && outputsSkipped.length > 0 && (
+                  <div className="mb-4 px-4 py-2.5 rounded-[14px] text-[13px] leading-[18px] bg-[rgba(224,119,58,.08)] text-[#9A5B23] dark:bg-[rgba(224,119,58,.12)] dark:text-[#E0A477]">
+                    {t.kbOutSkippedNotice(outputsSkipped.length)}
+                  </div>
+                )}
                 {outputsLoaded ? outputs.length === 0 ? (
                   <KbEmptyState muted={muted} card={card} ink={ink} title={t.kbOutEmpty} hint={t.kbOutEmptyHint} />
                 ) : (() => {
@@ -1186,13 +1254,13 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                                 {rows.map((o) => (
                                     <article key={o.path} className={`group min-h-[286px] rounded-[22px] overflow-hidden border transition-all duration-200 bg-white border-black/[0.045] hover:border-black/[0.075] dark:bg-[#1C1C1E] dark:border-white/[0.055] dark:hover:bg-[#202124] dark:hover:border-white/[0.09]`}
                                       style={isDark ? { boxShadow: '0 14px 36px rgba(0,0,0,.24)' } : { boxShadow: '0 1px 2px rgba(0,0,0,.035), 0 10px 24px rgba(0,0,0,.05)' }}>{/* isDark dynamic-value: 保留 (multi-stop boxShadow) */}
-                                      <OutputLivePreview o={o} onOpen={() => setOutputPreview({ path: o.path, sessionId: o.sessionId || o.session_id || null })} outPreviewCache={outPreviewCache} runQueuedPreview={runQueuedPreview} rememberOutPreview={rememberOutPreview} outCatMeta={outCatMeta} />
+                                      <OutputLivePreview o={o} onOpen={() => setOutputPreview({ path: o.path, sessionId: o.sessionId || null })} outPreviewCache={outPreviewCache} runQueuedPreview={runQueuedPreview} rememberOutPreview={rememberOutPreview} outCatMeta={outCatMeta} />
                                       <div className="px-5 pb-4">
                                         <div className="flex items-start gap-3 pt-1">
                                           <div className={`text-[17px] leading-[23px] font-semibold flex-1 min-w-0 truncate ${ink}`} title={o.name}>{o.name}</div>
                                           <span className="h-6 min-w-[48px] px-2.5 rounded-full inline-flex items-center justify-center text-[11px] font-normal tracking-[0.02em] shrink-0 text-[#0066CC] dark:text-[#8DB7FF] bg-[rgba(0,122,255,.08)] dark:bg-[rgba(10,132,255,.10)]">{String(o.ext || '').toUpperCase().slice(0, 4)}</span>
                                         </div>
-                                        <div className={`flex items-center gap-2 text-[13px] mt-2 text-[#6E6E73] dark:text-[#AEAEB2]`}><span>{fmtOutputDate(o.mtime)}</span><i className="w-1 h-1 rounded-full bg-current opacity-40"></i><span className="truncate">{o.source || t.kbSubOutput}</span></div>
+                                        <div className={`flex items-center gap-2 text-[13px] mt-2 text-[#6E6E73] dark:text-[#AEAEB2]`}><span className="whitespace-nowrap shrink-0">{fmtOutputDate(o.mtime)}</span><i className="w-1 h-1 rounded-full bg-current opacity-40 shrink-0"></i><span className="truncate">{o.source || t.kbSubOutput}</span></div>
                                         <OutputActions o={o} t={t} continueOutput={continueOutput} newOutputProject={newOutputProject} openFolder={openFolder} canOpenSystemFiles={canOpenSystemFiles} canDownloadArtifacts={canDownloadArtifacts} />
                                       </div>
                                     </article>
@@ -1223,7 +1291,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                                 return (
                                   // biome-ignore lint/a11y/useKeyWithClickEvents: list-row click is a shortcut; keyboard path handled by the in-row action buttons
                                   // biome-ignore lint/a11y/noStaticElementInteractions: list-row click hot zone; not a standalone interactive control
-                                  <div key={o.path} onClick={() => setOutputPreview({ path: o.path, sessionId: o.sessionId || o.session_id || null })}
+                                  <div key={o.path} onClick={() => setOutputPreview({ path: o.path, sessionId: o.sessionId || null })}
                                     className={TABLE_ROW_CLASS}>
                                     <div className="grid grid-cols-[minmax(0,1fr)_auto] md:grid-cols-[minmax(0,1fr)_132px_176px] items-center gap-4">
                                       <div className="flex min-w-0 items-center gap-4">
@@ -1259,22 +1327,31 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
             )}
             {outputPreview && <FilePreviewModal path={outputPreview.path} sessionId={outputPreview.sessionId} t={t} onClose={() => setOutputPreview(null)} />}
 
-            {sub === 'remote' && <RemoteKnowledgeView t={t} />}
+            {sub === 'remote' && <RemoteKnowledgeView t={t} localEmbedSupported={localEmbedSupported} />}
 
             {/* ============ 知识库 · embedding 模型未安装/加载中/加载失败 → gate ============ */}
+            {/* localEmbedSupported=false 的平台（linux/loongarch64）编译期即无本地 embedding：
+                整个「下载并部署」流程不可能成功，隐藏下载入口（角标/资源卡/按钮），只留平台说明。
+                web 端能力快照永远缺失，阻塞通常只是「宿主桌面端尚未安装模型」——宿主平台本身
+                可能支持，所以归因到桌面端（kbEmbedWebTitle/Desc）而不是宣称平台不支持。 */}
             {sub === 'kb' && !modelUsable && (
               <div className="max-w-[560px] mx-auto text-center pt-8 pb-2">
                 <div className="w-[84px] h-[84px] mx-auto rounded-[24px] grid place-items-center relative"
                   style={{ background: isDark ? 'linear-gradient(135deg,#2A2440,#1E2438)' : 'linear-gradient(135deg,#efeafe,#e3ecfb)' }}>{/* isDark dynamic-value: 保留 (linear-gradient) */}
                   <Database size={40} className="text-[#6f5cf0]" />
-                  <span className="absolute -right-1.5 -bottom-1.5 w-[30px] h-[30px] rounded-full grid place-items-center"
-                    style={{ background: 'linear-gradient(135deg,#6f5cf0,#5b6cf2)', border: `3px solid ${isDark ? '#131314' : '#fff'}`, boxShadow: '0 4px 10px rgba(108,92,231,.35)' }}>{/* isDark dynamic-value: 保留 (border 模板字符串拼色) */}
-                    <Download size={14} className="text-white" />
-                  </span>
+                  {localEmbedSupported && (
+                    <span className="absolute -right-1.5 -bottom-1.5 w-[30px] h-[30px] rounded-full grid place-items-center"
+                      style={{ background: 'linear-gradient(135deg,#6f5cf0,#5b6cf2)', border: `3px solid ${isDark ? '#131314' : '#fff'}`, boxShadow: '0 4px 10px rgba(108,92,231,.35)' }}>{/* isDark dynamic-value: 保留 (border 模板字符串拼色) */}
+                      <Download size={14} className="text-white" />
+                    </span>
+                  )}
                 </div>
-                <h2 className={`mt-5 text-[20px] font-extrabold ${ink}`}>{modelInstalled ? (modelLoading ? t.kbModelLoadingTitle : t.kbModelFailedTitle) : t.kbModelTitle}</h2>
-                <p className={`mt-2.5 mx-auto max-w-[450px] text-[13.5px] leading-relaxed ${muted}`}>{modelInstalled ? (modelLoading ? t.kbModelLoadingDesc : t.kbModelFailedDesc) : t.kbModelDesc}</p>
+                <h2 className={`mt-5 text-[20px] font-extrabold ${ink}`}>{localEmbedSupported ? (modelInstalled ? (modelLoading ? t.kbModelLoadingTitle : t.kbModelFailedTitle) : t.kbModelTitle) : (isWeb ? t.kbEmbedWebTitle : t.kbEmbedUnsupported)}</h2>
+                {(localEmbedSupported || isWeb) && (
+                  <p className={`mt-2.5 mx-auto max-w-[450px] text-[13.5px] leading-relaxed ${muted}`}>{localEmbedSupported ? (modelInstalled ? (modelLoading ? t.kbModelLoadingDesc : t.kbModelFailedDesc) : t.kbModelDesc) : t.kbEmbedWebDesc}</p>
+                )}
 
+                {localEmbedSupported && (
                 <div className={`mt-5 mx-auto max-w-[480px] text-left rounded-2xl p-[18px] ${panel}`} style={panelShadow}>
                   <div className="flex items-center gap-3">
                     <div className="w-[46px] h-[46px] rounded-xl grid place-items-center shrink-0 bg-[#f0eefb] dark:bg-[#2A2440]"
@@ -1302,8 +1379,17 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                     ))}
                   </div>
                 </div>
+                )}
 
-                {!downloading && !modelLoading ? (
+                {localEmbedSupported && (downloading || modelLoading ? (
+                  <div className="mt-5 max-w-[480px] mx-auto">
+                    <ModelProgressIndicator
+                      downloading={downloading}
+                      percent={dlPct}
+                      label={modelLoading && !downloading ? t.kbModelLoading : dlStageLabel}
+                    />
+                  </div>
+                ) : (
                   <div className="mt-5">
                     {modelFailed ? (
                       <div className="flex items-center justify-center gap-3">
@@ -1319,17 +1405,9 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                       </button>
                     )}
                     <div className={`mt-3 text-[12px] ${muted}`}>{t.kbModelFoot}</div>
-                    {(kbm.error || (effectiveKbModel && effectiveKbModel.error)) && <div className="mt-2 text-[12px] text-[#d63a3a]">{kbm.error || effectiveKbModel.error}</div>}
+                    {(kbm.error || (effectiveKbModel && effectiveKbModel.error)) && <div className="mt-2 text-[12px] text-[#d63a3a] dark:text-[#ff8a80]">{kbm.error || effectiveKbModel.error}</div>}
                   </div>
-                ) : (
-                  <div className="mt-5 max-w-[480px] mx-auto">
-                    <ModelProgressIndicator
-                      downloading={downloading}
-                      percent={dlPct}
-                      label={modelLoading && !downloading ? t.kbModelLoading : dlStageLabel}
-                    />
-                  </div>
-                )}
+                ))}
               </div>
             )}
 
@@ -1363,8 +1441,34 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                   </span>
                 </div>
 
+                {/* 模型已安装但本进程未加载（首帧门控 deferred——崩溃中断安装后常停在
+                    这一状态）。此前页面只剩上面的徽标，没有任何继续/修复入口——加载
+                    动作只能靠用户自己想到「导入文件触发补载」。真实加载失败会清
+                    deferred 并落 error，改走既有失败门（Retry/Repair），不进此分支。
+                    canInstallKbModel=false 的平台（web）没有本地模型安装能力，不渲染；
+                    localEmbedSupported=false 的平台（linux/loongarch64）无法加载本地
+                    embedding，同样不渲染。正常安装路径在该平台不存在已安装态，但
+                    peer/共享宿主可能留下残留模型目录（kb_tool.rs 的同款场景），此处
+                    按 fail-closed 一并隐藏。 */}
+                {localEmbedSupported && canInstallKbModel && modelInstalled && !modelReady && !modelLoading && !downloading && !kbPeerDownloading && (
+                  <div className={`mb-5 rounded-2xl border p-4 border-[#dfe3ee] bg-[#f8f9fd] dark:border-white/10 dark:bg-white/[0.04] flex flex-wrap items-center justify-between gap-3`}>
+                    <div className="min-w-0 flex-1">
+                      <div className={`text-[14px] font-bold ${ink}`}>{t.kbModelNotLoadedTitle}</div>
+                      <div className={`mt-1 text-[12px] ${muted}`}>{t.kbModelNotLoadedDesc}</div>
+                    </div>
+                    <button type="button" onClick={() => startModelDownload(false)}
+                      className={`rounded-full px-4 py-2 text-[13px] font-semibold shrink-0 ${accent}`}>{t.kbModelLoadNowBtn}</button>
+                  </div>
+                )}
+                {(downloading || modelLoading) && (
+                  <div className="mb-5 max-w-[480px]">
+                    <ModelProgressIndicator downloading={downloading} percent={dlPct}
+                      label={modelLoading && !downloading ? t.kbModelLoading : dlStageLabel} />
+                  </div>
+                )}
+
                 {importError && (
-                  <div data-testid="kb-import-error" role="alert" className="mb-3 rounded-xl border border-[#d63a3a]/30 bg-[#d63a3a]/10 px-4 py-3 text-[12px] text-[#d63a3a]">
+                  <div data-testid="kb-import-error" role="alert" className="mb-3 rounded-xl border border-[#d63a3a]/30 bg-[#d63a3a]/10 px-4 py-3 text-[12px] text-[#b72f2f] dark:text-[#ff8a80]">
                     {importError}
                   </div>
                 )}
@@ -1406,7 +1510,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                             <div key={file.itemId} className="flex items-center gap-3 text-[12px]">
                               <div className="min-w-0 flex-1">
                                 <div className={`truncate font-medium ${ink}`} title={file.path}>{file.name}</div>
-                                <div className="truncate text-[#d63a3a]" title={file.error}>{file.error}</div>
+                                <div className="truncate text-[#d63a3a] dark:text-[#ff8a80]" title={file.error}>{file.error}</div>
                               </div>
                               <button type="button" onClick={() => retryImportFile(file.itemId)} disabled={indexing || failedFilesLoading}
                                 className={`shrink-0 rounded-full px-3 py-1.5 font-medium ${soft} ${indexing || failedFilesLoading ? 'cursor-default opacity-50' : ''}`}>
@@ -1453,7 +1557,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                       <div className={`text-[15px] font-bold ${ink}`}>{t.kbMyColls}</div>
                       <div className={`text-[12px] ${muted}`}>{colls.length} {t.kbCollUnit} · {colls.reduce((s, c) => s + (c.docCount || 0), 0)} {t.kbDocs} · {fmtSize(colls.reduce((s, c) => s + (c.totalBytes || 0), 0))}</div>
                     </div>
-                    <div className="grid grid-cols-3 gap-4">
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
                       {shown.map((c) => {
                         const prog = (idx && idx.running && idx.collectionId === c.id && idx.total > 0) ? Math.round((idx.done / idx.total) * 100) : null;
                         const isIdx = c.status === 'indexing' || prog != null;
@@ -1542,7 +1646,7 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
                       </div>
                       );
                     })()}
-                    {removeDocError && <div role="alert" className="mt-3 rounded-xl bg-[#d63a3a]/8 px-3 py-2 text-[12px] text-[#d63a3a]">{removeDocError}</div>}
+                    {removeDocError && <div role="alert" className="mt-3 rounded-xl bg-[#d63a3a]/[0.08] px-3 py-2 text-[12px] text-[#b72f2f] dark:text-[#ff8a80]">{removeDocError}</div>}
                   </div>
                 )}
 
@@ -1616,13 +1720,12 @@ const OutputLivePreview = ({ o, onOpen, outPreviewCache, runQueuedPreview, remem
               ) : (
                 <div className="flex flex-col gap-1 mb-4 max-h-[240px] overflow-y-auto">
                   {colls.map((c) => (
-                    <button type="button" key={c.id} onClick={async () => { try { replaceIndexState(await invokeTauri('kb_collection_add_sources', { collectionId: c.id, paths: Array.isArray(addToKb) ? addToKb : [addToKb] })); } catch { /* silently degrade */ } setAddToKb(null); if (!outputsOnly) setSub('kb'); }}
+                    <button type="button" key={c.id} onClick={async () => { try { replaceIndexState(await invokeTauri('kb_collection_add_sources', { collectionId: c.id, paths: Array.isArray(addToKb) ? addToKb : [addToKb] })); } catch { /* silently degrade */ } setAddToKb(null); setSub('kb'); }}
                       className={`text-left px-4 py-2.5 rounded-xl text-[14px] ${card} ${iconHover} ${ink}`}>{c.name}</button>
                   ))}
                 </div>
               )}
-      {/* eslint-disable-next-line sonarjs/no-unenclosed-multiline-block -- single-line blocks are this file's existing style; bulk re-wrapping would flood the diff */}
-              <button type="button" onClick={() => { setAddToKb(null); if (!outputsOnly) setSub('kb'); setNewColl({ name: '', category: '' }); }} className={`w-full px-4 py-2.5 rounded-xl text-[13px] font-medium ${soft}`}>+ {t.kbNewColl}</button>
+              <button type="button" onClick={() => { setAddToKb(null); setSub('kb'); setNewColl({ name: '', category: '' }); }} className={`w-full px-4 py-2.5 rounded-xl text-[13px] font-medium ${soft}`}>+ {t.kbNewColl}</button>
             </KbDialog>
           )}
 

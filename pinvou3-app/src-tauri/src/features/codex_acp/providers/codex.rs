@@ -13,7 +13,7 @@ use toml::Value;
 
 use super::{
     AgentConfigWriter, EffectiveConfig, EffectiveEntry, PROVIDER_ID_PREFIX, ProviderTarget,
-    atomic_write,
+    atomic_write, read_toml_config, remove_prefixed_entries,
 };
 
 const ENV_KEY_NAME: &str = "OPENAI_API_KEY";
@@ -23,6 +23,9 @@ const ENV_KEY_NAME: &str = "OPENAI_API_KEY";
 /// catalog 后警告消除且上下文窗口等参数正确（格式按 codex 0.146 实测）。
 const CATALOG_FILE_NAME: &str = "pinvou3-model-catalog.json";
 /// catalog 里 base_instructions 必须与原值一致（codex 内置，勿自创文案）。
+/// 已知局限：该句把「GPT-5」身份钉在中转的每一个模型上——用户经此中转
+/// 非 GPT 模型时，模型会自称 GPT-5。若 codex 校验放开，应替换为真实模型名；
+/// 在此之前仅在文档登记，不改文案（改了会被 codex 拒收 catalog）。
 const CATALOG_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 /// 无法获知中转模型真实窗口时的保守默认（与 kimi 侧默认一致量级）。
 const CATALOG_DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
@@ -41,17 +44,7 @@ impl CodexConfigWriter {
 
     /// 读取当前配置；文件缺失时视为空表，不可解析时**拒绝覆盖**并明确报错。
     fn read_config(&self) -> Result<Value> {
-        if !self.config_path.exists() {
-            return Ok(Value::Table(Default::default()));
-        }
-        let raw = fs::read_to_string(&self.config_path)
-            .with_context(|| format!("读取 {} 失败", self.config_path.display()))?;
-        toml::from_str::<Value>(&raw).with_context(|| {
-            format!(
-                "{} 不是有效的 TOML，拒绝覆盖；请手动修复或删除该文件后重试",
-                self.config_path.display()
-            )
-        })
+        read_toml_config(&self.config_path)
     }
 
     /// 生成/更新受管模型 catalog（幂等）。`context_window` 未指定时用保守默认。
@@ -218,36 +211,12 @@ impl AgentConfigWriter for CodexConfigWriter {
         let Some(table) = config.as_table_mut() else {
             return Ok(());
         };
-        let mut changed = false;
-        let managed_ids = table
-            .get("model_providers")
-            .and_then(Value::as_table)
-            .map(|providers| {
-                providers
-                    .keys()
-                    .filter(|key| key.starts_with(PROVIDER_ID_PREFIX))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if !managed_ids.is_empty() {
-            // managed_ids was just collected from the model_providers table of the
-            // same in-memory config, so it must be retrievable again; failure means
-            // an abnormal data shape and should error rather than panic.
-            let Some(providers) = table
-                .get_mut("model_providers")
-                .and_then(Value::as_table_mut)
-            else {
-                anyhow::bail!("codex config.toml model_providers table vanished during rollback");
-            };
-            for id in managed_ids {
-                providers.remove(&id);
-            }
-            changed = true;
-            if providers.is_empty() {
-                table.remove("model_providers");
-            }
-        }
+        let mut changed = remove_prefixed_entries(
+            table,
+            "model_providers",
+            PROVIDER_ID_PREFIX,
+            "codex config.toml model_providers table vanished during rollback",
+        )?;
         let provider_ref = table
             .get("model_provider")
             .and_then(Value::as_str)

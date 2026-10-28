@@ -19,9 +19,9 @@ const panelShadow = 'shadow-[0_1px_2px_rgba(24,24,40,0.04),0_8px_24px_rgba(24,24
 const ink = 'text-[#1F1F1F] dark:text-[#E3E3E3]';
 const muted = 'text-[#444746] dark:text-[#C4C7C5]';
 const button = 'inline-flex h-9 items-center justify-center gap-1.5 whitespace-nowrap rounded-full px-4 text-[13px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45';
-const primary = `${button} bg-[#0B57D0] text-white hover:bg-[#0848ad] dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#c2d8fb]`;
+const primary = `${button} bg-[#0B57D0] text-white hover:bg-[#0A4BB8] dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]`;
 const soft = `${button} bg-[#F0F4F9] text-[#0B57D0] hover:bg-[#E1E5EA] dark:bg-[#2A2B2D] dark:text-[#A8C7FA] dark:hover:bg-[#333537]`;
-const quiet = `${button} px-3 text-[#444746] hover:bg-[#F0F4F9] dark:text-[#C4C7C5] dark:hover:bg-[#333537]`;
+const quiet = `${button} text-[#444746] hover:bg-[#F0F4F9] dark:text-[#C4C7C5] dark:hover:bg-[#333537]`;
 
 // How long the join/connect success feedback stays visible (both connector entry points share the same timing).
 const JOIN_FEEDBACK_SETTLE_MS = 550;
@@ -38,11 +38,14 @@ function classifyUploadedDocument(document, duplicate) {
     : base === 'index_failed' ? 'duplicate_failed'
       : 'duplicate_pending';
 }
-const danger = `${button} px-3 text-[#d63a3a] hover:bg-[#d63a3a]/10`;
+const danger = `${button} text-[#d63a3a] hover:bg-[#d63a3a]/10 hover:text-[#b72f2f] dark:text-[#ff8a80] dark:hover:text-[#ff8a80]`;
 const iconButton = 'grid h-8 w-8 shrink-0 place-items-center rounded-full text-[#444746] transition-colors hover:bg-[#E1E5EA] dark:text-[#C4C7C5] dark:hover:bg-[#333537] disabled:cursor-not-allowed disabled:opacity-45';
 const field = 'h-10 w-full rounded-xl border border-[#dfe3ea] bg-white px-3.5 text-[13px] text-[#1F1F1F] outline-none transition-shadow placeholder:text-[#8b8d94] focus:border-[#0B57D0] focus:ring-2 focus:ring-[#0B57D0]/10 dark:border-white/10 dark:bg-[#171719] dark:text-[#E3E3E3] dark:focus:border-[#A8C7FA]';
 const ownerSection = 'rounded-2xl border border-[#e3e7ee] bg-white p-4 dark:border-white/10 dark:bg-[#1E1F20] sm:p-5';
 const ownerTab = 'inline-flex h-10 min-w-0 items-center justify-center gap-2 rounded-lg px-3 text-[13px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0B57D0]/25';
+// The two hero calls-to-action share one string; the hover pair is the
+// canonical card-buttons.mjs primary recipe.
+const heroPrimary = 'inline-flex h-10 items-center justify-center gap-1.5 rounded-xl bg-[#0B57D0] px-5 text-[14px] font-bold text-white transition-all hover:-translate-y-0.5 hover:bg-[#0A4BB8] disabled:opacity-45 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]';
 const documentPageSize = 200;
 const documentStatusBatchSize = 500;
 const uploadIndexPollIntervalMs = 1000;
@@ -94,7 +97,7 @@ function NoticeBanner({ notice, onClose, role, owner = false, closeLabel }) {
   return (
     <div
       role={role || (error ? 'alert' : 'status')}
-      className={`flex items-start gap-2 rounded-xl border px-3.5 py-3 text-[13px] ${error ? 'border-[#d63a3a]/20 bg-[#d63a3a]/8 text-[#b72f2f]' : 'border-[#18a957]/20 bg-[#18a957]/8 text-[#16894a]'}`}
+      className={`flex items-start gap-2 rounded-xl border px-3.5 py-3 text-[13px] ${error ? 'border-[#d63a3a]/20 bg-[#d63a3a]/[0.08] text-[#b72f2f] dark:text-[#ff8a80]' : 'border-[#18a957]/20 bg-[#18a957]/[0.08] text-[#0F7A40] dark:text-[#7DD3A8]'}`}
     >
       {error ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
       <span className={`min-w-0 flex-1 ${owner ? 'break-words' : 'break-all'}`}>{notice.text}</span>
@@ -147,7 +150,12 @@ function OverlayDialog({
 }
 
 // eslint-disable-next-line sonarjs/cognitive-complexity -- the main view aggregates the connection/collection/document/member data flows; splitting would break the existing structure
-function RemoteKnowledgeView({ t }) {
+function RemoteKnowledgeView({ t, localEmbedSupported }) {
+  // 本机作为共享知识库宿主时的「下载嵌入模型」入口与 KnowledgeView 的模型卡共用同一条
+  // 服务端下载漏斗（begin_model_download），后者在不支持的平台（linux/loongarch64）会
+  // 直接拒绝。入口按 === true 判定（fail closed）：快照未到达或未来新增渲染点漏传 prop
+  // 时一律隐藏，与 KnowledgeView 的模型卡门控保持同一方向。
+  const localEmbedReady = localEmbedSupported === true;
   const [connections, setConnections] = useState([]);
   const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState('');
@@ -265,6 +273,11 @@ function RemoteKnowledgeView({ t }) {
   const uploadCloseLabel = uploadHasStarted
     ? (uploadInProgress ? t.remoteKbCollapse : t.remoteKbDone)
     : t.remoteKbCancel;
+
+  const closeUploadDialog = useCallback(() => {
+    if (!uploadHasStarted) setPublishDraft(null);
+    setShowUploadDialog(false);
+  }, [uploadHasStarted]);
 
   const documentStatusLabel = status => ({
     pending: t.remoteKbStatusPending,
@@ -511,7 +524,7 @@ function RemoteKnowledgeView({ t }) {
         includeDeleted: includeTrash,
       });
       if (requestId !== collectionsRequestRef.current || serverId !== selectedServerRef.current) return;
-      setCollections(next);
+      setCollections(next || []);
       const current = selectedCollectionRef.current;
       const nextCollectionId = current && next.some(item => item.id === current)
         ? current
@@ -631,8 +644,7 @@ function RemoteKnowledgeView({ t }) {
       else if (showRecoveryCode) setShowRecoveryCode(false);
       else if (showRestoreDialog && !isBusy('restore-host')) setShowRestoreDialog(false);
       else if (showUploadDialog && !isBusy('upload')) {
-        if (!uploadHasStarted) setPublishDraft(null);
-        setShowUploadDialog(false);
+        closeUploadDialog();
       }
       else if (showPublishDialog && !isBusy('prepare-publish')) setShowPublishDialog(false);
       else if (showCollectionCreator) setShowCollectionCreator(false);
@@ -645,7 +657,7 @@ function RemoteKnowledgeView({ t }) {
     };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [closeOwnerPanel, confirmation, documentToTrash, finishConfirmation, isBusy, joinFeedback?.status, showCollectionCreator, showConnector, showOwnerPanel, showPublishDialog, showRecoveryCode, showRestoreDialog, showUploadDialog, uploadHasStarted]);
+  }, [closeOwnerPanel, closeUploadDialog, confirmation, documentToTrash, finishConfirmation, isBusy, joinFeedback?.status, showCollectionCreator, showConnector, showOwnerPanel, showPublishDialog, showRecoveryCode, showRestoreDialog, showUploadDialog, uploadHasStarted]);
   // Escape / outside-click close for the add-content menu; escapeOnWindow keeps the original window-level keydown listener,
   // preserving the original ordering against the popover Escape chain above (closeOnEscape).
   useOutsidePointerClose(
@@ -889,7 +901,7 @@ function RemoteKnowledgeView({ t }) {
     });
     if (!created) return;
     setShareLink(created.share);
-    setOwnerShares(await invokeTauri('remote_kb_shares', { serverId: selectedServerId }));
+    setOwnerShares((await invokeTauri('remote_kb_shares', { serverId: selectedServerId })) || []);
   }
 
   async function resolveJoinRequest(requestId, scope) {
@@ -901,13 +913,13 @@ function RemoteKnowledgeView({ t }) {
       ...(scope ? { scope } : {}),
     }));
     if (!resolved) return;
-    setOwnerJoinRequests(await invokeTauri('remote_kb_join_requests', { serverId: selectedServerId }));
-    setOwnerDevices(await invokeTauri('remote_kb_devices', { serverId: selectedServerId }));
+    setOwnerJoinRequests((await invokeTauri('remote_kb_join_requests', { serverId: selectedServerId })) || []);
+    setOwnerDevices((await invokeTauri('remote_kb_devices', { serverId: selectedServerId })) || []);
   }
 
   async function stopShare(shareId) {
     const stopped = await run(`stop-share-${shareId}`, () => invokeTauri('remote_kb_stop_share', { serverId: selectedServerId, shareId }));
-    if (stopped) setOwnerShares(await invokeTauri('remote_kb_shares', { serverId: selectedServerId }));
+    if (stopped) setOwnerShares((await invokeTauri('remote_kb_shares', { serverId: selectedServerId })) || []);
   }
 
   async function updateMember(device, patch) {
@@ -1133,11 +1145,13 @@ function RemoteKnowledgeView({ t }) {
     await loadCollections(selectedServerId);
   }
 
+  const asPathList = value => (Array.isArray(value) ? value : (value ? [value] : []));
+
   async function chooseUploadFiles() {
     if (uploadInProgress) return;
     setShowUploadSourceMenu(false);
     const paths = await openTauriDialog({ multiple: true, directory: false });
-    const selected = Array.isArray(paths) ? paths : (paths ? [paths] : []);
+    const selected = asPathList(paths);
     if (!selected.length) return;
     setPublishDraft(null);
     queueUploads(selected.map(path => ({ path, name: uploadEntryName(path) })));
@@ -1149,7 +1163,7 @@ function RemoteKnowledgeView({ t }) {
     if (uploadInProgress) return;
     setShowUploadSourceMenu(false);
     const roots = await openTauriDialog({ multiple: true, directory: true });
-    const selected = Array.isArray(roots) ? roots : (roots ? [roots] : []);
+    const selected = asPathList(roots);
     if (!selected.length) return;
     const discovery = await run('discover-folders', () => invokeTauri('remote_kb_discover_folder_files', {
       paths: selected,
@@ -1403,6 +1417,8 @@ function RemoteKnowledgeView({ t }) {
     return <div className={`mx-auto max-w-[1400px] py-8 ${muted}`}>{t.remoteKbDesktopOnly}</div>;
   }
 
+  const activeShares = ownerShares.filter(item => !item.stoppedAt && item.expiresAt > Date.now() / 1000); // eslint-disable-line react-hooks/purity -- expiry is computed relative to the current time; the list only renders while the panel is open
+
   return (
     <div
       // 唯一挂载点（KnowledgeView 的 remote 子页）恒为嵌入式：类名按 embedded=true
@@ -1443,7 +1459,7 @@ function RemoteKnowledgeView({ t }) {
               {hostStatus?.supported && !hostStatus.installed && (
                 <button type="button"
                   data-testid="shared-kb-create-host"
-                  className="inline-flex h-10 items-center justify-center gap-1.5 rounded-xl bg-[#0B57D0] px-5 text-[14px] font-bold text-white transition-all hover:-translate-y-0.5 hover:bg-[#0848ad] disabled:opacity-45"
+                  className={heroPrimary}
                   onClick={installHost}
                   disabled={isBusy('install-host')}
                 >
@@ -1454,7 +1470,7 @@ function RemoteKnowledgeView({ t }) {
               {connectionsLoaded && hostStatus?.supported && hostStatus.installed && !hasLocalHostOwner && (
                 <button type="button"
                   data-testid="shared-kb-reconnect-host"
-                  className="inline-flex h-10 items-center justify-center gap-1.5 rounded-xl bg-[#0B57D0] px-5 text-[14px] font-bold text-white transition-all hover:-translate-y-0.5 hover:bg-[#0848ad] disabled:opacity-45"
+                  className={heroPrimary}
                   onClick={reconnectHost}
                   disabled={isBusy('reconnect-host')}
                 >
@@ -1525,7 +1541,7 @@ function RemoteKnowledgeView({ t }) {
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               {pendingJoins.map(item => (
                 <div key={item.requestId} className="flex items-center gap-3 rounded-xl bg-[#F7F9FC] px-3.5 py-3 dark:bg-white/[0.04]">
-                  <div className="grid h-9 w-9 place-items-center rounded-xl bg-[#fff2dd] text-[#a76518] dark:bg-[#412d13] dark:text-[#eab66f]"><RefreshCw size={15} /></div>
+                  <div className="grid h-9 w-9 place-items-center rounded-xl bg-[#fff2dd] text-[#96600F] dark:bg-[#412d13] dark:text-[#eab66f]"><RefreshCw size={15} /></div>
                   <div className="min-w-0 flex-1">
                     <p className={`truncate text-[13px] font-semibold ${ink}`}>{item.serverName}</p>
                     <p className={`truncate text-[11px] ${muted}`}>{item.deviceName}</p>
@@ -1573,7 +1589,7 @@ function RemoteKnowledgeView({ t }) {
                 <div className="min-w-[220px] flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className={`truncate text-[16px] font-bold ${ink}`}>{selectedConnection.name}</h2>
-                    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${selectedConnection.online && selectedConnection.ready ? 'bg-[#e2f6e9] text-[#16894a] dark:bg-[#13361f] dark:text-[#7DD3A8]' : 'bg-[#fff2dd] text-[#a76518] dark:bg-[#412d13] dark:text-[#eab66f]'}`}>
+                    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${selectedConnection.online && selectedConnection.ready ? 'bg-[#e2f6e9] text-[#0F7A40] dark:bg-[#13361f] dark:text-[#7DD3A8]' : 'bg-[#fff2dd] text-[#96600F] dark:bg-[#412d13] dark:text-[#eab66f]'}`}>
                       <span className={`h-1.5 w-1.5 rounded-full ${selectedConnection.online && selectedConnection.ready ? 'bg-[#18a957]' : 'bg-[#d6873e]'}`} />
                       {selectedConnection.online ? (selectedConnection.ready ? t.remoteKbReady : t.remoteKbNotReady) : t.remoteKbOffline}
                     </span>
@@ -1601,7 +1617,7 @@ function RemoteKnowledgeView({ t }) {
                   {canManage && (
                     <label className={`${quiet} cursor-pointer px-2.5`} title={t.remoteKbShowTrash}>
                       <input data-testid="remote-trash-toggle" className="peer sr-only" type="checkbox" checked={includeTrash} onChange={event => changeTrashVisibility(event.target.checked)} />
-                      <span className="relative h-5 w-8 rounded-full bg-[#d8dce3] transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-4 after:w-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-[#0B57D0] peer-checked:after:translate-x-3" />
+                      <span className="relative h-5 w-8 rounded-full bg-[#E5E5EA] dark:bg-[#39393D] transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-4 after:w-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-[#0B57D0] peer-checked:after:translate-x-3" />
                       {t.remoteKbShowTrash}
                     </label>
                   )}
@@ -1610,7 +1626,7 @@ function RemoteKnowledgeView({ t }) {
                   )}
                 </div>
               </div>
-              {selectedConnection.error && <p className="mt-3 rounded-xl bg-[#d63a3a]/8 px-3 py-2 text-[12px] text-[#d63a3a]">{selectedConnection.error}</p>}
+              {selectedConnection.error && <p className="mt-3 rounded-xl bg-[#d63a3a]/[0.08] px-3 py-2 text-[12px] text-[#b72f2f] dark:text-[#ff8a80]">{selectedConnection.error}</p>}
             </section>
 
             <section>
@@ -1654,13 +1670,13 @@ function RemoteKnowledgeView({ t }) {
                           {collection.description && <p className={`mt-3 line-clamp-2 text-[12px] leading-5 ${muted}`}>{collection.description}</p>}
                         </button>
                         <div className="mt-4 flex items-center justify-between border-t border-gray-400/15 pt-3">
-                          <span className={`inline-flex items-center gap-1.5 text-[11.5px] ${collection.status === 'ready' ? 'text-[#16894a] dark:text-[#7DD3A8]' : muted}`}>
+                          <span className={`inline-flex items-center gap-1.5 text-[11.5px] ${collection.status === 'ready' ? 'text-[#0F7A40] dark:text-[#7DD3A8]' : muted}`}>
                             <span className={`h-1.5 w-1.5 rounded-full ${collection.status === 'ready' ? 'bg-[#18a957]' : 'bg-[#d6873e]'}`} />
                             {collection.status === 'ready' ? t.remoteKbReady : t.remoteKbNotReady}
                           </span>
                           {canManage && (
                             <div className="flex items-center gap-1">
-                              <button type="button" className={collection.deletedAt ? quiet : 'text-[11.5px] text-[#d63a3a] hover:underline disabled:opacity-50'} disabled={isBusy('collection-trash')} onClick={() => changeCollectionTrash(collection)}>
+                              <button type="button" className={collection.deletedAt ? quiet : 'text-[11.5px] text-[#d63a3a] dark:text-[#ff8a80] hover:underline disabled:opacity-50'} disabled={isBusy('collection-trash')} onClick={() => changeCollectionTrash(collection)}>
                                 {collection.deletedAt ? t.remoteKbRestore : t.remoteKbTrash}
                               </button>
                               {isOwner && collection.deletedAt && <button type="button" className={danger} onClick={() => permanentlyDelete('collection', collection.id, collection.name)} disabled={isBusy(`permanent-collection-${collection.id}`)} title={t.remoteKbPermanentDelete}><Trash2 size={13} /></button>}
@@ -1735,10 +1751,10 @@ function RemoteKnowledgeView({ t }) {
                         </div>
                         <div className="min-w-0">
                           <p className={`truncate text-[13px] font-medium ${ink}`} title={document.name}>{document.name}</p>
-                          {document.error && <p className="mt-0.5 truncate text-[11px] text-[#d63a3a]" title={document.error}>{document.error}</p>}
+                          {document.error && <p className="mt-0.5 truncate text-[11px] group-hover:text-[#b72f2f] dark:group-hover:text-[#ff8a80] text-[#d63a3a] dark:text-[#ff8a80]" title={document.error}>{document.error}</p>}
                         </div>
                       </div>
-                      <span className={`flex w-auto items-center gap-1.5 text-[11.5px] md:w-28 ${document.status === 'ready' ? 'text-[#16894a] dark:text-[#7DD3A8]' : document.status === 'failed' ? 'text-[#d63a3a]' : muted}`}>
+                      <span className={`flex w-auto items-center gap-1.5 text-[11.5px] md:w-28 ${document.status === 'ready' ? 'text-[#0F7A40] dark:text-[#7DD3A8]' : document.status === 'failed' ? 'group-hover:text-[#b72f2f] dark:group-hover:text-[#ff8a80] text-[#d63a3a] dark:text-[#ff8a80]' : muted}`}>
                         <span className={`h-1.5 w-1.5 rounded-full ${document.status === 'ready' ? 'bg-[#18a957]' : document.status === 'failed' ? 'bg-[#d63a3a]' : 'bg-[#d6873e]'}`} />
                         {documentStatusLabel(document.status)}
                       </span>
@@ -1747,8 +1763,8 @@ function RemoteKnowledgeView({ t }) {
                       <div className="ml-auto flex w-auto items-center justify-end gap-0.5 md:w-28">
                         {!document.deletedAt && <button type="button" className={iconButton} onClick={() => downloadDocument(document)} title={t.remoteKbDownload}><Download size={14} /></button>}
                         {canManage && !document.deletedAt && <button type="button" className={iconButton} onClick={() => replaceDocument(document)} title={t.remoteKbReplace}><RefreshCw size={14} /></button>}
-                        {canManage && <button type="button" data-testid="remote-document-trash" className={`${iconButton} ${document.deletedAt ? '' : 'text-[#d63a3a]'}`} onClick={() => requestDocumentTrash(document)} disabled={isBusy(`document-trash-${document.id}`)} title={document.deletedAt ? t.remoteKbRestore : t.remoteKbTrash}>{isBusy(`document-trash-${document.id}`) ? <RefreshCw size={14} className="animate-spin" /> : document.deletedAt ? <RefreshCw size={14} /> : <Trash2 size={14} />}</button>}
-                        {isOwner && document.deletedAt && <button type="button" className={`${iconButton} text-[#d63a3a]`} onClick={() => permanentlyDelete('document', document.id, document.name)} disabled={isBusy(`permanent-document-${document.id}`)} title={t.remoteKbPermanentDelete}><Trash2 size={14} /></button>}
+                        {canManage && <button type="button" data-testid="remote-document-trash" className={`${iconButton} ${document.deletedAt ? '' : 'text-[#d63a3a] dark:text-[#ff8a80]'}`} onClick={() => requestDocumentTrash(document)} disabled={isBusy(`document-trash-${document.id}`)} title={document.deletedAt ? t.remoteKbRestore : t.remoteKbTrash}>{isBusy(`document-trash-${document.id}`) ? <RefreshCw size={14} className="animate-spin" /> : document.deletedAt ? <RefreshCw size={14} /> : <Trash2 size={14} />}</button>}
+                        {isOwner && document.deletedAt && <button type="button" className={`${iconButton} text-[#d63a3a] dark:text-[#ff8a80]`} onClick={() => permanentlyDelete('document', document.id, document.name)} disabled={isBusy(`permanent-document-${document.id}`)} title={t.remoteKbPermanentDelete}><Trash2 size={14} /></button>}
                       </div>
                     </div>
                   ))}
@@ -1814,13 +1830,13 @@ function RemoteKnowledgeView({ t }) {
                 <p className={`text-[12px] leading-5 ${muted}`}>{t.remoteKbHostProgressHint}</p>
               )}
               {hostProgress.phase === 'failed' && (
-                <div data-testid="shared-kb-host-progress-error" className="flex items-start gap-2 rounded-xl bg-[#d63a3a]/8 px-3.5 py-3 text-[12px] leading-5 text-[#b72f2f]">
+                <div data-testid="shared-kb-host-progress-error" className="flex items-start gap-2 rounded-xl bg-[#d63a3a]/[0.08] px-3.5 py-3 text-[12px] leading-5 text-[#b72f2f] dark:text-[#ff8a80]">
                   <AlertTriangle size={16} className="mt-0.5 shrink-0" />
                   <span className="min-w-0 break-words">{hostProgress.error}</span>
                 </div>
               )}
               {hostProgress.phase === 'complete' && (
-                <div className="flex items-center gap-2 text-[12px] font-semibold text-[#16894a] dark:text-[#7DD3A8]">
+                <div className="flex items-center gap-2 text-[12px] font-semibold text-[#0F7A40] dark:text-[#7DD3A8]">
                   <CheckCircle2 size={16} />
                   {t.remoteKbHostProgressComplete}
                 </div>
@@ -1856,7 +1872,7 @@ function RemoteKnowledgeView({ t }) {
                 aria-live="polite"
                 className="py-5 text-center animate-in fade-in zoom-in-95 duration-200 motion-reduce:animate-none"
               >
-                <div className={`mx-auto grid h-14 w-14 place-items-center rounded-2xl transition-colors duration-200 ${joinFeedback.status === 'approved' ? 'bg-[#e2f6e9] text-[#16894a] dark:bg-[#13361f] dark:text-[#7DD3A8]' : 'bg-[#eaf2ff] text-[#0B57D0] dark:bg-[#172b49] dark:text-[#A8C7FA]'}`}>
+                <div className={`mx-auto grid h-14 w-14 place-items-center rounded-2xl transition-colors duration-200 ${joinFeedback.status === 'approved' ? 'bg-[#e2f6e9] text-[#0F7A40] dark:bg-[#13361f] dark:text-[#7DD3A8]' : 'bg-[#eaf2ff] text-[#0B57D0] dark:bg-[#172b49] dark:text-[#A8C7FA]'}`}>
                   <CheckCircle2 size={25} />
                 </div>
                 <h3 className={`mt-4 text-[15px] font-bold ${ink}`}>
@@ -1946,7 +1962,7 @@ function RemoteKnowledgeView({ t }) {
                     <p id="remote-join-source-help" data-testid="remote-join-source-help" className={`text-[12px] leading-5 ${muted}`}>{t.remoteKbJoinHint}</p>
                   </div>
                 )}
-                {connectorError && <p role="alert" className="mt-3 rounded-xl bg-[#d63a3a]/8 px-3.5 py-3 text-[12px] leading-5 text-[#b72f2f]">{connectorError}</p>}
+                {connectorError && <p role="alert" className="mt-3 rounded-xl bg-[#d63a3a]/[0.08] px-3.5 py-3 text-[12px] leading-5 text-[#b72f2f] dark:text-[#ff8a80]">{connectorError}</p>}
                 <div className="mt-5 flex justify-end gap-2">
                   <button type="button" className={quiet} onClick={() => {
                     if (identityProbe) setIdentityProbe(null);
@@ -2034,13 +2050,13 @@ function RemoteKnowledgeView({ t }) {
                         <button data-testid="remote-copy-share" type="button" className={iconButton} title={t.remoteKbCopy} aria-label={t.remoteKbCopy} onClick={() => copyWithFeedback(shareLink, t.remoteKbLinkCopied)}><Copy size={15} /></button>
                       </div>
                     )}
-                    {!!ownerShares.filter(item => !item.stoppedAt && item.expiresAt > Date.now() / 1000).length && ( // eslint-disable-line react-hooks/purity -- expiry is computed relative to the current time; the list only renders while the panel is open
+                    {!!activeShares.length && (
                       <div className="mt-3 space-y-2">
-                        {ownerShares.filter(item => !item.stoppedAt && item.expiresAt > Date.now() / 1000).map(item => ( // eslint-disable-line react-hooks/purity -- same as above; filter expired shares against the current time
+                        {activeShares.map(item => (
                           <div key={item.id} className="flex flex-wrap items-center gap-2 rounded-xl bg-[#F7F9FC] px-3 py-2.5 dark:bg-white/[0.04]">
                             <Link size={14} className="text-[#0B57D0] dark:text-[#A8C7FA]" />
                             <span className={`min-w-[180px] flex-1 truncate text-[12.5px] ${muted}`}>{new Date(item.expiresAt * 1000).toLocaleString()}</span>
-                            {item.autoApproveRead && <span className="text-[12px] text-[#16894a] dark:text-[#7DD3A8]">{t.remoteKbAutoReadShort}</span>}
+                            {item.autoApproveRead && <span className="text-[12px] text-[#0F7A40] dark:text-[#7DD3A8]">{t.remoteKbAutoReadShort}</span>}
                             <button type="button" className={quiet} onClick={() => stopShare(item.id)} disabled={isBusy(`stop-share-${item.id}`)}>{t.remoteKbStopShare}</button>
                           </div>
                         ))}
@@ -2087,7 +2103,7 @@ function RemoteKnowledgeView({ t }) {
                           <div key={device.id} className="flex flex-col gap-2 rounded-xl bg-[#F7F9FC] px-3 py-3 dark:bg-white/[0.04] sm:flex-row sm:items-center">
                             <div className="min-w-[150px] flex-1">
                               <p className={`truncate text-[13.5px] font-semibold ${ink}`}>{device.name}{current ? ` · ${t.remoteKbThisDevice}` : ''}</p>
-                              <p className={`mt-1 text-[12px] ${device.revoked ? 'text-[#d63a3a]' : muted}`}>{device.revoked ? t.remoteKbRevoked : device.scope === 'owner' ? t.remoteKbOwner : device.scope === 'manage' ? t.remoteKbManage : t.remoteKbReadOnly}</p>
+                              <p className={`mt-1 text-[12px] ${device.revoked ? 'text-[#d63a3a] dark:text-[#ff8a80]' : muted}`}>{device.revoked ? t.remoteKbRevoked : device.scope === 'owner' ? t.remoteKbOwner : device.scope === 'manage' ? t.remoteKbManage : t.remoteKbReadOnly}</p>
                             </div>
                             <div className="flex flex-wrap items-center gap-1.5">
                               {!device.scope?.includes('owner') && !device.revoked && (
@@ -2125,9 +2141,16 @@ function RemoteKnowledgeView({ t }) {
                       <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[#EAF2FF] text-[#0B57D0] dark:bg-[#172B49] dark:text-[#A8C7FA]"><Database size={18} /></div>
                       <div className="min-w-0 flex-1">
                         <h3 className={`text-[15px] font-bold ${ink}`}>{t.remoteKbModelTitle}</h3>
-                        <p className={`mt-1 text-[13px] leading-5 ${ownerModelStatus?.error ? 'text-[#d63a3a]' : muted}`}>{ownerModelStatus?.error || (ownerModelStatus?.ready ? t.remoteKbModelReady : ownerModelStatus?.downloading ? t.remoteKbModelDownloading : t.remoteKbModelMissing)}</p>
+                        {/* 平台证明不支持本地嵌入时，能力说明（本地化文案）优先于
+                            后端原始诊断——宿主面板的下载入口本就被能力门隐藏，
+                            残留目录的加载失败只是同一事实的英文回声，不该用
+                            诊断文本顶掉用户语言里的解释（其余场景诊断仍优先）。 */}
+                        <p className={`mt-1 text-[13px] leading-5 ${isLocalHostOwner && !localEmbedReady ? muted : (ownerModelStatus?.error ? 'text-[#d63a3a] dark:text-[#ff8a80]' : muted)}`}>{isLocalHostOwner && !localEmbedReady ? t.kbEmbedUnsupported : (ownerModelStatus?.error || (ownerModelStatus?.ready ? t.remoteKbModelReady : ownerModelStatus?.downloading ? t.remoteKbModelDownloading : t.remoteKbModelMissing))}</p>
                       </div>
-                      {isLocalHostOwner && !ownerModelStatus?.ready && <button type="button" className={`${soft} w-full sm:w-auto`} onClick={downloadOwnerModel} disabled={ownerModelStatus?.downloading || isBusy('owner-model-download')}>{ownerModelStatus?.downloading ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />}{ownerModelStatus?.downloading ? t.remoteKbModelDownloadingAction : t.remoteKbDownloadModel}</button>}
+                      {/* 下载入口被 localEmbedReady 隐藏时（本机平台无本地嵌入，下载
+                          在宿主侧也注定被拒），状态行改用平台不支持说明而不是让
+                          「尚未下载」悬空；非宿主观看者看到的仍是宿主的真实状态。 */}
+                      {isLocalHostOwner && localEmbedReady && !ownerModelStatus?.ready && <button type="button" className={`${soft} w-full sm:w-auto`} onClick={downloadOwnerModel} disabled={ownerModelStatus?.downloading || isBusy('owner-model-download')}>{ownerModelStatus?.downloading ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />}{ownerModelStatus?.downloading ? t.remoteKbModelDownloadingAction : t.remoteKbDownloadModel}</button>}
                     </div>
                   </section>
 
@@ -2168,7 +2191,7 @@ function RemoteKnowledgeView({ t }) {
           >
             <textarea className={`${field} h-24 resize-none py-3 font-mono text-[11px]`} readOnly value={backupRecoveryCode} />
             {recoveryCopyFeedback && (
-              <p role={recoveryCopyFeedback.type === 'error' ? 'alert' : 'status'} className={`mt-3 text-[12px] ${recoveryCopyFeedback.type === 'error' ? 'text-[#b72f2f]' : 'text-[#16894a]'}`}>
+              <p role={recoveryCopyFeedback.type === 'error' ? 'alert' : 'status'} className={`mt-3 text-[12px] ${recoveryCopyFeedback.type === 'error' ? 'text-[#b72f2f] dark:text-[#ff8a80]' : 'text-[#0F7A40] dark:text-[#7DD3A8]'}`}>
                 {recoveryCopyFeedback.text}
               </p>
             )}
@@ -2251,7 +2274,7 @@ function RemoteKnowledgeView({ t }) {
                 ))}
               </select>
             ) : (
-              <p className={`rounded-xl bg-[#F7F9FC] px-3.5 py-4 text-[12px] ${muted}`}>{t.remoteKbNoLocalCollections}</p>
+              <p className={`rounded-xl bg-[#F7F9FC] px-3.5 py-4 text-[12px] dark:bg-white/[0.04] ${muted}`}>{t.remoteKbNoLocalCollections}</p>
             )}
             <div className="mt-5 flex justify-end gap-2">
               <button type="button" className={quiet} onClick={() => setShowPublishDialog(false)} disabled={isBusy('prepare-publish')}>{t.remoteKbCancel}</button>
@@ -2267,10 +2290,7 @@ function RemoteKnowledgeView({ t }) {
             testId="remote-upload-dialog"
             title={t.remoteKbUploadTitle}
             icon={Upload}
-            onClose={() => {
-              if (!uploadHasStarted) setPublishDraft(null);
-              setShowUploadDialog(false);
-            }}
+            onClose={closeUploadDialog}
             closeLabel={t.remoteKbClose}
             closeDisabled={isBusy('upload')}
           >
@@ -2288,10 +2308,10 @@ function RemoteKnowledgeView({ t }) {
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className={`truncate text-[12.5px] font-semibold ${ink}`} title={item.path}>{item.name}</p>
-                    {item.error && <p className="mt-0.5 truncate text-[11px] text-[#d63a3a]" title={item.error}>{item.error}</p>}
+                    {item.error && <p className="mt-0.5 truncate text-[11px] text-[#d63a3a] dark:text-[#ff8a80]" title={item.error}>{item.error}</p>}
                   </div>
                   {item.status !== 'queued' && (
-                      <span className={`inline-flex shrink-0 items-center gap-1.5 text-[11.5px] ${['success', 'duplicate'].includes(item.status) ? 'text-[#16894a] dark:text-[#7DD3A8]' : ['failed', 'index_failed', 'duplicate_failed'].includes(item.status) ? 'text-[#d63a3a]' : ['pending_index', 'duplicate_pending'].includes(item.status) ? 'text-[#a76518] dark:text-[#eab66f]' : muted}`}>
+                      <span className={`inline-flex shrink-0 items-center gap-1.5 text-[11.5px] ${['success', 'duplicate'].includes(item.status) ? 'text-[#0F7A40] dark:text-[#7DD3A8]' : ['failed', 'index_failed', 'duplicate_failed'].includes(item.status) ? 'text-[#d63a3a] dark:text-[#ff8a80]' : ['pending_index', 'duplicate_pending'].includes(item.status) ? 'text-[#96600F] dark:text-[#eab66f]' : muted}`}>
                       {item.status === 'uploading' && <RefreshCw size={13} className="animate-spin" />}
                       {['success', 'duplicate'].includes(item.status) && <CheckCircle2 size={13} />}
                       {['failed', 'index_failed', 'duplicate_failed'].includes(item.status) && <AlertTriangle size={13} />}
@@ -2310,10 +2330,7 @@ function RemoteKnowledgeView({ t }) {
               </div>
             )}
             <div className="mt-5 flex justify-end gap-2">
-              <button type="button" className={quiet} onClick={() => {
-                if (!uploadHasStarted) setPublishDraft(null);
-                setShowUploadDialog(false);
-              }} disabled={isBusy('upload')}>{uploadCloseLabel}</button>
+              <button type="button" className={quiet} onClick={closeUploadDialog} disabled={isBusy('upload')}>{uploadCloseLabel}</button>
               {uploadQueue.some(item => item.status === 'queued' || item.status === 'failed') && (
                 <button type="button" className={primary} onClick={startUpload} disabled={uploadInProgress}>
                   {isBusy('upload') && <RefreshCw size={14} className="animate-spin" />}

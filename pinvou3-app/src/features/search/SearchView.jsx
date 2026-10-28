@@ -3,7 +3,8 @@ import { createPortal } from 'react-dom';
 import { Check, Filter, PinIcon, X } from '../../components/icons.jsx';
 import { IosSearchField } from '../../components/IosControls.jsx';
 import { useOutsidePointerClose } from '../../components/ComposerPopover.jsx';
-import { ArchivedDeleteConfirmDialog, RecentItem } from '../../components/layout/NavigationComponents.jsx';
+import { RecentItem } from '../../components/layout/NavigationComponents.jsx';
+import { ArchivedDeleteConfirmDialog } from '../../components/ArchiveConfirmDialog.jsx';
 import { SessionAttachmentTitle } from '../attachments/SessionAttachmentTitle.jsx';
 import {
   sessionTitlePlainText,
@@ -12,6 +13,7 @@ import {
 import { formatDateGroupLabel, formatSessionDate, localDateKey } from '../../shared/date-utils.js';
 import { sessionRoute } from '../../shared/session-management.js';
 import { compareSessionsByRecentUpdate, filterSessionsByTab, groupSessionsByLocalDate, sessionListComparator } from '../../shared/session-list-pipeline.js';
+import { isDefaultChatTitle } from '../../shared/i18n.js';
 
 // 对话管理页:上方搜索框,工具行「对话|已收纳」切换 + 批量管理,左侧日期栏,右侧对话列表。
 // 已收纳与在线对话共用同一套日期分组/搜索/多选管线,仅数据源与行操作不同
@@ -65,7 +67,7 @@ export const SearchView = ({ theme, history, t, language, archived = EMPTY_ARCHI
   // 已收纳复用同一套日期分组管线:归一成 history 形状(updatedAt 取对话自身更新时间),
   // 原始 DTO 挂 raw 供恢复/删除按钮取 archived_at 等信息
   const archivedHistory = archivedList.map(s => {
-    const titlePresentation = sessionTitlePresentation(s.title || t.newChat, s.title_attachment_names);
+    const titlePresentation = sessionTitlePresentation(!s.title || isDefaultChatTitle(s.title) ? t.newChat : s.title, s.title_attachment_names);
     return {
       id: s.id,
       title: sessionTitlePlainText(titlePresentation),

@@ -366,6 +366,13 @@ async fn run_revocation_loop(
         let (ws, _) = match connected {
             Ok(pair) => pair,
             Err(error) => {
+                // The revocation channel's Connection events are consumed
+                // only by this loop's channel-closure detection (the manager
+                // side matches only Message), so log the failure reason here,
+                // aligned with the main loop's connect-failure log.
+                eprintln!(
+                    "[web-access] connect relay for revocation failed: {error} ({relay_url})"
+                );
                 if tx_in
                     .send(RelayInbound::Connection {
                         endpoint_id: endpoint_id.clone(),
@@ -387,6 +394,7 @@ async fn run_revocation_loop(
         let (mut write, mut read) = ws.split();
         let revoke = revoke_message_parts(&endpoint_id, &desktop_secret);
         if let Err(error) = write.send(Message::Text(revoke.to_string().into())).await {
+            eprintln!("[web-access] revoke endpoint failed: {error}");
             if tx_in
                 .send(RelayInbound::Connection {
                     endpoint_id: endpoint_id.clone(),
@@ -457,11 +465,15 @@ async fn run_revocation_loop(
             }
         }
 
+        // Reached on both failure paths (read error) and the clean paths
+        // (server close / local ACK-timeout close), so the wording must not
+        // claim a lost connection.
+        eprintln!("[web-access] relay revocation socket closed; reconnecting");
         if tx_in
             .send(RelayInbound::Connection {
                 endpoint_id: endpoint_id.clone(),
                 connected: false,
-                error: Some("relay revocation connection lost; reconnecting".to_string()),
+                error: Some("relay revocation socket closed; reconnecting".to_string()),
             })
             .await
             .is_err()
@@ -799,8 +811,8 @@ fn terminal_message(value: &Value, endpoint_id: &str) -> Option<RelayTerminal> {
 /// Whether an inbound relay message is terminal for the given endpoint
 /// (revoked / replaced / endpoint-not-found): the boolean view of
 /// [`terminal_message`]. The live connection loop needs the terminal kind;
-/// the persistence-driven replay (`manager::persistence::pending_revocation_ack`)
-/// only consumes the terminal/not-terminal bit, so both call sites share this
+/// the persistence-driven pending-revocation replay only consumes the
+/// terminal/not-terminal bit, so both call sites share this
 /// one predicate and their test suites jointly pin it.
 pub(crate) fn terminal_relay_message(value: &Value, endpoint_id: &str) -> bool {
     terminal_message(value, endpoint_id).is_some()

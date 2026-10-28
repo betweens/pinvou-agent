@@ -203,6 +203,17 @@ pub fn discover_folder_files(roots: &[String]) -> Result<RemoteFolderDiscovery, 
     })
 }
 
+/// Probe a shared-knowledge endpoint's identity. The first request accepts
+/// any certificate to learn the server's CA, and a second request pinned to
+/// that CA checks that the identity did not change mid-probe. The returned
+/// CA is still untrusted: the caller must show its fingerprint and get
+/// explicit confirmation before joining. A free function because the
+/// headless CLI depends on this crate but not on `pinvou_knowledge`; the
+/// GUI's `remote_kb_probe_private_endpoint` command routes through here.
+pub async fn probe_private_identity(source: &str) -> Result<RemoteKnowledgeProbe, String> {
+    KnowledgeClient::probe_private_identity(source).await
+}
+
 fn keep_folder_entry(entry: &DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return true;
@@ -425,6 +436,44 @@ impl RemoteKnowledgeService {
         Ok(connection)
     }
 
+    /// 写入新凭据并在连接落盘失败时回滚：读旧值 → set 新值 → `persist` →
+    /// 失败则恢复旧值（旧值为空则删除），回滚也失败时在错误里带上回滚失败
+    /// 原因。register/rebind 与配对两条持久化路径共用；`_persistence` 由
+    /// 调用方持有（凭据写入与连接落盘须在同一原子区间，见
+    /// `upsert_owner_connection`）。
+    fn set_credential_with_rollback(
+        &self,
+        reference: &CredentialReference,
+        token: &str,
+        error_prefix: &str,
+        persist: impl FnOnce() -> Result<RemoteConnection, String>,
+        _persistence: &parking_lot::MutexGuard<'_, ()>,
+    ) -> Result<RemoteConnection, String> {
+        let previous_token = self
+            .credentials
+            .get(reference)
+            .map_err(|error| error.user_message())?;
+        self.credentials
+            .set(reference, token)
+            .map_err(|error| error.user_message())?;
+        let result = persist();
+        if let Err(error) = &result {
+            let rollback = if let Some(previous_token) = previous_token {
+                self.credentials.set(reference, &previous_token)
+            } else {
+                self.credentials.delete(reference)
+            };
+            return Err(match rollback {
+                Ok(()) => error.clone(),
+                Err(rollback) => format!(
+                    "{error_prefix}，且凭据回滚失败：{error}；{}",
+                    rollback.user_message()
+                ),
+            });
+        }
+        result
+    }
+
     fn persist_local_owner_connection(
         &self,
         endpoint: String,
@@ -443,29 +492,13 @@ impl RemoteKnowledgeService {
         };
         let _persistence = self.persistence.lock();
         let reference = credential_reference(&connection.server_id);
-        let previous_token = self
-            .credentials
-            .get(&reference)
-            .map_err(|error| error.user_message())?;
-        self.credentials
-            .set(&reference, token)
-            .map_err(|error| error.user_message())?;
-
-        if let Err(error) = self.upsert_owner_connection(connection.clone(), true, &_persistence) {
-            let rollback = if let Some(previous_token) = previous_token {
-                self.credentials.set(&reference, &previous_token)
-            } else {
-                self.credentials.delete(&reference)
-            };
-            return Err(match rollback {
-                Ok(()) => error,
-                Err(rollback) => format!(
-                    "保存本机所有者连接失败，且凭据回滚失败：{error}；{}",
-                    rollback.user_message()
-                ),
-            });
-        }
-        Ok(connection)
+        self.set_credential_with_rollback(
+            &reference,
+            token,
+            "保存本机所有者连接失败",
+            || self.upsert_owner_connection(connection.clone(), true, &_persistence),
+            &_persistence,
+        )
     }
 
     /// Rebinds an already authorized local owner after the bundled host moves
@@ -733,7 +766,7 @@ impl RemoteKnowledgeService {
                 device_id: None,
                 created_at: pending.created_at,
                 expires_at: pending.expires_at,
-                resolved_at: Some(chrono::Utc::now().timestamp()),
+                resolved_at: None,
             }),
         }
     }
@@ -817,7 +850,7 @@ impl RemoteKnowledgeService {
                     version: String::new(),
                     protocol_version: 2,
                     tls_ca: pending.tls_ca.clone(),
-                    initialized: true,
+                    initialized: false,
                     ready: false,
                     model_present: false,
                     model: String::new(),
@@ -1031,33 +1064,17 @@ impl RemoteKnowledgeService {
             legacy_insecure_http: false,
         };
         let reference = credential_reference(&connection.server_id);
-        let previous_token = self
-            .credentials
-            .get(&reference)
-            .map_err(|error| error.user_message())?;
-        self.credentials
-            .set(&reference, &paired.token)
-            .map_err(|error| error.user_message())?;
-
-        let mut next = self.configured_connections();
-        next.push(connection.clone());
-        next.sort_by(|left, right| left.name.cmp(&right.name));
-        if let Err(error) = save_connections(&self.path, &next) {
-            let rollback = if let Some(previous_token) = previous_token {
-                self.credentials.set(&reference, &previous_token)
-            } else {
-                self.credentials.delete(&reference)
-            };
-            return Err(match rollback {
-                Ok(()) => error,
-                Err(rollback) => format!(
-                    "保存远程知识库连接失败，且凭据回滚失败：{error}；{}",
-                    rollback.user_message()
-                ),
-            });
-        }
-        *self.connections.write() = next;
-        Ok(connection)
+        // 复用 register/rebind 的收尾序列（按 server_id 原位替换/追加、按名称
+        // 排序、落盘并同步内存副本）。上方 ensure_server_id_not_connected 已
+        // 排除既有 server_id，这里恒走 insert_missing 的追加臂；落盘失败仍按
+        // 原样回滚刚写入的凭据（错误文案保持本路径原文）。
+        self.set_credential_with_rollback(
+            &reference,
+            &paired.token,
+            "保存远程知识库连接失败",
+            || self.upsert_owner_connection(connection.clone(), true, &_persistence),
+            &_persistence,
+        )
     }
 
     pub fn remove_connection(&self, server_id: &str) -> Result<(), String> {
@@ -1149,17 +1166,6 @@ impl RemoteKnowledgeService {
     pub async fn restore_collection(&self, server_id: &str, id: i64) -> Result<(), String> {
         self.require_manage(server_id)?;
         self.client_for(server_id)?.restore_collection(id).await
-    }
-
-    pub async fn documents(
-        &self,
-        server_id: &str,
-        collection_id: i64,
-        include_deleted: bool,
-    ) -> Result<Vec<Document>, String> {
-        self.client_for(server_id)?
-            .documents(collection_id, include_deleted)
-            .await
     }
 
     pub async fn documents_page(
